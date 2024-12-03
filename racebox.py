@@ -18,8 +18,9 @@ DOWNLOAD_COMMAND = bytes([0xB5, 0x62, 0xFF, 0x23, 0x00, 0x00, 0x22, 0x65])  # Co
 # CSV headers based on the parsed data structure
 CSV_HEADERS = [
     "iTOW", "Year", "Month", "Day", "Hour", "Minute", "Second", "Longitude", "Latitude",
-    "WGS Altitude", "Speed", "Heading", "G-Force X", "G-Force Y", "G-Force Z",
-    "Rotation rate X", "Rotation rate Y", "Rotation rate Z"
+    "WGS Altitude", "MSL Altitude", "Horizontal Accuracy", "Vertical Accuracy", "Speed", 
+    "Heading", "G-Force X", "G-Force Y", "G-Force Z", "Rotation rate X", "Rotation rate Y", 
+    "Rotation rate Z"
 ]
 
 # Add these constants at the top with other constants
@@ -35,7 +36,7 @@ def format_filename_from_first_record(first_record, device_name):
     minute = f"{first_record['Minute']:02d}"
     second = f"{first_record['Second']:02d}"
     timestamp = f"{year}{month}{day}_{hour}{minute}{second}"
-    return f"racebox_data_{device_name}_{timestamp}.csv"
+    return f"{device_name.replace(' ', '_')}_{timestamp}.csv"
 
 
 # Function to save parsed data into CSV with first record's date and device name
@@ -137,6 +138,9 @@ def parse_21_message(packet):
         "Longitude": parsed_data[14] / 1e7,
         "Latitude": parsed_data[15] / 1e7,
         "WGS Altitude": parsed_data[16] / 1000,
+        "MSL Altitude": parsed_data[17] / 1000,
+        "Horizontal Accuracy": parsed_data[18] / 1000,
+        "Vertical Accuracy": parsed_data[19] / 1000,
         "Speed": parsed_data[20] / 1000,
         "Heading": parsed_data[21] / 100000,
         "G-Force X": parsed_data[27] / 1000,
@@ -164,9 +168,9 @@ def parse_01_message(packet):
         "Longitude": parsed_data[14] / 1e7,
         "Latitude": parsed_data[15] / 1e7,
         "WGS Altitude": parsed_data[16] / 1000,
-        # "MSL Altitude": parsed_data[17] / 1000,
-        # "Horizontal Accuracy": parsed_data[18] / 1000,
-        # "Vertical Accuracy": parsed_data[19] / 1000,
+        "MSL Altitude": parsed_data[17] / 1000,
+        "Horizontal Accuracy": parsed_data[18] / 1000,
+        "Vertical Accuracy": parsed_data[19] / 1000,
         "Speed": parsed_data[20] / 1000,
         "Heading": parsed_data[21] / 100000,
         "G-Force X": parsed_data[27] / 1000,
