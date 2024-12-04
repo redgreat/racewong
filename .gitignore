@@ -164,5 +164,5 @@ cython_debug/
 .csv
 .html
 .pdf
-map.py
-folium_map.py
+src/map.py
+src/map.py
