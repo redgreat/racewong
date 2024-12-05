@@ -2,7 +2,7 @@
 # -*- coding:utf-8 -*-
 # @author by wangcw @ 2024
 # @generate at 2024-12-5 10:55:53
-# comment: 读取racebox 数据并存入数据库
+# comment: 读取RaceBox 数据并存入数据库
 
 import asyncio
 import struct
@@ -12,8 +12,7 @@ import json
 import os
 import configparser
 import psycopg2
-from psycopg2.extras import execute_values
-import psycopg2.extras
+import psycopg2.extras as extras
 import uuid
 from loguru import logger
 
@@ -57,20 +56,19 @@ TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 NMEA_TX_UUID = "00001103-0000-1000-8000-00805f9b34fb"
 DOWNLOAD_COMMAND = bytes([0xB5, 0x62, 0xFF, 0x23, 0x00, 0x00, 0x22, 0x65])  # Command to initiate data download
 
-ins_data = """insert into lc_racebox(itow, year, month, day, hour, minute, second, validity_flags, time_accuracy, nanoseconds,
-            fix_status, fix_status_flags, date_time_flags, numberof_svs, longitude, latitude, wgs_altitude, msl_altitude,
-            horizontal_accuracy, vertical_accuracy, speed, heading, speed_accuracy, heading_accuracy, pdop, lat_lon_flags,
-            battery_voltage, gforce_x, gforce_y, gforce_z, rotation_rate_x, rotation_rate_y, rotation_rate_z) values %s
-            on conflict (itow) do update set year=excluded.year, month=excluded.month, day=excluded.day, hour=excluded.hour, 
-            minute=excluded.minute, second=excluded.second, validity_flags=excluded.validity_flags, 
-            time_accuracy=excluded.time_accuracy, nanosecond=excluded.nanoseconds,
-            fix_status=excluded.fix_status, fix_status_flags=excluded.fix_status_flags, 
-            date_time_flags=excluded.date_time_flags, numberof_svs=excluded.numberof_svs, 
-            longitude=excluded.longitude, latitude=excluded.latitude, wgs_altitude=excluded.wgs_altitude, 
-            msl_altitud=excluded.msl_altitude, horizontal_accuracy=excluded.horizontal_accuracy, 
+ins_data = """insert into lc_racebox(itow, imp_stamp, year, month, day, hour, minute, second, validity_flags, time_accuracy, 
+            nanoseconds, fix_status, fix_status_flags, date_time_flags, numberof_svs, longitude, latitude, wgs_altitude, 
+            msl_altitude, horizontal_accuracy, vertical_accuracy, speed, heading, speed_accuracy, heading_accuracy, pdop, 
+            lat_lon_flags, battery_voltage, gforce_x, gforce_y, gforce_z, rotation_rate_x, rotation_rate_y, rotation_rate_z) 
+            values %s on conflict (itow) do update set year=excluded.year, month=excluded.month, day=excluded.day, 
+            hour=excluded.hour, minute=excluded.minute, second=excluded.second, validity_flags=excluded.validity_flags, 
+            time_accuracy=excluded.time_accuracy, nanoseconds=excluded.nanoseconds, fix_status=excluded.fix_status,
+            fix_status_flags=excluded.fix_status_flags, date_time_flags=excluded.date_time_flags, 
+            numberof_svs=excluded.numberof_svs, longitude=excluded.longitude, latitude=excluded.latitude, 
+            wgs_altitude=excluded.wgs_altitude, msl_altitude=excluded.msl_altitude, horizontal_accuracy=excluded.horizontal_accuracy, 
             vertical_accuracy=excluded.vertical_accuracy, speed=excluded.speed, heading=excluded.heading, 
             speed_accuracy=excluded.speed_accuracy, heading_accuracy=excluded.heading_accuracy, pdop=excluded.pdop, 
-            lat_lon_flag=excluded.lat_lon_flags, battery_voltage=excluded.battery_voltage, gforce_x=excluded.gforce_x, 
+            lat_lon_flags=excluded.lat_lon_flags, battery_voltage=excluded.battery_voltage, gforce_x=excluded.gforce_x, 
             gforce_y=excluded.gforce_y, gforce_z=excluded.gforce_z, rotation_rate_x=excluded.rotation_rate_x, 
             rotation_rate_y=excluded.rotation_rate_y, rotation_rate_z=excluded.rotation_rate_z;
             """
@@ -130,6 +128,7 @@ def speed_to_color(speed, max_speed):
 
 # Function to plot the GPS path on an interactive folium map
 def plot_gps_path(in_data, map_name):
+    map_start_time = datetime.now()
     longitudes = []
     latitudes = []
     speeds = []
@@ -174,19 +173,26 @@ def plot_gps_path(in_data, map_name):
 
     map_folium.save(map_name)
 
-    logger.info(f"定位信息生成地图：{map_name}")
+    logger.info(f"地图 {map_name.replace('../file/','')} 生成完成，耗时 {(datetime.now() - map_start_time).total_seconds()} 秒！")
 
 
-def format_filename_from_first_record(first_record, device_name):
-    """Generate filename using the first record's date."""
-    year = first_record[2]
-    month = f"{first_record[3]:02d}"
-    day = f"{first_record[4]:02d}"
-    hour = f"{first_record[5]:02d}"
-    minute = f"{first_record[6]:02d}"
-    second = f"{first_record[7]:02d}"
-    timestamp = f"{year}{month}{day}_{hour}{minute}{second}"
-    return f"{device_name.replace(' ', '_')}_{timestamp}"
+def format_filename(in_first_record, in_last_record):
+    """生成文件名"""
+    first_year = in_first_record[2]
+    first_month = f"{in_first_record[3]:02d}"
+    first_day = f"{in_first_record[4]:02d}"
+    first_hour = f"{in_first_record[5]:02d}"
+    first_minute = f"{in_first_record[6]:02d}"
+    first_second = f"{in_first_record[7]:02d}"
+    last_year = in_last_record[2]
+    last_month = f"{in_last_record[3]:02d}"
+    last_day = f"{in_last_record[4]:02d}"
+    last_hour = f"{in_last_record[5]:02d}"
+    last_minute = f"{in_last_record[6]:02d}"
+    last_second = f"{in_last_record[7]:02d}"
+    first_timestamp = f"{first_year}{first_month}{first_day}{first_hour}{first_minute}{first_second}"
+    last_timestamp = f"{last_year}{last_month}{last_day}{last_hour}{last_minute}{last_second}"
+    return f"{first_timestamp}_{last_timestamp}"
 
 
 def save_last_device(device):
@@ -220,7 +226,7 @@ async def scan_and_connect():
             try:
                 device = await BleakScanner.find_device_by_address(last_device['address'])
                 if device:
-                    logger.info(f"找到上次连接设备: {device.name} - {device.address}")
+                    logger.info(f"找到上次连接设备: {device.name}")
                     await connect_and_download(device)
                 else:
                     logger.info("未找到上次连接设备, 扫描新设备...")
@@ -235,14 +241,14 @@ async def scan_and_connect():
         if racebox_devices:
             logger.info(f"扫描到 {len(racebox_devices)} 个RaceBox设备")
             for device in racebox_devices:
-                logger.info(f"连接设备 {device.name} - {device.address} 中...")
+                logger.info(f"连接设备 {device.name} 中...")
                 # 保存连接成功设备
                 save_last_device(device)
                 try:
                     await connect_and_download(device)
                     break  # 仅连接扫描出的第一个设备
                 except Exception as e:
-                    logger.info(f"连接设备 {device.name}: {e} 失败！")
+                    logger.info(f"连接设备失败： {device.name}: {e}")
         else:
             logger.error("未找到 RaceBox 设备")
     except asyncio.CancelledError:
@@ -297,27 +303,27 @@ def parse_message(packet):
         parsed_data[4],  # "Hour"
         parsed_data[5],  # "Minute"
         parsed_data[6],  # "Second"
-        {
+        extras.Json({
             "Valid Date": valid_date,
             "Valid Time": valid_time,
             "Fully Resolved": fully_resolved,
             "Valid Magnetic Declination": valid_magnetic_declination
-        },  # "Validity Flags"
+        }),  # "Validity Flags"
         parsed_data[8],  # "Time Accuracy"
         parsed_data[9],  # "Nanoseconds"
         parsed_data[10],  # "Fix Status"
-        {
+        extras.Json({
             "Valid Fix": valid_fix,
             "Differential Corrections Applied": differential_corrections_applied,
             "Power State": power_state,
             "Valid Heading": valid_heading,
             "Carrier Phase Range Solution": carrier_phase_range_solution
-        },  # "Fix Status Flags"
-        {
+        }),  # "Fix Status Flags"
+        extras.Json({
             "Available Confirmation of Date/Time Validity": available_confirmation,
             "Confirmed UTC Date Validity": confirmed_utc_date,
             "Confirmed UTC Time Validity": confirmed_utc_time
-        },  # "Date/Time Flags"
+        }),  # "Date/Time Flags"
         parsed_data[13],  # "Number of SVs"
         parsed_data[14] / 1e7,  # "Longitude"
         parsed_data[15] / 1e7,  # "Latitude"
@@ -330,10 +336,10 @@ def parse_message(packet):
         parsed_data[22],  # "Speed Accuracy"
         parsed_data[23] / 1e5,  # "Heading Accuracy"
         parsed_data[24],  # "PDOP"
-        {
+        extras.Json({
             "Invalid Latitude, Longitude, WGS Altitude, and MSL Altitude": invalid_lat_lon,
             "Differential Correction Age": differential_correction_age
-        },  # "Lat/Lon Flags"
+        }),  # "Lat/Lon Flags"
         input_voltage / 10,  # "Battery Status or Input Voltage"
         parsed_data[27] / 1000,  # "G-Force X"
         parsed_data[28] / 1000,  # "G-Force Y"
@@ -371,8 +377,13 @@ async def connect_and_download(device):
     buffer = bytearray()
     total_records = 0
     download_complete = asyncio.Event()
+    session_num = 0
+    down_start_time = datetime.now()
+    session_start_time = datetime.now()
+    first_record = None
+    last_record = None
 
-    async with BleakClient(device.address) as client:
+    async with (BleakClient(device.address) as client):
         try:
             await client.disconnect()
             await client.connect()
@@ -384,9 +395,8 @@ async def connect_and_download(device):
                 return
 
             def notification_handler(sender, data):
-                nonlocal buffer, session_data, total_records
+                nonlocal buffer, session_data, total_records, session_num, down_start_time, session_start_time, first_record, last_record
                 buffer.extend(data)
-                session_num = 0
 
                 # 处理传输数据
                 while len(buffer) >= 8:
@@ -394,7 +404,6 @@ async def connect_and_download(device):
                         message_class, message_id = buffer[2], buffer[3]
                         packet_length = struct.unpack('<H', buffer[4:6])[0]
                         full_packet_length = packet_length + 8
-                        start_time = datetime.now()
 
                         if len(buffer) < full_packet_length:
                             break
@@ -407,22 +416,28 @@ async def connect_and_download(device):
                                 elif message_id == 0x21:  # 历史数据
                                     record = parse_message(buffer[:full_packet_length])
                                     session_data.append(record)
+                                    if first_record is None:
+                                        first_record = record
+                                    last_record = record
                                 elif message_id == 0x01:  # 实时数据
                                     record = parse_message(buffer[:full_packet_length])
                                     session_data.append(record)
+                                    if first_record is None:
+                                        first_record = record
+                                    last_record = record
                                 elif message_id == 0x02:
-                                    logger.info("下载完成！")
+                                    logger.info(f"下载完成，耗时 {(datetime.now() - down_start_time).total_seconds()} 秒！")
                                     download_complete.set()
-                                elif message_id == 0x03:
-                                    logger.info("接收 NACK 消息！")
                                 elif message_id == 0x26:
-                                    session_num += 1
-                                    duration = (datetime.now() - start_time).total_seconds()
-                                    first_records = session_data[0]
-                                    file_name = format_filename_from_first_record(first_records, device.name)
-                                    imp_data = (time_uuid, file_name, duration)
-                                    insert_db(ins_imp, imp_data)
-                                    logger.info(f"已处理{session_num}段数据，累计耗时 {duration} 秒！")
+                                    if first_record:
+                                        session_num += 1
+                                        duration = (datetime.now() - session_start_time).total_seconds()
+                                        file_name = format_filename(first_record, last_record)
+                                        imp_data = (time_uuid, file_name, duration)
+                                        insert_db(ins_imp, imp_data)
+                                        logger.info(f"已处理第{session_num}段数据，耗时 {duration} 秒！")
+                                    session_start_time = datetime.now()
+                                    first_record = None
                             buffer = buffer[full_packet_length:]
 
             await client.start_notify(TX_CHAR_UUID, notification_handler)
@@ -440,22 +455,22 @@ async def connect_and_download(device):
     # 保存数据
     if session_data:
         try:
-            first_record = session_data[0]
-            map_name = f"../file/{format_filename_from_first_record(first_record, device.name)}_map.html"
+            map_record = session_data[0]
+            map_name = (f"../file/map_{map_record[2]}{map_record[3]:02d}{map_record[4]:02d}"
+                        f"{map_record[5]:02d}{map_record[6]:02d}{map_record[7]:02d}.html")
             plot_gps_path(session_data, map_name)
 
+            insert_start_time = datetime.now()
             cur = con.cursor()
-            execute_values(cur, ins_data, session_data, page_size=1000)
+            extras.execute_values(cur, ins_data, session_data, page_size=1000)
             con.commit()
+            logger.info(f"定位数据入库成功，耗时 {(datetime.now() - insert_start_time).total_seconds()} 秒！")
         except Exception as e:
             logger.error(e)
         finally:
             cur.close()
 
 
-async def main():
-    await scan_and_connect()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+start_time = datetime.now()
+asyncio.run(scan_and_connect())
+logger.info(f"所有操作完成，总计耗时 {(datetime.now() - start_time).total_seconds()} 秒！")
