@@ -3,6 +3,8 @@
 -- created : 2024-12-5 15:30:23
 -- 运维脚本
 
+set time zone 'asia/shanghai';
+
 insert into lc_racebox(itow, year, month, day, hour, minute, second, validity_flags, time_accuracy, nanoseconds,
 fix_status, fix_status_flags, date_time_flags, numberof_svs, longitude, latitude, wgs_altitude, msl_altitude,
 horizontal_accuracy, vertical_accuracy, speed, heading, speed_accuracy, heading_accuracy, pdop, lat_lon_flags,
@@ -25,3 +27,8 @@ insert into imp_racebox(imp_stamp, file_name, duration);
 select * from lc_racebox;
 
 select * from imp_racebox;
+
+select * from lc_racebox where imp_stamp='beea6fee-b36d-11ef-bce9-d4f32d1e055e';
+
+delete from imp_racebox where imp_stamp='39f6f9f7-b369-11ef-8802-d4f32d1e055e';
+delete from lc_racebox where imp_stamp='39f6f9f7-b369-11ef-8802-d4f32d1e055e';
