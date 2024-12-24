@@ -19,12 +19,12 @@ create table lc_racebox (
   hour int,
   minute int,
   second int,
-  validity_flags json,
+  -- validity_flags json,
   time_accuracy int,
   nanoseconds int,
   fix_status int,
-  fix_status_flags json,
-  date_time_flags json,
+  -- fix_status_flags json,
+  -- date_time_flags json,
   numberof_svs int,
   longitude decimal(18,7),
   latitude decimal(18,7),
@@ -37,8 +37,8 @@ create table lc_racebox (
   speed_accuracy int,
   heading_accuracy int,
   pdop int,
-  lat_lon_flags json,
-  battery_voltage int,
+  -- lat_lon_flags json,
+  -- battery_voltage int,
   gforce_x decimal(10,3),
   gforce_y decimal(10,3),
   gforce_z decimal(10,3),
@@ -74,12 +74,12 @@ comment on column lc_racebox.day is '日(UTC)';
 comment on column lc_racebox.hour is '时(UTC)';
 comment on column lc_racebox.minute is '分(UTC)';
 comment on column lc_racebox.second is '秒(UTC)';
-comment on column lc_racebox.validity_flags is '数据验证标记';
+-- comment on column lc_racebox.validity_flags is '数据验证标记';
 comment on column lc_racebox.time_accuracy is '精确时间戳';
 comment on column lc_racebox.nanoseconds is '毫秒';
 comment on column lc_racebox.fix_status is 'GPS修正0:no fix 2:2D fix 3:3D fix';
-comment on column lc_racebox.fix_status_flags is 'GPS修正标记';
-comment on column lc_racebox.date_time_flags is '时间日期标记';
+-- comment on column lc_racebox.fix_status_flags is 'GPS修正标记';
+-- comment on column lc_racebox.date_time_flags is '时间日期标记';
 comment on column lc_racebox.numberof_svs is 'GPS卫星数量';
 comment on column lc_racebox.longitude is 'GPS经度';
 comment on column lc_racebox.latitude is 'GPS维度';
@@ -92,8 +92,8 @@ comment on column lc_racebox.heading is '方向角';
 comment on column lc_racebox.speed_accuracy is '精确速度(毫米/秒)';
 comment on column lc_racebox.heading_accuracy is '精确方向角';
 comment on column lc_racebox.pdop is '定位点经度误差';
-comment on column lc_racebox.lat_lon_flags is '经纬度标记';
-comment on column lc_racebox.battery_voltage is '电池电压';
+-- comment on column lc_racebox.lat_lon_flags is '经纬度标记';
+-- comment on column lc_racebox.battery_voltage is '电池电压';
 comment on column lc_racebox.gforce_x is '前后加速度/milli-g';
 comment on column lc_racebox.gforce_y is '左右加速度/milli-g';
 comment on column lc_racebox.gforce_z is '上下加速度/milli-g';
