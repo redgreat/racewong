@@ -20,6 +20,8 @@ import folium
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+from folium.map import FeatureGroup
+from folium.raster_layers import TileLayer
 
 # 数据库连接定义
 config = configparser.ConfigParser()
@@ -30,6 +32,7 @@ pg_database = config.get("racebox", "database")
 pg_user = config.get("racebox", "user")
 pg_password = config.get("racebox", "password")
 pg_port = int(config.get("racebox", "port"))
+amap_key = config.get("amap", "amap_key")
 
 # 日志配置
 logDir = os.path.expanduser("../log/")
@@ -151,6 +154,16 @@ def plot_gps_path(in_data, map_name):
     avg_lon = np.mean(longitudes)
     map_folium = folium.Map(location=[avg_lat, avg_lon], zoom_start=13)
 
+    amap_layer = TileLayer(
+        'https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
+        attr='高德地图',
+        overlay=True,
+        control=True,
+        **{'Amap_key': amap_key}
+    )
+
+    map_folium.add_child(amap_layer)
+
     # Calculate maximum speed for normalization
     max_speed = max(speeds)
 
@@ -224,7 +237,7 @@ async def scan_and_connect():
         if last_device:
             logger.info(f"开始连接上次连接设备: {last_device['name']}")
             try:
-                device = await BleakScanner.find_device_by_address(last_device['address'])
+                device = await BleakScanner.find_device_by_address(last_device['address'], timeout=10)
                 if device:
                     logger.info(f"找到上次连接设备: {device.name}")
                     await connect_and_download(device)
@@ -235,7 +248,7 @@ async def scan_and_connect():
                 logger.info("扫描新设备...")
 
         # 上次连接设备连接失败，扫描新设备
-        devices = await BleakScanner.discover()
+        devices = await BleakScanner.discover(timeout=10)
         racebox_devices = [device for device in devices if device.name and "RaceBox" in device.name]
 
         if racebox_devices:
@@ -383,7 +396,7 @@ async def connect_and_download(device):
     first_record = None
     last_record = None
 
-    async with (BleakClient(device.address) as client):
+    async with (BleakClient(device.address, timeout=20) as client):
         try:
             await client.disconnect()
             await client.connect()
@@ -454,6 +467,8 @@ async def connect_and_download(device):
 
     # 保存数据
     if session_data:
+        print(session_data[0])
+        print(session_data[1])
         try:
             map_record = session_data[0]
             map_name = (f"../file/map_{map_record[2]}{map_record[3]:02d}{map_record[4]:02d}"
