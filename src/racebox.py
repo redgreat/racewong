@@ -20,6 +20,7 @@ import folium
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+from folium.raster_layers import TileLayer
 
 # 数据库连接定义
 config = configparser.ConfigParser()
@@ -30,6 +31,7 @@ pg_database = config.get("racebox", "database")
 pg_user = config.get("racebox", "user")
 pg_password = config.get("racebox", "password")
 pg_port = int(config.get("racebox", "port"))
+amap_key = config.get("amap", "amap_key")
 
 # 日志配置
 logDir = os.path.expanduser("../log/")
@@ -164,10 +166,17 @@ def plot_gps_path(in_data, map_name):
     map_folium = folium.Map(
         location=[avg_lat, avg_lon],
         zoom_start=13,
-        control_scale=True,
-        tiles='Amap'
+        control_scale=True
     )
 
+    amap_layer = TileLayer(
+        'https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
+        attr='高德地图',
+        overlay=True,
+        control=True,
+        **{'Amap_key': amap_key}
+    )
+    map_folium.add_child(amap_layer)
     max_speed = max(speeds)
 
     for i in range(1, len(latitudes) - 1):
@@ -399,7 +408,7 @@ async def connect_and_download(device):
     first_record = None
     last_record = None
 
-    async with (BleakClient(device.address) as client):
+    async with (BleakClient(device.address, timeout=20) as client):
         try:
             await client.disconnect()
             await client.connect()
