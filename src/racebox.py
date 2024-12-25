@@ -21,6 +21,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from folium.raster_layers import TileLayer
+import math
 
 # 数据库连接定义
 config = configparser.ConfigParser()
@@ -58,22 +59,14 @@ TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 NMEA_TX_UUID = "00001103-0000-1000-8000-00805f9b34fb"
 DOWNLOAD_COMMAND = bytes([0xB5, 0x62, 0xFF, 0x23, 0x00, 0x00, 0x22, 0x65])  # Command to initiate data download
 
-# ins_data = """insert into lc_racebox(itow, imp_stamp, year, month, day, hour, minute, second, validity_flags, time_accuracy,
-#             nanoseconds, fix_status, fix_status_flags, date_time_flags, numberof_svs, longitude, latitude, wgs_altitude,
-#             msl_altitude, horizontal_accuracy, vertical_accuracy, speed, heading, speed_accuracy, heading_accuracy, pdop,
-#             lat_lon_flags, battery_voltage, gforce_x, gforce_y, gforce_z, rotation_rate_x, rotation_rate_y, rotation_rate_z)
-#             values %s on conflict (itow) do update set year=excluded.year, month=excluded.month, day=excluded.day,
-#             hour=excluded.hour, minute=excluded.minute, second=excluded.second, validity_flags=excluded.validity_flags,
-#             time_accuracy=excluded.time_accuracy, nanoseconds=excluded.nanoseconds, fix_status=excluded.fix_status,
-#             fix_status_flags=excluded.fix_status_flags, date_time_flags=excluded.date_time_flags,
-#             numberof_svs=excluded.numberof_svs, longitude=excluded.longitude, latitude=excluded.latitude,
-#             wgs_altitude=excluded.wgs_altitude, msl_altitude=excluded.msl_altitude, horizontal_accuracy=excluded.horizontal_accuracy,
-#             vertical_accuracy=excluded.vertical_accuracy, speed=excluded.speed, heading=excluded.heading,
-#             speed_accuracy=excluded.speed_accuracy, heading_accuracy=excluded.heading_accuracy, pdop=excluded.pdop,
-#             lat_lon_flags=excluded.lat_lon_flags, battery_voltage=excluded.battery_voltage, gforce_x=excluded.gforce_x,
-#             gforce_y=excluded.gforce_y, gforce_z=excluded.gforce_z, rotation_rate_x=excluded.rotation_rate_x,
-#             rotation_rate_y=excluded.rotation_rate_y, rotation_rate_z=excluded.rotation_rate_z;
-#             """
+# Define the bounding box for China
+LAT_MIN, LAT_MAX = 3.52, 53.33
+LON_MIN, LON_MAX = 73.40, 135.25
+
+# GC02J 坐标转换参数
+x_pi = math.pi * 3000.0 / 180.0
+a = 6378245.0
+ee = 0.00669342162296594323
 
 ins_data = """insert into lc_racebox(itow, imp_stamp, year, month, day, hour, minute, second, time_accuracy, nanoseconds,  
             fix_status, numberof_svs, longitude, latitude, wgs_altitude, msl_altitude, horizontal_accuracy, 
@@ -93,34 +86,6 @@ ins_data = """insert into lc_racebox(itow, imp_stamp, year, month, day, hour, mi
 ins_imp = """insert into imp_racebox(imp_stamp, file_name, duration) values (%s, %s, %s);
           """
 
-# 定义标志位的掩码
-# validity_flags
-VALID_DATE_MASK = 0x01  # 00000001
-VALID_TIME_MASK = 0x02  # 00000010
-FULLY_RESOLVED_MASK = 0x04  # 00000100
-VALID_MAG_DECLINATION_MASK = 0x08  # 00001000
-
-# fix_status_flags
-VALID_FIX_MASK = 0x01  # 00000001
-DIFFERENTIAL_CORRECTIONS_MASK = 0x02  # 00000010
-POWER_STATE_MASK = 0x1C  # 00011100
-VALID_HEADING_MASK = 0x20  # 00100000
-CARRIER_PHASE_RANGE_SOLUTION_MASK = 0xC0  # 11000000
-
-# date_time_flags
-AVAILABLE_CONFIRMATION_MASK = 0x20  # 00100000
-CONFIRMED_UTC_DATE_MASK = 0x40  # 01000000
-CONFIRMED_UTC_TIME_MASK = 0x80  # 10000000
-
-# lat_lon_flags
-INVALID_LAT_LON_MASK = 0x01  # 00000001
-DIFFERENTIAL_CORRECTION_AGE_MASK = 0x1E  # 00011110
-
-# battery_status_voltage
-CHARGING_MASK = 0x80  # 10000000
-BATTERY_LEVEL_MASK = 0x7F  # 01111111
-VOLTAGE_MASK = 0xFF  # 11111111
-
 # 上次连接设备文件
 DEVICE_MEMORY_FILE = "../conf/last_device.json"
 
@@ -137,41 +102,85 @@ con = psycopg2.connect(database=pg_database,
 psycopg2.extras.register_uuid()
 
 
+def _transformlat(lng, lat):
+    ret = (-100.0 + 2.0 * lng + 3.0 * lat + 0.2 * lat * lat +
+           0.1 * lng * lat + 0.2 * math.sqrt(math.fabs(lng)))
+    ret += (20.0 * math.sin(6.0 * lng * math.pi) + 20.0 *
+            math.sin(2.0 * lng * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(lat * math.pi) + 40.0 *
+            math.sin(lat / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (160.0 * math.sin(lat / 12.0 * math.pi) + 320 *
+            math.sin(lat * math.pi / 30.0)) * 2.0 / 3.0
+    return ret
+
+def _transformlng(lng, lat):
+    ret = (300.0 + lng + 2.0 * lat + 0.1 * lng * lng +
+           0.1 * lng * lat + 0.1 * math.sqrt(math.fabs(lng)))
+    ret += (20.0 * math.sin(6.0 * lng * math.pi) + 20.0 *
+            math.sin(2.0 * lng * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(lng * math.pi) + 40.0 *
+            math.sin(lng / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (150.0 * math.sin(lng / 12.0 * math.pi) + 300.0 *
+            math.sin(lng / 30.0 * math.pi)) * 2.0 / 3.0
+    return ret
+
+def out_of_china(lng, lat):
+    return not (lng > 73.40 and lng < 135.25 and lat > 3.52 and lat < 53.55)
+
+def wgs84_to_gcj02(lng, lat):
+    if out_of_china(lng, lat):
+        return [lng, lat]
+    dlat = _transformlat(lng - 105.0, lat - 35.0)
+    dlng = _transformlng(lng - 105.0, lat - 35.0)
+    radlat = lat / 180.0 * math.pi
+    magic = math.sin(radlat)
+    magic = 1 - ee * magic * magic
+    sqrtmagic = math.sqrt(magic)
+    dlat = (dlat * 180.0) / ((a * (1 - ee)) / (magic * sqrtmagic) * math.pi)
+    dlng = (dlng * 180.0) / (a / sqrtmagic * math.cos(radlat) * math.pi)
+    mglat = lat + dlat
+    mglng = lng + dlng
+    return [mglng, mglat]
+
+
 def speed_to_color(speed, max_speed):
-    cmap = plt.get_cmap('cool')
+    cmap = plt.get_cmap('jet')
     norm_speed = min(speed / max_speed, 1.0)
     return mcolors.to_hex(cmap(norm_speed))
 
 
 def plot_gps_path(in_data, map_name):
     map_start_time = datetime.now()
-    longitudes = []
-    latitudes = []
+    lngs = []
+    lats = []
     speeds = []
     for row in in_data:
-        longitudes.append(float(row[15]))
-        latitudes.append(float(row[16]))
-        speeds.append(float(row[21]))
+        lng=float(row[12])
+        lat=float(row[13])
+        if not out_of_china(lng, lat):
+            lngs.append(lng)
+            lats.append(lat)
+            speeds.append(float(row[18]))
 
-    if len(longitudes) < 1000 or len(latitudes) < 1000:
-        logger.info(f"因点数据少于1000，跳过生成地图： {map_name}！")
+    if len(lngs) < 100 or len(lats) < 100:
+        logger.info(f"因点数据少于100，跳过生成地图： {map_name}！")
         return
 
-    if len(longitudes) == 0 or len(latitudes) == 0:
+    if len(lngs) == 0 or len(lats) == 0:
         logger.info(f"没有定位点，跳过生成地图 {map_name}！")
         return
 
-    avg_lat = np.mean(latitudes)
-    avg_lon = np.mean(longitudes)
+    avg_lng = np.mean(lngs)
+    avg_lat = np.mean(lats)
     map_folium = folium.Map(
-        location=[avg_lat, avg_lon],
+        location=[avg_lat, avg_lng],
         zoom_start=13,
         control_scale=True
     )
 
     amap_layer = TileLayer(
         'https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
-        attr='高德地图',
+        attr='AMAP',
         overlay=True,
         control=True,
         **{'Amap_key': amap_key}
@@ -179,11 +188,10 @@ def plot_gps_path(in_data, map_name):
     map_folium.add_child(amap_layer)
     max_speed = max(speeds)
 
-    for i in range(1, len(latitudes) - 1):
-        start_point = [latitudes[i - 1], longitudes[i - 1]]
-        end_point = [latitudes[i], longitudes[i]]
+    for i in range(1, len(lats) - 1):
+        start_point = [lats[i - 1], lngs[i - 1]]
+        end_point = [lats[i], lngs[i]]
         speed = speeds[i]
-
         color = speed_to_color(speed, max_speed)
 
         folium.PolyLine(
@@ -193,8 +201,8 @@ def plot_gps_path(in_data, map_name):
             opacity=1.0
         ).add_to(map_folium)
 
-    folium.Marker([latitudes[0], longitudes[0]], icon=folium.Icon(color='green')).add_to(map_folium)
-    folium.Marker([latitudes[-1], longitudes[-1]], icon=folium.Icon(color='red')).add_to(map_folium)
+    folium.Marker([lats[0], lngs[0]], icon=folium.Icon(color='green')).add_to(map_folium)
+    folium.Marker([lats[-1], lngs[-1]], icon=folium.Icon(color='red')).add_to(map_folium)
     map_folium.save(map_name)
 
     logger.info(
@@ -285,95 +293,40 @@ def parse_message(packet):
     """处理二进制数据"""
     payload = packet[6:86]
     parsed_data = struct.unpack('<I H B B B B B B I i B B B B i i i i I I i i I I H B B h h h h h h', payload[:80])
-
-    # validity_flags parse
-    # validity_flags_byte = parsed_data[7]
-    # valid_date = (validity_flags_byte & VALID_DATE_MASK) != 0
-    # valid_time = (validity_flags_byte & VALID_TIME_MASK) != 0
-    # fully_resolved = (validity_flags_byte & FULLY_RESOLVED_MASK) != 0
-    # valid_magnetic_declination = (validity_flags_byte & VALID_MAG_DECLINATION_MASK) != 0
-
-    # fix_status_flags parse
-    # fix_status_flags_byte = parsed_data[11]
-    # valid_fix = (fix_status_flags_byte & VALID_FIX_MASK) != 0
-    # differential_corrections_applied = (fix_status_flags_byte & DIFFERENTIAL_CORRECTIONS_MASK) != 0
-    # power_state = (fix_status_flags_byte & POWER_STATE_MASK) >> 2  # 提取Bits 4..2
-    # valid_heading = (fix_status_flags_byte & VALID_HEADING_MASK) != 0
-    # carrier_phase_range_solution = (fix_status_flags_byte & CARRIER_PHASE_RANGE_SOLUTION_MASK) >> 6  # 提取Bits 7..6
-
-    # datetime_flags
-    # datetime_flags_byte = parsed_data[12]
-    # available_confirmation = (datetime_flags_byte & AVAILABLE_CONFIRMATION_MASK) != 0
-    # confirmed_utc_date = (datetime_flags_byte & CONFIRMED_UTC_DATE_MASK) != 0
-    # confirmed_utc_time = (datetime_flags_byte & CONFIRMED_UTC_TIME_MASK) != 0
-
-    # lat_lon_flags
-    # lat_lon_flags_byte = parsed_data[25]
-    # invalid_lat_lon = (lat_lon_flags_byte & INVALID_LAT_LON_MASK) != 0
-    # differential_correction_age = (lat_lon_flags_byte & DIFFERENTIAL_CORRECTION_AGE_MASK) >> 1
-
-    # battery_status_voltage
-    # battery_status_voltage_byte = parsed_data[26]
-    # 提取电池电量百分比（适用于RaceBox Mini和Mini S）
-    # battery_level = battery_status_voltage_byte & BATTERY_LEVEL_MASK
-    # 计算输入电压（适用于RaceBox Micro）
-    # input_voltage = battery_status_voltage_byte & VOLTAGE_MASK
-
-    record = (
-        parsed_data[0],  # "iTOW"
-        time_uuid,  # 导入标签
-        parsed_data[1],  # "Year"
-        parsed_data[2],  # "Month"
-        parsed_data[3],  # "Day"
-        parsed_data[4],  # "Hour"
-        parsed_data[5],  # "Minute"
-        parsed_data[6],  # "Second"
-        # extras.Json({
-        #     "Valid Date": valid_date,
-        #     "Valid Time": valid_time,
-        #     "Fully Resolved": fully_resolved,
-        #     "Valid Magnetic Declination": valid_magnetic_declination
-        # }),  # "Validity Flags"
-        parsed_data[8],  # "Time Accuracy"
-        parsed_data[9],  # "Nanoseconds"
-        parsed_data[10],  # "Fix Status"
-        # extras.Json({
-        #     "Valid Fix": valid_fix,
-        #     "Differential Corrections Applied": differential_corrections_applied,
-        #     "Power State": power_state,
-        #     "Valid Heading": valid_heading,
-        #     "Carrier Phase Range Solution": carrier_phase_range_solution
-        # }),  # "Fix Status Flags"
-        # extras.Json({
-        #     "Available Confirmation of Date/Time Validity": available_confirmation,
-        #     "Confirmed UTC Date Validity": confirmed_utc_date,
-        #     "Confirmed UTC Time Validity": confirmed_utc_time
-        # }),  # "Date/Time Flags"
-        parsed_data[13],  # "Number of SVs"
-        parsed_data[14] / 1e7,  # "Longitude"
-        parsed_data[15] / 1e7,  # "Latitude"
-        parsed_data[16] / 1000,  # "WGS Altitude"
-        parsed_data[17] / 1000,  # "MSL Altitude"
-        parsed_data[18] / 1000,  # "Horizontal Accuracy"
-        parsed_data[19] / 1000,  # "Vertical Accuracy"
-        parsed_data[20] / 100 * 60,  # "Speed"
-        parsed_data[21] / 100000,  # "Heading"
-        parsed_data[22],  # "Speed Accuracy"
-        parsed_data[23] / 1e5,  # "Heading Accuracy"
-        parsed_data[24],  # "PDOP"
-        # extras.Json({
-        #     "Invalid Latitude, Longitude, WGS Altitude, and MSL Altitude": invalid_lat_lon,
-        #     "Differential Correction Age": differential_correction_age
-        # }),  # "Lat/Lon Flags"
-        # input_voltage / 10,  # "Battery Status or Input Voltage"
-        parsed_data[27] / 1000,  # "G-Force X"
-        parsed_data[28] / 1000,  # "G-Force Y"
-        parsed_data[29] / 1000,  # "G-Force Z"
-        parsed_data[30] / 100,  # "Rotation rate X"
-        parsed_data[31] / 100,  # "Rotation rate Y"
-        parsed_data[32] / 100  # "Rotation rate Z"
-    )
-    return record
+    lng, lat = wgs84_to_gcj02((parsed_data[14] / 1e7), (parsed_data[15] / 1e7))
+    if int(parsed_data[10]) != 0:
+        record = (
+            parsed_data[0],  # "iTOW"
+            time_uuid,  # 导入标签
+            parsed_data[1],  # "Year"
+            parsed_data[2],  # "Month"
+            parsed_data[3],  # "Day"
+            parsed_data[4],  # "Hour"
+            parsed_data[5],  # "Minute"
+            parsed_data[6],  # "Second"
+            parsed_data[8],  # "Time Accuracy"
+            parsed_data[9],  # "Nanoseconds"
+            parsed_data[10],  # "Fix Status"
+            parsed_data[13],  # "Number of SVs"
+            lng,  # "Longitude"
+            lat,  # "Latitude"
+            parsed_data[16] / 1000,  # "WGS Altitude"
+            parsed_data[17] / 1000,  # "MSL Altitude"
+            parsed_data[18] / 1000,  # "Horizontal Accuracy"
+            parsed_data[19] / 1000,  # "Vertical Accuracy"
+            parsed_data[20] / 100 * 60,  # "Speed"
+            parsed_data[21] / 100000,  # "Heading"
+            parsed_data[22],  # "Speed Accuracy"
+            parsed_data[23] / 1e5,  # "Heading Accuracy"
+            parsed_data[24],  # "PDOP"
+            parsed_data[27] / 1000,  # "G-Force X"
+            parsed_data[28] / 1000,  # "G-Force Y"
+            parsed_data[29] / 1000,  # "G-Force Z"
+            parsed_data[30] / 100,  # "Rotation rate X"
+            parsed_data[31] / 100,  # "Rotation rate Y"
+            parsed_data[32] / 100  # "Rotation rate Z"
+        )
+        return record
 
 
 def validate_checksum(buffer):
@@ -408,7 +361,7 @@ async def connect_and_download(device):
     first_record = None
     last_record = None
 
-    async with (BleakClient(device.address, timeout=20) as client):
+    async with (BleakClient(device.address) as client):
         try:
             await client.disconnect()
             await client.connect()
@@ -440,15 +393,17 @@ async def connect_and_download(device):
                                     logger.info(f"总计 {total_records} 条记录")
                                 elif message_id == 0x21:  # 历史数据
                                     record = parse_message(buffer[:full_packet_length])
-                                    session_data.append(record)
-                                    if first_record is None:
-                                        first_record = record
-                                    last_record = record
+                                    if record:
+                                        session_data.append(record)
+                                        if first_record is None:
+                                            first_record = record
+                                        last_record = record
                                 elif message_id == 0x01:  # 实时数据
                                     record = parse_message(buffer[:full_packet_length])
-                                    session_data.append(record)
-                                    if first_record is None:
-                                        first_record = record
+                                    if record:
+                                        session_data.append(record)
+                                        if first_record is None:
+                                            first_record = record
                                     last_record = record
                                 elif message_id == 0x02:
                                     logger.info(
@@ -481,10 +436,14 @@ async def connect_and_download(device):
     # 保存数据
     if session_data:
         try:
-            map_record = session_data[0]
-            map_name = (f"../file/map_{map_record[2]}{map_record[3]:02d}{map_record[4]:02d}"
-                        f"{map_record[5]:02d}{map_record[6]:02d}{map_record[7]:02d}.html")
-            plot_gps_path(session_data, map_name)
+            for map_record in session_data:
+                lng=float(map_record[12])
+                lat=float(map_record[13])
+                if not out_of_china(lng, lat):
+                    map_name = (f"../file/map_{map_record[2]}{map_record[3]:02d}{map_record[4]:02d}"
+                                f"{map_record[5]:02d}{map_record[6]:02d}{map_record[7]:02d}.html")
+                    plot_gps_path(session_data, map_name)
+                    break
 
             insert_start_time = datetime.now()
             cur = con.cursor()
