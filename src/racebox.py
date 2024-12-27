@@ -249,8 +249,24 @@ def get_last_device():
     return None
 
 
-async def scan_and_connect():
-    """查询RaceBox设备并连接"""
+async def scan_device_connect():
+    devices = await BleakScanner.discover()
+    racebox_devices = [device for device in devices if device.name and "RaceBox" in device.name]
+
+    if racebox_devices:
+        logger.info(f"扫描到 {len(racebox_devices)} 个RaceBox设备")
+        for device in racebox_devices:
+            logger.info(f"连接设备 {device.name} 中...")
+            # 保存连接成功设备
+            save_last_device(device)
+            try:
+                await connect_and_download(device)
+                break  # 仅连接扫描出的第一个设备
+            except Exception as e:
+                logger.info(f"连接设备失败： {device.name}: {e}")
+
+
+async def last_device_connect():
     try:
         # 先尝试连接上次连接的设备
         last_device = get_last_device()
@@ -263,25 +279,11 @@ async def scan_and_connect():
                     await connect_and_download(device)
                 else:
                     logger.info("未找到上次连接设备, 扫描新设备...")
+                    await scan_device_connect()
             except Exception as e:
                 logger.info(f"上次连接设备连接失败！: {e}")
                 logger.info("扫描新设备...")
-
-        # 上次连接设备连接失败，扫描新设备
-        devices = await BleakScanner.discover()
-        racebox_devices = [device for device in devices if device.name and "RaceBox" in device.name]
-
-        if racebox_devices:
-            logger.info(f"扫描到 {len(racebox_devices)} 个RaceBox设备")
-            for device in racebox_devices:
-                logger.info(f"连接设备 {device.name} 中...")
-                # 保存连接成功设备
-                save_last_device(device)
-                try:
-                    await connect_and_download(device)
-                    break  # 仅连接扫描出的第一个设备
-                except Exception as e:
-                    logger.info(f"连接设备失败： {device.name}: {e}")
+                await scan_device_connect()
         else:
             logger.error("未找到 RaceBox 设备")
     except asyncio.CancelledError:
@@ -361,7 +363,7 @@ async def connect_and_download(device):
     first_record = None
     last_record = None
 
-    async with (BleakClient(device.address) as client):
+    async with (BleakClient(device.address, timeout=20) as client):
         try:
             await client.disconnect()
             await client.connect()
@@ -457,5 +459,5 @@ async def connect_and_download(device):
 
 
 start_time = datetime.now()
-asyncio.run(scan_and_connect())
+asyncio.run(last_device_connect())
 logger.info(f"所有操作完成，总计耗时 {(datetime.now() - start_time).total_seconds()} 秒！")
