@@ -206,7 +206,7 @@ def plot_gps_path(in_data, map_name):
     map_folium.save(map_name)
 
     logger.info(
-        f"地图 {map_name.replace('../file/', '')} 生成完成，耗时 {(datetime.now() - map_start_time).total_seconds()} 秒！")
+        f"地图 {map_name.replace('../routes/', '')} 生成完成，耗时 {(datetime.now() - map_start_time).total_seconds()} 秒！")
 
 
 def format_filename(in_first_record, in_last_record):
@@ -442,7 +442,7 @@ async def connect_and_download(device):
                 lng=float(map_record[12])
                 lat=float(map_record[13])
                 if not out_of_china(lng, lat):
-                    map_name = (f"../file/map_{map_record[2]}{map_record[3]:02d}{map_record[4]:02d}"
+                    map_name = (f"../routes/map_{map_record[2]}{map_record[3]:02d}{map_record[4]:02d}"
                                 f"{map_record[5]:02d}{map_record[6]:02d}{map_record[7]:02d}.html")
                     plot_gps_path(session_data, map_name)
                     break
