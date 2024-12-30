@@ -14,14 +14,14 @@ jobs:
       with:
         repository: 'redgreat/me'
         token: ${{ secrets.ME_PAT }}
-        path: 'pages'
+        path: 'me'
 
     - name: Checkout source repository
       uses: actions/checkout@v4
       with:
         repository: 'redgreat/racewong'
         token: ${{ secrets.ME_PAT }}
-        path: 'routes'
+        path: 'racewong'
 
     - name: Add routes as submodule
       run: |
