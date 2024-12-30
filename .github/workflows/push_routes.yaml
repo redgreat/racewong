@@ -14,21 +14,21 @@ jobs:
       with:
         repository: 'redgreat/me'
         token: ${{ secrets.ME_PAT }}
-        path: 'me'
+        path: 'pages'
 
     - name: Checkout source repository
       uses: actions/checkout@v4
       with:
         repository: 'redgreat/racewong'
         token: ${{ secrets.ME_PAT }}
-        path: 'racewong'
+        path: 'routes'
 
     - name: Add routes as submodule
       run: |
         cd me
         git config --global user.name 'racewong'
         git config --global user.email 'rubygreat@msn.com'
-        git submodule add -b main -f ../racewong/routes pages/routes
+        git submodule add -b main -f routes pages/routes
         git commit -m "Add routes as submodule"
         git push origin main
 
