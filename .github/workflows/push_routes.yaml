@@ -1,4 +1,4 @@
-name: PushRoutes
+name: Sync Routes as Submodule
 
 on:
   push:
@@ -6,32 +6,35 @@ on:
       - main
 
 jobs:
-  push_routes:
+  sync-routes:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout source code
-        uses: actions/checkout@v4
+    - name: Checkout target repository
+      uses: actions/checkout@v4
+      with:
+        repository: 'redgreat/me'
+        token: ${{ secrets.ME_PAT }}
+        path: 'me'
 
-      - name: Add compiled files to git
-        run: |
-          if [ -d "./routes" ]; then
-            git add ./routes
-          else
-            echo "Output directory does not exist."
-            exit 1
-          fi
+    - name: Checkout source repository
+      uses: actions/checkout@v4
+      with:
+        repository: 'redgreat/racewong'
+        token: ${{ secrets.ME_PAT }}
+        path: 'racewong'
 
-      - name: Push Routes
-        env:
-          ACCESS_TOKEN: ${{ secrets.ME_PAT }}
-        run: |
-          git remote add origin https://github.com/redgreat/me.git
-          
-          if git diff --cached --quiet; then
-            echo "无新文件提交"
-          else
-            git config --global user.name 'racewang.action'
-            git config --global user.email 'rubygreat@msn.com'
-            git commit -m "自动提交轨迹文件"
-            git push origin HEAD:main --force
-          fi
+    - name: Add routes as submodule
+      run: |
+        cd me
+        git config --global user.name 'racewong'
+        git config --global user.email 'rubygreat@msn.com'
+        git submodule add -b main -f ../racewong/routes pages/routes
+        git commit -m "Add routes as submodule"
+        git push origin main
+
+    - name: Synchronize submodule
+      run: |
+        cd me
+        git submodule update --remote --merge
+        git commit -m "Synchronize routes submodule"
+        git push origin main
