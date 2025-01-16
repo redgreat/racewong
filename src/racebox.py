@@ -71,16 +71,7 @@ ee = 0.00669342162296594323
 ins_data = """insert into lc_racebox(itow, imp_stamp, year, month, day, hour, minute, second, time_accuracy, nanoseconds,  
             fix_status, numberof_svs, longitude, latitude, wgs_altitude, msl_altitude, horizontal_accuracy, 
             vertical_accuracy, speed, heading, speed_accuracy, heading_accuracy, pdop, gforce_x, gforce_y, gforce_z, 
-            rotation_rate_x, rotation_rate_y, rotation_rate_z) values %s on conflict (itow) do update set 
-            year=excluded.year, month=excluded.month, day=excluded.day, hour=excluded.hour, minute=excluded.minute, 
-            second=excluded.second, time_accuracy=excluded.time_accuracy, nanoseconds=excluded.nanoseconds, 
-            fix_status=excluded.fix_status, numberof_svs=excluded.numberof_svs, longitude=excluded.longitude, 
-            latitude=excluded.latitude, wgs_altitude=excluded.wgs_altitude, msl_altitude=excluded.msl_altitude, 
-            horizontal_accuracy=excluded.horizontal_accuracy, vertical_accuracy=excluded.vertical_accuracy, 
-            speed=excluded.speed, heading=excluded.heading, speed_accuracy=excluded.speed_accuracy, 
-            heading_accuracy=excluded.heading_accuracy, pdop=excluded.pdop, gforce_x=excluded.gforce_x, 
-            gforce_y=excluded.gforce_y, gforce_z=excluded.gforce_z, rotation_rate_x=excluded.rotation_rate_x, 
-            rotation_rate_y=excluded.rotation_rate_y, rotation_rate_z=excluded.rotation_rate_z;
+            rotation_rate_x, rotation_rate_y, rotation_rate_z) values %s;
             """
 
 ins_imp = """insert into imp_racebox(imp_stamp, file_name, duration) values (%s, %s, %s);

@@ -11,6 +11,7 @@ set time zone 'asia/shanghai';
 
 drop table if exists lc_racebox;
 create table lc_racebox (
+  id serial,
   itow int,
   imp_stamp uuid,
   year int,
@@ -44,12 +45,13 @@ create table lc_racebox (
   gforce_z decimal(10,3),
   rotation_rate_x decimal(10,2),
   rotation_rate_y decimal(10,2),
-  rotation_rate_z decimal(10,2)
+  rotation_rate_z decimal(10,2),
+  insert_time timestamptz default current_timestamp
 );
 
 alter table lc_racebox owner to wangcw;
-alter table lc_racebox drop constraint if exists pk_racebox_itow cascade;
-alter table lc_racebox add constraint pk_racebox_itow primary key (itow);
+alter table lc_racebox drop constraint if exists pk_racebox_id cascade;
+alter table lc_racebox add constraint pk_racebox_id primary key (id);
 
 drop index if exists non_racebox_imp_stamp;
 create index non_racebox_imp_stamp on lc_racebox using btree (imp_stamp asc nulls last);
@@ -66,6 +68,7 @@ create index non_racebox_minute on lc_racebox using btree (minute asc nulls last
 drop index if exists non_racebox_second;
 create index non_racebox_second on lc_racebox using btree (second asc nulls last);
 
+comment on column lc_racebox.id is '自增主键';
 comment on column lc_racebox.itow is 'GPS星历时间戳';
 comment on column lc_racebox.imp_stamp is '导入标记';
 comment on column lc_racebox.year is '年(UTC)';
@@ -100,6 +103,7 @@ comment on column lc_racebox.gforce_z is '上下加速度/milli-g';
 comment on column lc_racebox.rotation_rate_x is '前后旋转速度/centi-degrees per second';
 comment on column lc_racebox.rotation_rate_y is '左右旋转速度/centi-degrees per second';
 comment on column lc_racebox.rotation_rate_z is '上下旋转速度/centi-degrees per second';
+comment on column lc_racebox.insert_time is '数据写入时间';
 comment on table lc_racebox is '业务数据_racebox信息';
 
 --  导入记录

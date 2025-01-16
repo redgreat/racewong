@@ -32,3 +32,25 @@ select * from lc_racebox where imp_stamp='beea6fee-b36d-11ef-bce9-d4f32d1e055e';
 
 delete from imp_racebox where imp_stamp='39f6f9f7-b369-11ef-8802-d4f32d1e055e';
 delete from lc_racebox where imp_stamp='39f6f9f7-b369-11ef-8802-d4f32d1e055e';
+
+SELECT COUNT(1) FROM imp_racebox;
+
+SELECT * FROM lc_racebox ORDER BY itow DESC;
+
+SELECT * FROM imp_racebox ORDER BY insert_time desc;
+
+SELECT COUNT(1) FROM lc_racebox WHERE imp_stamp='c1f18674-d3cb-11ef-ac2b-d4f32d1e055e';
+
+SELECT * FROM lc_racebox WHERE imp_stamp='c1f18674-d3cb-11ef-ac2b-d4f32d1e055e';
+
+DELETE FROM lc_racebox WHERE imp_stamp='b69af8bb-d3a0-11ef-aa1b-d4f32d1e055e';
+
+DELETE FROM imp_racebox WHERE imp_stamp='b69af8bb-d3a0-11ef-aa1b-d4f32d1e055e';
+
+SELECT COUNT(1) FROM lc_racebox WHERE year=2025 and month=1 and day in (15, 16);
+
+SELECT * FROM pg_stat_activity;
+
+SELECT pid, usename, datname, client_addr, state, query
+FROM pg_stat_activity;
+
