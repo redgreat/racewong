@@ -435,7 +435,7 @@ async def connect_and_download(device):
                 if not out_of_china(lng, lat):
                     map_name = (f"../routes/map_{map_record[2]}{map_record[3]:02d}{map_record[4]:02d}"
                                 f"{map_record[5]:02d}{map_record[6]:02d}{map_record[7]:02d}.html")
-                    plot_gps_path(session_data, map_name)
+                    # plot_gps_path(session_data, map_name)
                     break
 
             insert_start_time = datetime.now()

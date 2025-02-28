@@ -39,7 +39,7 @@ SELECT * FROM lc_racebox ORDER BY itow DESC;
 
 SELECT * FROM imp_racebox ORDER BY insert_time desc;
 
-SELECT COUNT(1) FROM lc_racebox WHERE imp_stamp='c1f18674-d3cb-11ef-ac2b-d4f32d1e055e';
+SELECT COUNT(1) FROM lc_racebox WHERE imp_stamp='686c4ecf-d6d3-11ef-8392-d4f32d1e055e';
 
 SELECT * FROM lc_racebox WHERE imp_stamp='c1f18674-d3cb-11ef-ac2b-d4f32d1e055e';
 
