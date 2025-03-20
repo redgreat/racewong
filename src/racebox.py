@@ -68,14 +68,17 @@ x_pi = math.pi * 3000.0 / 180.0
 a = 6378245.0
 ee = 0.00669342162296594323
 
+exists_imp = """select count(1) from imp_racebox where file_name = %s;
+          """
+
+ins_imp = """insert into imp_racebox(imp_stamp, file_name, duration) values (%s, %s, %s);
+          """
+
 ins_data = """insert into lc_racebox(itow, imp_stamp, year, month, day, hour, minute, second, time_accuracy, nanoseconds,  
             fix_status, numberof_svs, longitude, latitude, wgs_altitude, msl_altitude, horizontal_accuracy, 
             vertical_accuracy, speed, heading, speed_accuracy, heading_accuracy, pdop, gforce_x, gforce_y, gforce_z, 
             rotation_rate_x, rotation_rate_y, rotation_rate_z) values %s;
             """
-
-ins_imp = """insert into imp_racebox(imp_stamp, file_name, duration) values (%s, %s, %s);
-          """
 
 # 上次连接设备文件
 DEVICE_MEMORY_FILE = "../conf/last_device.json"
@@ -286,7 +289,7 @@ def parse_message(packet):
     """处理二进制数据"""
     payload = packet[6:86]
     parsed_data = struct.unpack('<I H B B B B B B I i B B B B i i i i I I i i I I H B B h h h h h h', payload[:80])
-    lng, lat = wgs84_to_gcj02((parsed_data[14] / 1e7), (parsed_data[15] / 1e7))
+    # lng, lat = wgs84_to_gcj02((parsed_data[14] / 1e7), (parsed_data[15] / 1e7))
     if int(parsed_data[10]) != 0:
         record = (
             parsed_data[0],  # "iTOW"
@@ -301,8 +304,8 @@ def parse_message(packet):
             parsed_data[9],  # "Nanoseconds"
             parsed_data[10],  # "Fix Status"
             parsed_data[13],  # "Number of SVs"
-            lng,  # "Longitude"
-            lat,  # "Latitude"
+            parsed_data[14] / 1e7,  # "Longitude"
+            parsed_data[15] / 1e7,  # "Latitude"
             parsed_data[16] / 1000,  # "WGS Altitude"
             parsed_data[17] / 1000,  # "MSL Altitude"
             parsed_data[18] / 1000,  # "Horizontal Accuracy"
@@ -341,6 +344,28 @@ def insert_db(in_sql, in_data):
     finally:
         cur.close()
 
+def load_db(in_sql, in_data):
+    try:
+        cur = con.cursor()
+        extras.execute_values(cur, in_sql, in_data, page_size=1000)
+        con.commit()
+    except Exception as e:
+        logger.error(e)
+    finally:
+        cur.close()
+
+def select_db(sel_sql, in_filter):
+    try:
+        cur = con.cursor()
+        res = cur.execute(sel_sql, (in_filter,))
+        if res:
+            return res.fetchone()
+        else:
+            return None
+    except Exception as e:
+        logger.error(e)
+    finally:
+        cur.close()
 
 async def connect_and_download(device):
     """建立已扫描连接并下载数据"""
@@ -399,19 +424,29 @@ async def connect_and_download(device):
                                             first_record = record
                                     last_record = record
                                 elif message_id == 0x02:
-                                    logger.info(
-                                        f"下载完成，耗时 {(datetime.now() - down_start_time).total_seconds()} 秒！")
+                                    # logger.info(
+                                    #     f"下载完成，耗时 {(datetime.now() - down_start_time).total_seconds()} 秒！")
                                     download_complete.set()
                                 elif message_id == 0x26:
                                     if first_record:
                                         session_num += 1
                                         duration = (datetime.now() - session_start_time).total_seconds()
                                         file_name = format_filename(first_record, last_record)
-                                        imp_data = (time_uuid, file_name, duration)
-                                        insert_db(ins_imp, imp_data)
-                                        logger.info(f"已处理第{session_num}段数据，耗时 {duration} 秒！")
+                                        exists_data = select_db(exists_imp, file_name)
+                                        if exists_data == 0:
+                                            if session_data:
+                                                session_len = len(exists_data)
+                                                imp_data = (time_uuid, file_name, duration)
+                                                insert_db(ins_imp, imp_data)
+                                                load_db(ins_data, session_data)
+                                                logger.info(f"已处理第{session_num}段数据文件名：{file_name}，共计{session_len}条，耗时 {duration} 秒！")
+                                            else:
+                                                logger.info(f"第{session_num}段数据文件名：{file_name}，共计{session_len}条，处理耗时 {duration} 秒，无数据，已跳过！")
+                                        else:
+                                            logger.info(f"第{session_num}段数据文件名：{file_name}，共计{session_len}条，处理耗时 {duration} 秒，数据库中已存在，已跳过！")
                                     session_start_time = datetime.now()
                                     first_record = None
+                                    session_data = []
                             buffer = buffer[full_packet_length:]
 
             await client.start_notify(TX_CHAR_UUID, notification_handler)
@@ -425,29 +460,6 @@ async def connect_and_download(device):
             logger.error(e)
         finally:
             await client.disconnect()
-
-    # 保存数据
-    if session_data:
-        try:
-            for map_record in session_data:
-                lng=float(map_record[12])
-                lat=float(map_record[13])
-                if not out_of_china(lng, lat):
-                    map_name = (f"../routes/map_{map_record[2]}{map_record[3]:02d}{map_record[4]:02d}"
-                                f"{map_record[5]:02d}{map_record[6]:02d}{map_record[7]:02d}.html")
-                    # plot_gps_path(session_data, map_name)
-                    break
-
-            insert_start_time = datetime.now()
-            cur = con.cursor()
-            extras.execute_values(cur, ins_data, session_data, page_size=1000)
-            con.commit()
-            logger.info(f"定位数据入库成功，耗时 {(datetime.now() - insert_start_time).total_seconds()} 秒！")
-        except Exception as e:
-            logger.error(e)
-        finally:
-            cur.close()
-
 
 start_time = datetime.now()
 asyncio.run(last_device_connect())
