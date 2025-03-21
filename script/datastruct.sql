@@ -4,7 +4,7 @@
 -- postgres表结构设计
 
 -- 设置查询路径
-alter role wangcw set search_path to wangcw, public;
+alter role user_eadm set search_path to eadm, public;
 
 --设置 本地时区
 set time zone 'asia/shanghai';
@@ -49,7 +49,7 @@ create table lc_racebox (
   insert_time timestamptz default current_timestamp
 );
 
-alter table lc_racebox owner to wangcw;
+alter table lc_racebox owner to user_eadm;
 alter table lc_racebox drop constraint if exists pk_racebox_id cascade;
 alter table lc_racebox add constraint pk_racebox_id primary key (id);
 
@@ -115,7 +115,7 @@ create table imp_racebox(
   duration int,
   insert_time timestamptz default current_timestamp
 );
-alter table imp_racebox owner to wangcw;
+alter table imp_racebox owner to user_eadm;
 alter table imp_racebox drop constraint if exists pk_imp_racebox_id cascade;
 alter table imp_racebox add constraint pk_imp_racebox_id primary key (id);
 

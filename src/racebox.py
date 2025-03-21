@@ -59,15 +59,6 @@ TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 NMEA_TX_UUID = "00001103-0000-1000-8000-00805f9b34fb"
 DOWNLOAD_COMMAND = bytes([0xB5, 0x62, 0xFF, 0x23, 0x00, 0x00, 0x22, 0x65])  # Command to initiate data download
 
-# Define the bounding box for China
-LAT_MIN, LAT_MAX = 3.52, 53.33
-LON_MIN, LON_MAX = 73.40, 135.25
-
-# GC02J 坐标转换参数
-x_pi = math.pi * 3000.0 / 180.0
-a = 6378245.0
-ee = 0.00669342162296594323
-
 exists_imp = """select count(1) from imp_racebox where file_name = %s;
           """
 
@@ -96,111 +87,39 @@ con = psycopg2.connect(database=pg_database,
 psycopg2.extras.register_uuid()
 
 
-def _transformlat(lng, lat):
-    ret = (-100.0 + 2.0 * lng + 3.0 * lat + 0.2 * lat * lat +
-           0.1 * lng * lat + 0.2 * math.sqrt(math.fabs(lng)))
-    ret += (20.0 * math.sin(6.0 * lng * math.pi) + 20.0 *
-            math.sin(2.0 * lng * math.pi)) * 2.0 / 3.0
-    ret += (20.0 * math.sin(lat * math.pi) + 40.0 *
-            math.sin(lat / 3.0 * math.pi)) * 2.0 / 3.0
-    ret += (160.0 * math.sin(lat / 12.0 * math.pi) + 320 *
-            math.sin(lat * math.pi / 30.0)) * 2.0 / 3.0
-    return ret
-
-def _transformlng(lng, lat):
-    ret = (300.0 + lng + 2.0 * lat + 0.1 * lng * lng +
-           0.1 * lng * lat + 0.1 * math.sqrt(math.fabs(lng)))
-    ret += (20.0 * math.sin(6.0 * lng * math.pi) + 20.0 *
-            math.sin(2.0 * lng * math.pi)) * 2.0 / 3.0
-    ret += (20.0 * math.sin(lng * math.pi) + 40.0 *
-            math.sin(lng / 3.0 * math.pi)) * 2.0 / 3.0
-    ret += (150.0 * math.sin(lng / 12.0 * math.pi) + 300.0 *
-            math.sin(lng / 30.0 * math.pi)) * 2.0 / 3.0
-    return ret
-
-def out_of_china(lng, lat):
-    return not (lng > 73.40 and lng < 135.25 and lat > 3.52 and lat < 53.55)
-
-def wgs84_to_gcj02(lng, lat):
-    if out_of_china(lng, lat):
-        return [lng, lat]
-    dlat = _transformlat(lng - 105.0, lat - 35.0)
-    dlng = _transformlng(lng - 105.0, lat - 35.0)
-    radlat = lat / 180.0 * math.pi
-    magic = math.sin(radlat)
-    magic = 1 - ee * magic * magic
-    sqrtmagic = math.sqrt(magic)
-    dlat = (dlat * 180.0) / ((a * (1 - ee)) / (magic * sqrtmagic) * math.pi)
-    dlng = (dlng * 180.0) / (a / sqrtmagic * math.cos(radlat) * math.pi)
-    mglat = lat + dlat
-    mglng = lng + dlng
-    return [mglng, mglat]
+def insert_db(in_sql, in_data):
+    try:
+        cur = con.cursor()
+        cur.execute(in_sql, in_data)
+        con.commit()
+    except Exception as e:
+        logger.error(e)
+    finally:
+        cur.close()
 
 
-def speed_to_color(speed, max_speed):
-    cmap = plt.get_cmap('jet')
-    norm_speed = min(speed / max_speed, 1.0)
-    return mcolors.to_hex(cmap(norm_speed))
+def load_db(in_sql, in_data):
+    try:
+        cur = con.cursor()
+        extras.execute_values(cur, in_sql, in_data, page_size=1000)
+        con.commit()
+    except Exception as e:
+        logger.error(e)
+    finally:
+        cur.close()
 
 
-def plot_gps_path(in_data, map_name):
-    map_start_time = datetime.now()
-    lngs = []
-    lats = []
-    speeds = []
-    for row in in_data:
-        lng=float(row[12])
-        lat=float(row[13])
-        if not out_of_china(lng, lat):
-            lngs.append(lng)
-            lats.append(lat)
-            speeds.append(float(row[18]))
-
-    if len(lngs) < 100 or len(lats) < 100:
-        logger.info(f"因点数据少于100，跳过生成地图： {map_name}！")
-        return
-
-    if len(lngs) == 0 or len(lats) == 0:
-        logger.info(f"没有定位点，跳过生成地图 {map_name}！")
-        return
-
-    avg_lng = np.mean(lngs)
-    avg_lat = np.mean(lats)
-    map_folium = folium.Map(
-        location=[avg_lat, avg_lng],
-        zoom_start=13,
-        control_scale=True
-    )
-
-    amap_layer = TileLayer(
-        'https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
-        attr='AMAP',
-        overlay=True,
-        control=True,
-        **{'Amap_key': amap_key}
-    )
-    map_folium.add_child(amap_layer)
-    max_speed = max(speeds)
-
-    for i in range(1, len(lats) - 1):
-        start_point = [lats[i - 1], lngs[i - 1]]
-        end_point = [lats[i], lngs[i]]
-        speed = speeds[i]
-        color = speed_to_color(speed, max_speed)
-
-        folium.PolyLine(
-            [start_point, end_point],
-            color=color,
-            weight=3,
-            opacity=1.0
-        ).add_to(map_folium)
-
-    folium.Marker([lats[0], lngs[0]], icon=folium.Icon(color='green')).add_to(map_folium)
-    folium.Marker([lats[-1], lngs[-1]], icon=folium.Icon(color='red')).add_to(map_folium)
-    map_folium.save(map_name)
-
-    logger.info(
-        f"地图 {map_name.replace('../routes/', '')} 生成完成，耗时 {(datetime.now() - map_start_time).total_seconds()} 秒！")
+def select_db(sel_sql, in_filter):
+    try:
+        cur = con.cursor()
+        cur.execute(sel_sql, (in_filter,))
+        res = cur.fetchone()[0]
+        return res
+    except Exception as e:
+        logger.error(e)
+        return 0
+    finally:
+        cur.close()
 
 
 def format_filename(in_first_record, in_last_record):
@@ -334,39 +253,6 @@ def validate_checksum(buffer):
     return ck_a == buffer[-2] and ck_b == buffer[-1]
 
 
-def insert_db(in_sql, in_data):
-    try:
-        cur = con.cursor()
-        cur.execute(in_sql, in_data)
-        con.commit()
-    except Exception as e:
-        logger.error(e)
-    finally:
-        cur.close()
-
-def load_db(in_sql, in_data):
-    try:
-        cur = con.cursor()
-        extras.execute_values(cur, in_sql, in_data, page_size=1000)
-        con.commit()
-    except Exception as e:
-        logger.error(e)
-    finally:
-        cur.close()
-
-def select_db(sel_sql, in_filter):
-    try:
-        cur = con.cursor()
-        res = cur.execute(sel_sql, (in_filter,))
-        if res:
-            return res.fetchone()
-        else:
-            return None
-    except Exception as e:
-        logger.error(e)
-    finally:
-        cur.close()
-
 async def connect_and_download(device):
     """建立已扫描连接并下载数据"""
     session_data = []
@@ -433,9 +319,9 @@ async def connect_and_download(device):
                                         duration = (datetime.now() - session_start_time).total_seconds()
                                         file_name = format_filename(first_record, last_record)
                                         exists_data = select_db(exists_imp, file_name)
+                                        session_len = len(session_data)
                                         if exists_data == 0:
-                                            if session_data:
-                                                session_len = len(exists_data)
+                                            if session_len > 0:
                                                 imp_data = (time_uuid, file_name, duration)
                                                 insert_db(ins_imp, imp_data)
                                                 load_db(ins_data, session_data)
