@@ -68,11 +68,9 @@ TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 NMEA_TX_UUID = "00001103-0000-1000-8000-00805f9b34fb"
 DOWNLOAD_COMMAND = bytes([0xB5, 0x62, 0xFF, 0x23, 0x00, 0x00, 0x22, 0x65])  # Command to initiate data download
 
-exists_imp = """select count(1) from imp_racebox where file_name = %s;
-          """
+exists_imp = """select count(1) from imp_racebox where file_name = """
 
-ins_imp = """insert into imp_racebox(imp_stamp, file_name, duration) values (%s, %s, %s);
-          """
+ins_imp = """insert into imp_racebox(imp_stamp, file_name, duration) values (%s, %s, %s);"""
 
 ins_data = """insert into lc_racebox(itow, imp_stamp, year, month, day, hour, minute, second, time_accuracy, nanoseconds,  
             fix_status, numberof_svs, longitude, latitude, wgs_altitude, msl_altitude, horizontal_accuracy, 
@@ -80,7 +78,8 @@ ins_data = """insert into lc_racebox(itow, imp_stamp, year, month, day, hour, mi
             rotation_rate_x, rotation_rate_y, rotation_rate_z) values %s;
             """
 
-ins_taos_sql = """INSERT INTO eadm.lc_racebox VALUES"""
+ins_taos_sql = """insert into eadm.lc_racebox values"""
+
 
 # 上次连接设备文件
 DEVICE_MEMORY_FILE = "../conf/last_device.json"
@@ -138,28 +137,26 @@ def select_db(sel_sql, in_filter):
     finally:
         cur.close()
 
-
-def insert_taos_data(session_data):
+def load_taos(in_sql, in_data, batch_size):
     try:
         cur_taos = con_taos.cursor()
-
         params = []
-        for record in session_data:
+        for i, record in enumerate(in_data, 1):
             try:
                 microsecond = (record[9] // 1000) % 1_000_000
                 ts = datetime(
-                    year=record[2],   # Year
-                    month=record[3],  # Month
-                    day=record[4],    # Day
-                    hour=record[5],   # Hour
-                    minute=record[6], # Minute
-                    second=record[7], # Second
+                    year=record[2],
+                    month=record[3],
+                    day=record[4],
+                    hour=record[5],
+                    minute=record[6],
+                    second=record[7],
                     microsecond=microsecond
                 ).isoformat()
                 params.append((
                     ts,
                     record[0],
-                    record[1],
+                    str(record[1]),
                     record[2],
                     record[3],
                     record[4],
@@ -188,11 +185,15 @@ def insert_taos_data(session_data):
                     record[27],
                     record[28]
                 ))
+
+                if i % batch_size == 0:
+                    cur_taos.execute_many(in_sql, params)
+                    params = []
             except ValueError as e:
                 logger.error(f"Invalid datetime parameters in record: {e}")
                 continue
-        cur_taos.executemany(ins_taos_sql, params)
-        logger.info(f"成功写入TDengine {len(params)} 条数据")
+        if params:
+            cur_taos.execute_many(in_sql, params)
     except Exception as e:
         logger.error(f"TDengine写入失败: {e}")
     finally:
@@ -395,23 +396,42 @@ async def connect_and_download(device):
                                         session_num += 1
                                         duration = (datetime.now() - session_start_time).total_seconds()
                                         file_name = format_filename(first_record, last_record)
-                                        exists_data = select_db(exists_imp, file_name)
                                         session_len = len(session_data)
-                                        if exists_data == 0:
-                                            if session_len > 0:
-                                                imp_data = (time_uuid, file_name, duration)
-                                                # insert_db(ins_imp, imp_data)
-                                                # load_db(ins_data, session_data)
-                                                # insert taosdb
-                                                insert_taos_data(session_data)
-                                                logger.info(f"已处理第{session_num}段数据文件名：{file_name}，共计{session_len}条，耗时 {duration} 秒！")
+                                        
+                                        # pg
+                                        # exists_data = select_db(exists_imp, file_name)
+                                        # if exists_data == 0:
+                                        #     if session_len > 0:
+                                        #         imp_data = (time_uuid, file_name, duration)
+                                        #         insert_db(ins_imp, imp_data)
+                                        #         load_db(ins_data, session_data)
+                                        #         logger.info(f"已处理第{session_num}段数据文件名：{file_name}，共计{session_len}条，耗时 {duration} 秒！")
+                                        #     else:
+                                        #         logger.info(f"第{session_num}段数据文件名：{file_name}，共计{session_len}条，处理耗时 {duration} 秒，无数据，已跳过！")
+                                        # else:
+                                        #     logger.info(f"第{session_num}段数据文件名：{file_name}，共计{session_len}条，处理耗时 {duration} 秒，数据库中已存在，已跳过！")
+                                        
+                                        # taos    
+                                        try:
+                                            taos_exists_sql = f'select count(*) from eadm.imp_racebox where file_name = \'{file_name}\';'
+                                            taos_exists = con_taos.query(taos_exists_sql).fetch_all()
+                                            if taos_exists[0][0] == 0:
+                                                if session_len > 0:
+                                                    ins_taos_imp = (f'insert into eadm.imp_racebox(ts,imp_stamp,file_name,durations) '
+                                                                    f'values(\'now()\',\'{time_uuid}\',\'{file_name}\',{duration});')
+                                                    con_taos.execute(ins_taos_imp)
+                                                    load_taos(ins_taos_sql, session_data, 1000)
+                                                    logger.info(f"已处理第{session_num}段数据文件名：{file_name}，共计{session_len}条，耗时 {duration} 秒！")
+                                                else:
+                                                    logger.info(f"第{session_num}段数据文件名：{file_name}，共计{session_len}条，处理耗时 {duration} 秒，无数据，已跳过！")
                                             else:
-                                                logger.info(f"第{session_num}段数据文件名：{file_name}，共计{session_len}条，处理耗时 {duration} 秒，无数据，已跳过！")
-                                        else:
-                                            logger.info(f"第{session_num}段数据文件名：{file_name}，共计{session_len}条，处理耗时 {duration} 秒，数据库中已存在，已跳过！")
-                                    session_start_time = datetime.now()
-                                    first_record = None
-                                    session_data = []
+                                                logger.info(f"第{session_num}段数据文件名：{file_name}，共计{session_len}条，处理耗时 {duration} 秒，数据库中已存在，已跳过！")
+                                        except Exception as e:
+                                            logger.error(f"TDengine写入失败: {e}")
+
+                                        session_start_time = datetime.now()
+                                        first_record = None
+                                        session_data = []
                             buffer = buffer[full_packet_length:]
 
             await client.start_notify(TX_CHAR_UUID, notification_handler)
