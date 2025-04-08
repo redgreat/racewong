@@ -15,6 +15,7 @@ import psycopg2
 import psycopg2.extras as extras
 import uuid
 from loguru import logger
+import taos
 
 import folium
 import numpy as np
@@ -32,6 +33,14 @@ pg_database = config.get("racebox", "database")
 pg_user = config.get("racebox", "user")
 pg_password = config.get("racebox", "password")
 pg_port = int(config.get("racebox", "port"))
+
+td_host = config.get("tdengine", "host")
+td_database = config.get("tdengine", "database")
+td_port = int(config.get("tdengine", "port"))
+td_user = config.get("tdengine", "user")
+td_password = config.get("tdengine", "password")
+td_timezone = config.get("tdengine", "timezone")
+
 amap_key = config.get("amap", "amap_key")
 
 # 日志配置
@@ -71,6 +80,8 @@ ins_data = """insert into lc_racebox(itow, imp_stamp, year, month, day, hour, mi
             rotation_rate_x, rotation_rate_y, rotation_rate_z) values %s;
             """
 
+ins_taos_sql = """INSERT INTO eadm.lc_racebox VALUES"""
+
 # 上次连接设备文件
 DEVICE_MEMORY_FILE = "../conf/last_device.json"
 
@@ -86,6 +97,12 @@ con = psycopg2.connect(database=pg_database,
 
 psycopg2.extras.register_uuid()
 
+con_taos = taos.connect(host=td_host,
+                       database=td_database,
+                       port=td_port,
+                       user=td_user,
+                       password=td_password,
+                       timezone=td_timezone)
 
 def insert_db(in_sql, in_data):
     try:
@@ -120,6 +137,66 @@ def select_db(sel_sql, in_filter):
         return 0
     finally:
         cur.close()
+
+
+def insert_taos_data(session_data):
+    try:
+        cur_taos = con_taos.cursor()
+
+        params = []
+        for record in session_data:
+            try:
+                microsecond = (record[9] // 1000) % 1_000_000
+                ts = datetime(
+                    year=record[2],   # Year
+                    month=record[3],  # Month
+                    day=record[4],    # Day
+                    hour=record[5],   # Hour
+                    minute=record[6], # Minute
+                    second=record[7], # Second
+                    microsecond=microsecond
+                ).isoformat()
+                params.append((
+                    ts,
+                    record[0],
+                    record[1],
+                    record[2],
+                    record[3],
+                    record[4],
+                    record[5],
+                    record[6],
+                    record[7],
+                    record[8],
+                    record[9],
+                    record[10],
+                    record[11],
+                    record[12],
+                    record[13],
+                    record[14],
+                    record[15],
+                    record[16],
+                    record[17],
+                    record[18],
+                    record[19],
+                    record[20],
+                    record[21],
+                    record[22],
+                    record[23],
+                    record[24],
+                    record[25],
+                    record[26],
+                    record[27],
+                    record[28]
+                ))
+            except ValueError as e:
+                logger.error(f"Invalid datetime parameters in record: {e}")
+                continue
+        cur_taos.executemany(ins_taos_sql, params)
+        logger.info(f"成功写入TDengine {len(params)} 条数据")
+    except Exception as e:
+        logger.error(f"TDengine写入失败: {e}")
+    finally:
+        cur_taos.close()
 
 
 def format_filename(in_first_record, in_last_record):
@@ -323,8 +400,10 @@ async def connect_and_download(device):
                                         if exists_data == 0:
                                             if session_len > 0:
                                                 imp_data = (time_uuid, file_name, duration)
-                                                insert_db(ins_imp, imp_data)
-                                                load_db(ins_data, session_data)
+                                                # insert_db(ins_imp, imp_data)
+                                                # load_db(ins_data, session_data)
+                                                # insert taosdb
+                                                insert_taos_data(session_data)
                                                 logger.info(f"已处理第{session_num}段数据文件名：{file_name}，共计{session_len}条，耗时 {duration} 秒！")
                                             else:
                                                 logger.info(f"第{session_num}段数据文件名：{file_name}，共计{session_len}条，处理耗时 {duration} 秒，无数据，已跳过！")
