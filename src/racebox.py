@@ -11,8 +11,8 @@ from bleak import BleakScanner, BleakClient
 import json
 import os
 import configparser
-import psycopg2
-import psycopg2.extras as extras
+# import psycopg2
+# import psycopg2.extras as extras
 import uuid
 from loguru import logger
 import taos
@@ -88,13 +88,13 @@ DEVICE_MEMORY_FILE = "../conf/last_device.json"
 time_uuid = uuid.uuid1()
 
 # 建立数据库连接
-con = psycopg2.connect(database=pg_database,
-                       user=pg_user,
-                       password=pg_password,
-                       host=pg_host,
-                       port=pg_port)
-
-psycopg2.extras.register_uuid()
+# con = psycopg2.connect(database=pg_database,
+#                        user=pg_user,
+#                        password=pg_password,
+#                        host=pg_host,
+#                        port=pg_port)
+#
+# psycopg2.extras.register_uuid()
 
 con_taos = taos.connect(host=td_host,
                        database=td_database,
