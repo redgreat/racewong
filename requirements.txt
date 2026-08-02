@@ -1,0 +1,7 @@
+bleak
+psycopg2-binary
+loguru
+openpyxl
+folium
+numpy
+matplotlib
