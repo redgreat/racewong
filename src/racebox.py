@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from folium.raster_layers import TileLayer
 import math
+import sys
 
 # 项目根目录
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -39,6 +40,7 @@ pg_password = config.get("racebox", "password")
 pg_port = int(config.get("racebox", "port"))
 
 amap_key = config.get("amap", "amap_key")
+auto_erase = config.getboolean("racebox", "auto_erase", fallback=False)
 
 # Excel备份目录
 EXCEL_BACKUP_DIR = os.path.join(PROJECT_ROOT, "data", "excel_backup")
@@ -66,6 +68,8 @@ RX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 NMEA_TX_UUID = "00001103-0000-1000-8000-00805f9b34fb"
 DOWNLOAD_COMMAND = bytes([0xB5, 0x62, 0xFF, 0x23, 0x00, 0x00, 0x22, 0x65])
+STATUS_QUERY_COMMAND = bytes([0xB5, 0x62, 0xFF, 0x22, 0x00, 0x00, 0x21, 0x62])
+ERASE_MEMORY_COMMAND = bytes([0xB5, 0x62, 0xFF, 0x24, 0x00, 0x00, 0x23, 0x68])
 
 exists_imp = """select count(1) from imp_racebox where file_name = %s"""
 
@@ -376,6 +380,128 @@ def process_session_data(session_data, file_name, duration, session_num, session
     logger.info(f"第{session_num}段数据文件名：{file_name}，共计{session_len}条，已保存到Excel！")
 
 
+async def query_recording_status(device):
+    """查询设备录制状态"""
+    status_received = asyncio.Event()
+    status_result = {}
+
+    async with BleakClient(device.address, timeout=20) as client:
+        try:
+            await client.connect()
+
+            def status_handler(sender, data):
+                nonlocal status_result
+                buffer = bytearray(data)
+                while len(buffer) >= 8:
+                    if buffer[:2] == bytes([0xB5, 0x62]):
+                        msg_cls, msg_id = buffer[2], buffer[3]
+                        pkt_len = struct.unpack('<H', buffer[4:6])[0]
+                        full_len = pkt_len + 8
+                        if len(buffer) < full_len:
+                            break
+                        if validate_checksum(buffer[:full_len]):
+                            if msg_cls == 0xFF and msg_id == 0x22:
+                                payload = buffer[6:6 + pkt_len]
+                                if len(payload) >= 12:
+                                    status_result = {
+                                        "recording": payload[0] != 0,
+                                        "memory_level": payload[1],
+                                        "security_enabled": bool(payload[2] & 0x01),
+                                        "security_unlocked": bool(payload[2] & 0x02),
+                                        "stored_messages": struct.unpack('<I', payload[4:8])[0],
+                                        "max_messages": struct.unpack('<I', payload[8:12])[0],
+                                    }
+                                status_received.set()
+                            elif msg_cls == 0xFF and msg_id == 0x03:
+                                logger.error("设备不支持录制状态查询（可能是RaceBox Mini非S/Micro）")
+                                status_received.set()
+                        buffer = buffer[full_len:]
+
+            await client.start_notify(TX_CHAR_UUID, status_handler)
+            await client.write_gatt_char(RX_CHAR_UUID, STATUS_QUERY_COMMAND)
+
+            try:
+                await asyncio.wait_for(status_received.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.error("查询状态超时")
+                return None
+
+            await client.stop_notify(TX_CHAR_UUID)
+        except Exception as e:
+            logger.error(f"查询状态失败: {e}")
+            return None
+        finally:
+            await client.disconnect()
+
+    if status_result:
+        mem_pct = status_result["memory_level"]
+        stored = status_result["stored_messages"]
+        max_msg = status_result["max_messages"]
+        logger.info(f"设备状态: 录制={'是' if status_result['recording'] else '否'}, "
+                     f"内存 {mem_pct}% ({stored}/{max_msg}条), "
+                     f"安全锁={'已启用' if status_result['security_enabled'] else '未启用'}")
+    return status_result
+
+
+async def erase_device_memory(device):
+    """清除设备内存，显示进度"""
+    erase_complete = asyncio.Event()
+    erase_success = False
+
+    async with BleakClient(device.address, timeout=20) as client:
+        try:
+            await client.connect()
+
+            def erase_handler(sender, data):
+                nonlocal erase_success
+                buffer = bytearray(data)
+                while len(buffer) >= 8:
+                    if buffer[:2] == bytes([0xB5, 0x62]):
+                        msg_cls, msg_id = buffer[2], buffer[3]
+                        pkt_len = struct.unpack('<H', buffer[4:6])[0]
+                        full_len = pkt_len + 8
+                        if len(buffer) < full_len:
+                            break
+                        if validate_checksum(buffer[:full_len]):
+                            if msg_cls == 0xFF and msg_id == 0x24:
+                                # 进度更新
+                                if pkt_len >= 1:
+                                    progress = buffer[6]
+                                    logger.info(f"  清除进度: {progress}%")
+                            elif msg_cls == 0xFF and msg_id == 0x02:
+                                # ACK - 操作完成
+                                ack_payload = buffer[6:6 + pkt_len]
+                                if len(ack_payload) >= 2 and ack_payload[0] == 0xFF and ack_payload[1] == 0x24:
+                                    erase_success = True
+                                    erase_complete.set()
+                            elif msg_cls == 0xFF and msg_id == 0x03:
+                                # NACK - 操作失败
+                                logger.error("清除失败，可能内存已锁定或设备不支持")
+                                erase_complete.set()
+                        buffer = buffer[full_len:]
+
+            await client.start_notify(TX_CHAR_UUID, erase_handler)
+            await client.write_gatt_char(RX_CHAR_UUID, ERASE_MEMORY_COMMAND)
+            logger.info("开始清除设备内存...")
+
+            try:
+                await asyncio.wait_for(erase_complete.wait(), timeout=120.0)
+            except asyncio.TimeoutError:
+                logger.error("清除超时")
+                return False
+
+            await client.stop_notify(TX_CHAR_UUID)
+        except Exception as e:
+            logger.error(f"清除内存失败: {e}")
+            return False
+        finally:
+            await client.disconnect()
+
+    if erase_success:
+        logger.info("设备内存清除完成！")
+    return erase_success
+
+
 async def connect_and_download(device):
     """建立已扫描连接并下载数据"""
     session_data = []
@@ -459,6 +585,70 @@ async def connect_and_download(device):
             await client.disconnect()
 
 
+async def find_and_connect(operation_fn, operation_name):
+    """查找设备并执行指定操作"""
+    last_device = get_last_device()
+    if last_device:
+        logger.info(f"开始连接上次连接设备: {last_device['name']}")
+        try:
+            device = await BleakScanner.find_device_by_address(last_device['address'])
+            if device:
+                logger.info(f"找到上次连接设备: {device.name}")
+                await operation_fn(device)
+                return
+            else:
+                logger.info("未找到上次连接设备, 扫描新设备...")
+        except Exception as e:
+            logger.info(f"上次连接设备连接失败: {e}")
+            logger.info("扫描新设备...")
+    else:
+        logger.info("无历史设备记录")
+
+    # 扫描新设备
+    devices = await BleakScanner.discover()
+    racebox_devices = [d for d in devices if d.name and "RaceBox" in d.name]
+
+    if racebox_devices:
+        logger.info(f"扫描到 {len(racebox_devices)} 个RaceBox设备")
+        for device in racebox_devices:
+            logger.info(f"连接设备 {device.name} 中...")
+            save_last_device(device)
+            try:
+                await operation_fn(device)
+                break
+            except Exception as e:
+                logger.info(f"连接设备失败: {device.name}: {e}")
+    else:
+        logger.error("未找到任何 RaceBox 设备")
+
+
+async def main_operation():
+    """主操作入口，根据命令行参数选择操作模式"""
+    mode = sys.argv[1] if len(sys.argv) > 1 else "download"
+
+    if mode == "status":
+        await find_and_connect(query_recording_status, "状态查询")
+    elif mode == "erase":
+        await find_and_connect(erase_device_memory, "清除内存")
+    elif mode == "full":
+        # 下载 + 清除
+        await find_and_connect(connect_and_download, "下载数据")
+        logger.info("下载完成，开始清除设备内存...")
+        await find_and_connect(erase_device_memory, "清除内存")
+    elif mode == "download":
+        await find_and_connect(connect_and_download, "下载数据")
+        if auto_erase:
+            logger.info("已配置 auto_erase，开始清除设备内存...")
+            await find_and_connect(erase_device_memory, "清除内存")
+    else:
+        logger.error(f"未知操作模式: {mode}")
+        print("用法: python racebox.py [download|status|erase|full]")
+        print("  download  - 下载数据（默认）")
+        print("  status    - 查询设备状态")
+        print("  erase     - 清除设备内存")
+        print("  full      - 下载数据后自动清除内存")
+
+
 # 初始化数据库连接
 init_pg_connection()
 
@@ -466,7 +656,10 @@ init_pg_connection()
 sync_excel_backups()
 
 start_time = datetime.now()
-asyncio.run(last_device_connect())
+try:
+    asyncio.run(main_operation())
+except asyncio.CancelledError:
+    logger.info("\n用户取消操作！")
 
 if con:
     con.close()
