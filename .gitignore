@@ -164,3 +164,7 @@ cython_debug/
 .csv
 .html
 conf/
+data/
+.idea/
+file/
+routes/
