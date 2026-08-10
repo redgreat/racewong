@@ -112,6 +112,7 @@ def init_pg_connection():
 
 
 def insert_db(in_sql, in_data):
+    cur = None
     try:
         cur = con.cursor()
         cur.execute(in_sql, in_data)
@@ -119,10 +120,12 @@ def insert_db(in_sql, in_data):
     except Exception as e:
         logger.error(e)
     finally:
-        cur.close()
+        if cur:
+            cur.close()
 
 
 def load_db(in_sql, in_data):
+    cur = None
     try:
         cur = con.cursor()
         extras.execute_values(cur, in_sql, in_data, page_size=1000)
@@ -130,10 +133,12 @@ def load_db(in_sql, in_data):
     except Exception as e:
         logger.error(e)
     finally:
-        cur.close()
+        if cur:
+            cur.close()
 
 
 def select_db(sel_sql, in_filter):
+    cur = None
     try:
         cur = con.cursor()
         cur.execute(sel_sql, (in_filter,))
@@ -143,7 +148,8 @@ def select_db(sel_sql, in_filter):
         logger.error(e)
         return 0
     finally:
-        cur.close()
+        if cur:
+            cur.close()
 
 
 def format_filename(in_first_record, in_last_record):
@@ -296,7 +302,9 @@ def save_session_to_excel(session_data, file_name):
     ws.append(headers)
     
     for record in session_data:
-        ws.append(list(record))
+        row = list(record)
+        row[1] = str(row[1])  # UUID转字符串
+        ws.append(row)
     
     wb.save(excel_path)
     logger.info(f"数据已保存到Excel: {excel_path}")
@@ -586,7 +594,7 @@ async def connect_and_download(device):
 
 
 async def find_and_connect(operation_fn, operation_name):
-    """查找设备并执行指定操作"""
+    """查找设备并执行指定操作，返回 True 表示操作成功"""
     last_device = get_last_device()
     if last_device:
         logger.info(f"开始连接上次连接设备: {last_device['name']}")
@@ -595,7 +603,7 @@ async def find_and_connect(operation_fn, operation_name):
             if device:
                 logger.info(f"找到上次连接设备: {device.name}")
                 await operation_fn(device)
-                return
+                return True
             else:
                 logger.info("未找到上次连接设备, 扫描新设备...")
         except Exception as e:
@@ -615,11 +623,14 @@ async def find_and_connect(operation_fn, operation_name):
             save_last_device(device)
             try:
                 await operation_fn(device)
-                break
+                return True
             except Exception as e:
                 logger.info(f"连接设备失败: {device.name}: {e}")
     else:
         logger.error("未找到任何 RaceBox 设备")
+
+    logger.warning(f"{operation_name} 失败：未找到可用设备")
+    return False
 
 
 async def main_operation():
@@ -631,15 +642,19 @@ async def main_operation():
     elif mode == "erase":
         await find_and_connect(erase_device_memory, "清除内存")
     elif mode == "full":
-        # 下载 + 清除
-        await find_and_connect(connect_and_download, "下载数据")
-        logger.info("下载完成，开始清除设备内存...")
-        await find_and_connect(erase_device_memory, "清除内存")
+        ok = await find_and_connect(connect_and_download, "下载数据")
+        if ok:
+            logger.info("下载完成，开始清除设备内存...")
+            await find_and_connect(erase_device_memory, "清除内存")
+        else:
+            logger.warning("下载未成功，跳过清除内存")
     elif mode == "download":
-        await find_and_connect(connect_and_download, "下载数据")
-        if auto_erase:
+        ok = await find_and_connect(connect_and_download, "下载数据")
+        if ok and auto_erase:
             logger.info("已配置 auto_erase，开始清除设备内存...")
             await find_and_connect(erase_device_memory, "清除内存")
+        elif not ok:
+            logger.warning("下载未成功，跳过后续操作")
     else:
         logger.error(f"未知操作模式: {mode}")
         print("用法: python racebox.py [download|status|erase|full]")
