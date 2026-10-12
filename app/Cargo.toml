@@ -1,0 +1,30 @@
+[package]
+name = "racewong-app"
+version = "0.1.0"
+edition = "2021"
+description = "RaceBox BLE sync desktop app: download, PostgreSQL/MQTT upload, device memory erase"
+
+[dependencies]
+eframe = "0.31"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
+btleplug = "0.11"
+rumqttc = { version = "0.24", default-features = false }
+tokio-postgres = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+crc32fast = "1"
+chrono = { version = "0.4", features = ["clock"] }
+directories = "5"
+async-trait = "0.1"
+futures-util = "0.3"
+flexi_logger = "0.29"
+log = "0.4"
+
+[build-dependencies]
+winres = "0.1"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "s"
