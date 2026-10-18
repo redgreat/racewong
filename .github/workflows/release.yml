@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: "创建 GitHub Release（仅在手动触发且已给 tag 时有效）"
+        description: "创建 GitHub Release（手动触发时用当前分支名作为标签）"
         type: boolean
         default: false
 
@@ -17,44 +17,54 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   BIN_NAME: racewong-app
-  DIST_NAME: racewong-app-windows-x64
 
 jobs:
-  build-windows:
-    name: build (windows x64)
-    runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: app
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cmd: pwsh -NoProfile -File script/release.ps1 -BuildOnly -OutDir dist
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            cmd: bash script/release.sh --build-only --out-dir dist
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cmd: bash script/release.sh --build-only --out-dir dist
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install Rust stable (msvc)
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable-x86_64-pc-windows-msvc
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config libxkbcommon-dev libssl-dev
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            app/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('app/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          workspaces: app
 
-      - name: Run protocol tests
-        run: cargo test --bins --release
-
-      - name: Build release
-        run: cargo build --release --locked
-
-      - name: Verify exe has no console subsystem and icon embedded
+      - name: Verify exe is GUI subsystem with icon embedded
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $exe = "target\release\$env:BIN_NAME.exe"
-          if (-not (Test-Path $exe)) { throw "exe not found" }
+          $exe = "app/target/${{ matrix.target }}/release/$env:BIN_NAME.exe"
+          if (-not (Test-Path $exe)) { throw "exe 未生成: $exe" }
           $fs = [System.IO.File]::OpenRead($exe)
           $br = New-Object System.IO.BinaryReader($fs)
           $fs.Position = 0x3C; $peOff = $br.ReadInt32()
@@ -62,42 +72,49 @@ jobs:
           $subsystem = $br.ReadUInt16()
           $br.Close(); $fs.Close()
           if ($subsystem -ne 2) { throw "PE subsystem=$subsystem，预期 2(WINDOWS_GUI)，说明还会弹控制台" }
-          $ico = [System.IO.File]::ReadAllBytes("assets\icon.ico")
-          if ($ico[0] -ne 0 -or $ico[1] -ne 0 -or $ico[2] -ne 1) { throw "icon.ico invalid" }
           Write-Host "exe: $([math]::Round((Get-Item $exe).Length/1MB,2)) MB, subsystem=GUI"
 
-      - name: Stage artifact
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target\release\$env:BIN_NAME.exe" "dist\$env:DIST_NAME.exe"
-          Copy-Item "README.md" "dist\README.txt"
-          Copy-Item "assets\icon.ico" "dist\"
+      - name: Build and package
+        shell: bash
+        run: ${{ matrix.cmd }}
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.DIST_NAME }}
-          path: app/dist/*
+          name: ${{ matrix.name }}
+          path: dist/*
           if-no-files-found: error
 
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
-        uses: softprops/action-gh-release@v2
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    steps:
+      - uses: actions/checkout@v4
         with:
-          name: ${{ github.ref_name }}
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: |
-            app/dist/${{ env.DIST_NAME }}.exe
-            app/dist/README.txt
-          fail_on_unmatched_files: true
-          body: |
-            RaceBox 跨平台同步桌面应用（Windows x64，单文件 exe，约 5 MB）。
+          fetch-depth: 0
 
-            - BLE 扫描/连接 RaceBox，下载轨迹数据
-            - 上传方式三选一：PostgreSQL 直连 / MQTT(RBX2) / 两者
-            - 上传全部确认后自动清理设备内存（可关闭）
-            - 上传失败自动写本地缓存，下次启动重传
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
-            首次运行后配置在 `%APPDATA%\wongcw\racewong\config\config.json`，也可在“设置”页填写。
+      - name: Generate release notes from git log
+        run: bash script/release.sh --notes-only > dist/release-notes.md
+
+      - name: Create or update GitHub Release and upload packages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          shopt -s nullglob
+          files=(dist/*.zip dist/*.tar.gz dist/*.dmg dist/*.deb)
+          if [ ${#files[@]} -eq 0 ]; then echo "没有可上传的安装包"; exit 1; fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            gh release create "$TAG" --title "RaceBox 同步 $TAG" --notes-file dist/release-notes.md "${files[@]}"
+          fi
+          echo "https://github.com/${{ github.repository }}/releases/tag/$TAG"

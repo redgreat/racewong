@@ -255,27 +255,46 @@ cargo build --release
 不参与打包，密码在设置页填写）。本地 spool 在 `...\racewong\config\spool\`，日志在
 `...\config\racewong.log`。
 
-## 8. CI 自动发布（Windows）
+## 8. 发布脚本与 CI（Windows / macOS / Linux）
 
-`.github/workflows/release.yml` 只做 Windows x64：
+发布统一走 `script/release.ps1`（PowerShell 5.1 与 7+ 均可）或 `script/release.sh`（bash，Linux / macOS / WSL / Git Bash）：
 
-- 触发：推 `v*` tag 自动构建并发布 Release；也可在 Actions 页面手动 `workflow_dispatch`
-- `windows-latest` runner（自带 MSVC 工具链），`cargo test --bins --release` → `cargo build --release --locked`
-- 校验 exe 版本信息与 `assets/icon.ico` 合法性
-- 产物 `racewong-app-windows-x64.exe` + `README.txt`：tag 推送时自动挂到 GitHub Release（`softprops/action-gh-release`），
-  任何触发都会上传 Actions Artifact，方便先下载试用
-
-发布一个版本的典型流程：
-
-```bash
-cd app && cargo update -p racewong-app   # 或改 Cargo.toml 的 version
-git add app/Cargo.toml app/Cargo.lock
-git commit -m "chore(app): bump version"
-git tag v0.1.0
-git push origin main --tags
+```powershell
+# Windows：自动 patch +1 → 改 app/Cargo.toml → 提交 → 打标签 → 推送 → 建 Release → 本机打包
+.\script\release.ps1
+.\script\release.ps1 -Version v0.2.0      # 指定版本
+.\script\release.ps1 -NoBuild             # 只打标签建 Release，包全交给 CI
+.\script\release.ps1 -BuildOnly           # 只构建当前平台的安装包
 ```
 
-## 8. 与 Python 版本的差异
+```bash
+./script/release.sh                       # 同上的 bash 版
+./script/release.sh --version v0.2.0
+./script/release.sh --no-build
+./script/release.sh --build-only --out-dir dist
+```
+
+说明：
+
+- 自动版本：取最新 `v*.*.*` 标签 patch +1，没有标签就用 `app/Cargo.toml` 的版本
+- Release 正文来自 **git 提交记录**（`上一个标签..HEAD` 的 `git log`）
+- 建 Release 用 `gh`；没装 `gh` 时可用 `GITHUB_TOKEN` 走 REST
+- 本机只构建当前平台那一个包，产物形如：
+  - `racewong-<ver>-windows-x86_64.zip`
+  - `racewong-<ver>-macos-aarch64.tar.gz`（在 macOS 上还会出 `.dmg`，内含 `RaceBox 同步.app`）
+  - `racewong-<ver>-linux-x86_64.tar.gz`（有 `dpkg-deb` 时还会出 `.deb`）
+
+`.github/workflows/release.yml` 在三个 runner 上跑同一个脚本的 `-BuildOnly` / `--build-only`：
+
+| Job | Runner | 目标 | 产物 |
+| --- | --- | --- | --- |
+| windows-x86_64 | windows-latest | `x86_64-pc-windows-msvc` | zip |
+| macos-aarch64 | macos-latest | `aarch64-apple-darwin` | tar.gz + dmg |
+| linux-x86_64 | ubuntu-latest | `x86_64-unknown-linux-gnu` | tar.gz + deb |
+
+推 `v*` tag 时自动把三个包挂到同一个 Release；也可在 Actions 页面手动 `workflow_dispatch`。
+
+## 9. 与 Python 版本的差异
 
 | 项 | Python (`../src/racebox.py`) | 本应用 |
 | --- | --- | --- |
