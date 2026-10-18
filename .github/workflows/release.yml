@@ -59,7 +59,11 @@ jobs:
         with:
           workspaces: app
 
-      - name: Verify exe is GUI subsystem with icon embedded
+      - name: Build and package
+        shell: bash
+        run: ${{ matrix.cmd }}
+
+      - name: Verify exe is GUI subsystem (no console window)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -73,10 +77,6 @@ jobs:
           $br.Close(); $fs.Close()
           if ($subsystem -ne 2) { throw "PE subsystem=$subsystem，预期 2(WINDOWS_GUI)，说明还会弹控制台" }
           Write-Host "exe: $([math]::Round((Get-Item $exe).Length/1MB,2)) MB, subsystem=GUI"
-
-      - name: Build and package
-        shell: bash
-        run: ${{ matrix.cmd }}
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
