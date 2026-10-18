@@ -112,6 +112,20 @@ function Test-RemoteTag([string]$Tag) {
     return -not [string]::IsNullOrWhiteSpace($r.Output)
 }
 
+# GitHub 上是否已有该 tag 的 Release（gh 可用时才判断）。
+function Test-ReleaseExists([string]$Tag) {
+    if (-not (Get-Tool 'gh')) { return $false }
+    $r = Invoke-Cmd 'gh' @('release', 'view', $Tag)
+    return ($r.Code -eq 0)
+}
+
+# gh 是否已登录；没登录就交给 CI 去建 Release。
+function Test-GhAuth {
+    if (-not (Get-Tool 'gh')) { return $false }
+    $r = Invoke-Cmd 'gh' @('auth', 'status')
+    return ($r.Code -eq 0)
+}
+
 # ---------------------------------------------------------------- 平台识别
 function Get-HostOS {
     # PowerShell 5.1 只跑在 Windows 上，6.0+ 才有 $IsWindows/$IsMacOS/$IsLinux
@@ -359,8 +373,13 @@ function Publish-Release([string]$Tag, [string]$Notes, [string[]]$Assets) {
             if ($Tag -match '-') { $ghArgs += '--prerelease' }
             if ($DryRun) { Say "   [dry-run] gh $($ghArgs -join ' ')" }
             else {
-                $code = Invoke-Checked 'gh' $ghArgs
-                if ($code -ne 0) { Die '创建 Release 失败' }
+                $r = Invoke-Cmd 'gh' $ghArgs
+                if ($r.Code -ne 0) {
+                    # 标签已经推上去了，CI 的 publish 作业会用 GITHUB_TOKEN 建 Release，这里不中断
+                    Warn "创建 Release 失败：$($r.Output)"
+                    Warn '标签已推送，GitHub Actions 会自动创建 Release 并上传三个平台的包'
+                    return
+                }
                 Ok 'Release 已创建'
             }
         } else {
@@ -370,9 +389,8 @@ function Publish-Release([string]$Tag, [string]$Notes, [string[]]$Assets) {
             Step "上传 $($Assets.Count) 个安装包"
             if ($DryRun) { Say "   [dry-run] gh release upload $Tag $($Assets -join ' ') --clobber" }
             else {
-                $code = Invoke-Checked 'gh' (@('release', 'upload', $Tag) + $Assets + @('--clobber'))
-                if ($code -ne 0) { Die '上传附件失败' }
-                Ok '附件已上传'
+                $r = Invoke-Cmd 'gh' (@('release', 'upload', $Tag) + $Assets + @('--clobber'))
+                if ($r.Code -ne 0) { Warn "上传附件失败：$($r.Output)" } else { Ok '附件已上传' }
             }
         }
         return
@@ -463,6 +481,9 @@ if ($BuildOnly) {
 # ---- 完整发布 ----
 Step '检查工作区'
 Test-GitReady
+if (-not (Test-GhAuth)) {
+    Warn 'gh 未登录（`gh auth login`）：Release 与安装包交给 GitHub Actions 创建'
+}
 $branch = (Invoke-Git @('rev-parse', '--abbrev-ref', 'HEAD')).Trim()
 if (-not $branch) { Die '无法获取当前分支' }
 $dirty = Invoke-Git @('status', '--porcelain')
@@ -487,11 +508,19 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
 }
 $tag = "v$verNoV"
 
-# 标签在三处可能的状态：本地有 / 远端有；远端有的话就不能再发一次
+# 标签可能的状态：本地有 / 远端有。远端已有时不再重复发，只补建 Release
 $tagLocal  = -not [string]::IsNullOrWhiteSpace((Invoke-Git @('tag', '--list', $tag)))
 $tagRemote = Test-RemoteTag $tag
-if ($tagRemote) { Die "标签 $tag 已在远端存在，换个版本号（或先删远端标签）后再发" }
-if ($tagLocal) { Ok "本地已有标签 $tag（远端没有），跳过创建、稍后补推" } else { Ok "目标版本 $tag" }
+$skipTag   = $false
+if ($tagRemote) {
+    if (Test-ReleaseExists $tag) { Die "标签 $tag 与对应 Release 都已存在，换个版本号（或先删远端标签）后再发" }
+    Warn "标签 $tag 已在远端（上次可能没创建 Release），跳过打标签与推送，只补建 Release"
+    $skipTag = $true
+} elseif ($tagLocal) {
+    Ok "本地已有标签 $tag（远端没有），跳过创建、稍后补推"
+} else {
+    Ok "目标版本 $tag"
+}
 
 # Release 正文要在打新标签之前算好
 $prevTag = Get-LatestTag
@@ -517,7 +546,9 @@ if ($oldVer -ne $verNoV) {
 }
 
 Step "打标签 $tag"
-if ($tagLocal) {
+if ($skipTag) {
+    Ok '标签已在远端，跳过创建'
+} elseif ($tagLocal) {
     Ok '标签已存在，跳过创建'
 } elseif ($DryRun) {
     Say "   [dry-run] git tag -a $tag -m 'Release $tag'"
@@ -531,8 +562,12 @@ if ($DryRun) { Say "   [dry-run] git push origin $branch && git push origin $tag
 else {
     $r = Invoke-Cmd 'git' @('push', 'origin', $branch)
     if ($r.Code -ne 0) { Warn "推送分支 $branch 失败：$($r.Output)" }
-    Invoke-Git @('push', 'origin', $tag)
-    Ok "已推送 $tag"
+    if ($skipTag) {
+        Ok '标签已在远端，跳过推送'
+    } else {
+        Invoke-Git @('push', 'origin', $tag)
+        Ok "已推送 $tag"
+    }
 }
 
 $assets = @()
