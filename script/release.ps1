@@ -33,8 +33,10 @@ param(
     [string]$OutDir = 'dist'
 )
 
-$ErrorActionPreference = 'Stop'
-# PowerShell 7.4+ 默认把外部命令的非零退出码当终止错误，这里关掉，统一用 $LASTEXITCODE 判断
+# 这里刻意不用 Stop：PowerShell 7 会把外部命令写到 stderr 的内容（git 的进度信息、
+# cargo 的 warning）包装成 ErrorRecord，配合 ErrorActionPreference=Stop 会直接中断脚本。
+# 退出码统一由 Invoke-Cmd / Invoke-Checked 用 $LASTEXITCODE 判断。
+$ErrorActionPreference = 'Continue'
 if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
     $PSNativeCommandUseErrorActionPreference = $false
 }
@@ -74,7 +76,10 @@ function Invoke-Cmd([string]$Exe, [string[]]$ExeArgs) {
     $output = & $Exe @ExeArgs 2>&1
     $code = $LASTEXITCODE
     $text = ''
-    if ($null -ne $output) { $text = ($output | Out-String).Trim() }
+    if ($null -ne $output) {
+        # stderr 被合并进来的是 ErrorRecord，取它的文本，避免显示成一长串 PowerShell 报错
+        $text = (($output | ForEach-Object { $_.ToString() }) -join "`n").Trim()
+    }
     return @{ Code = $code; Output = $text }
 }
 
@@ -390,7 +395,7 @@ function Publish-Release([string]$Tag, [string]$Notes, [string[]]$Assets) {
     Step "通过 REST 创建/更新 GitHub Release $Tag"
     $releaseId = $null
     try {
-        $r = Invoke-RestMethod -Headers $headers -Method Get -Uri "https://api.github.com/repos/$repo/releases/tags/$Tag"
+        $r = Invoke-RestMethod -ErrorAction Stop -Headers $headers -Method Get -Uri "https://api.github.com/repos/$repo/releases/tags/$Tag"
         $releaseId = $r.id
     } catch {
         $releaseId = $null
@@ -405,7 +410,7 @@ function Publish-Release([string]$Tag, [string]$Notes, [string[]]$Assets) {
                 draft      = $false
                 prerelease = ($Tag -match '-')
             } | ConvertTo-Json
-            $r = Invoke-RestMethod -Headers $headers -Method Post -Uri "https://api.github.com/repos/$repo/releases" -Body $payload -ContentType 'application/json'
+            $r = Invoke-RestMethod -ErrorAction Stop -Headers $headers -Method Post -Uri "https://api.github.com/repos/$repo/releases" -Body $payload -ContentType 'application/json'
             $releaseId = $r.id
             Ok 'Release 已创建'
         }
