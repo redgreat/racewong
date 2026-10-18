@@ -24,7 +24,9 @@ pub const RBX2_MAGIC: &[u8; 4] = b"RBX2";
 pub const RBX2_HEADER_SIZE: usize = 136;
 pub const RBX2_RECORD_SIZE: usize = 80;
 pub const RBX2_VERSION: u8 = 2;
-pub const RBX2_MAX_BATCH_RECORDS: usize = 720;
+/// 单批最大记录数。协议上限是 720，但 broker 普遍限制单包 10KB
+/// （帧 = 136 + N×80 字节），120 条约 9.7KB，留足余量。
+pub const RBX2_MAX_BATCH_RECORDS: usize = 120;
 pub const DEVICE_FIELD_SIZE: usize = 48;
 
 pub const SPEED_KMH_PER_UNIT: f64 = 0.6;

@@ -85,7 +85,9 @@
 
 ### 2.4 MQTT RBX2 帧（des kwong §4）
 
-头 136 字节 + N×80 字节记录，消息长 `136 + N×80`，N ≤ 720，批次不可跨轨迹段。
+头 136 字节 + N×80 字节记录，消息长 `136 + N×80`，批次不可跨轨迹段。
+协议上限 N ≤ 720，但 broker 普遍限制单包 10KB（实测 db.wongcw.cn:1883 为 10240 字节），
+因此实现按 `RBX2_MAX_BATCH_RECORDS = 120` 分批（帧约 9.7KB），超限会被 broker 直接断连。
 
 | 偏移 | 长度 | 字段 |
 | ---: | ---: | --- |
@@ -131,12 +133,27 @@ app/    ui/                设置页 + 主页（设备、进度、日志）
 - sink 模式：`database` / `mqtt` / `both`，失败回落 spool 开关
 - PostgreSQL：host / port / database / user / password
 - MQTT：broker / port / user / password / topic / client id / QoS
-- 行为：`auto_erase`（上传全部成功后是否自动清理设备内存）
-- 外观：`theme` = `dark` / `light`（顶栏右侧按钮或设置页“外观”卡片切换，切换即保存；
+- 行为：`auto_erase`（上传全部成功后是否自动清理设备内存）、
+  `spool_on_failure`（失败转本地缓存）、`scan_timeout_secs`（蓝牙扫描超时，10–120 秒）
+- MQTT：`keepalive_secs`（保活间隔，10–300 秒）
+- 外观：`theme` = `dark` / `light`（设置页“外观”卡片切换，切换即保存；
   旧配置文件没有该字段时按 `serde(default)` 视为 `dark`，不会丢配置）
 
 界面为 egui 自绘的卡片式布局，暗色 / 亮色两套主题共用同一套配色变量
 （`src/style.rs` 的 `Palette`），改颜色只动这一处。
+
+### 界面结构
+
+- 顶部栏：主页右侧是“设置”小角标；设置页右侧是关闭 X（有未保存更改会弹窗确认）
+- 底部状态栏：左下角是运行状态（空闲 / 运行中 · 当前阶段），右下角是日志抽屉开关、
+  待重传数和版本号
+- 日志是底部可折叠抽屉（可拖高），不再是独立标签页
+- 同步页：左侧是大字号阶段 / 设备 / 进度条，右侧是主操作（开始同步 / 查询状态 /
+  清除内存）；任务运行中只保留红色 **取消同步**（点击后变“取消中...”），worker 在
+  扫描、MQTT 连接、下载、上传、擦除各检查点中断，设备数据不会被误删
+- 查询状态 / 清除内存不会连接 MQTT，只有完整同步才建立上传通道，启动更快
+- 设置页：上传方式用分段选择器；行为开关是 iOS 风格开关；设备扫描超时、
+  MQTT 保活间隔用滑块调节（均落盘到 config.json）
 
 ## 5. 实现顺序
 
@@ -195,6 +212,17 @@ PostgreSQL fn.wongcw.cn:8432/eadm ... 失败: password authentication failed for
 以及设置页对应卡片按钮旁边（进行中显示转圈，结束显示成功 / 失败 / 超时）。
 PostgreSQL 测试整体有 15 秒超时，主机不可达时不会一直转圈；MQTT 测试等 CONNACK，
 内部 10 秒超时。测试成功后 MQTT 的连接会保留到下一次测试或退出，避免打出误导性的断开错误。
+
+MQTT 连接的健壮性（`src/sink/mqtt.rs`）：
+
+- 每次连接的 client_id 都会加随机后缀，避免和设置页的探测连接
+  （或其它实例）client_id 相同被 broker 踢掉
+- eventloop 任务**除主动停止外绝不退出**：rumqttc 的 eventloop 只要继续 poll
+  就会在断线后自动重连；一旦任务退出，request channel 断开，之后所有 publish
+  都会报 `Failed to send mqtt requests to eventloop`（这就是之前同步时
+  所有批次上传失败的根因）
+- 连接断开时 `wait_ack` 会快速失败并给出“MQTT 连接已断开”而不是傻等 60 秒；
+  重连成功后的批次照常等 PUBACK
 
 ### 本地（Windows）构建
 无 MSVC Build Tools / C 盘紧张时，用 WSL + cargo-xwin 交叉编译到 `x86_64-pc-windows-msvc`，

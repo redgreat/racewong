@@ -35,6 +35,8 @@ pub struct Palette {
     pub success: Color32,
     pub warn: Color32,
     pub error: Color32,
+    /// 危险操作按钮底色（取消、清除内存等）。
+    pub danger: Color32,
     pub info: Color32,
 }
 
@@ -55,6 +57,7 @@ pub fn palette(theme: Theme) -> Palette {
             success: Color32::from_rgb(0x3f, 0xb9, 0x50),
             warn: Color32::from_rgb(0xd2, 0x99, 0x22),
             error: Color32::from_rgb(0xf8, 0x51, 0x49),
+            danger: Color32::from_rgb(0xc4, 0x3c, 0x33),
             info: Color32::from_rgb(0x6c, 0xb6, 0xff),
         },
         Theme::Light => Palette {
@@ -72,6 +75,7 @@ pub fn palette(theme: Theme) -> Palette {
             success: Color32::from_rgb(0x1a, 0x7f, 0x37),
             warn: Color32::from_rgb(0x9a, 0x67, 0x00),
             error: Color32::from_rgb(0xcf, 0x22, 0x2e),
+            danger: Color32::from_rgb(0xcf, 0x22, 0x2e),
             info: Color32::from_rgb(0x09, 0x63, 0xd8),
         },
     }
@@ -179,24 +183,26 @@ pub fn primary_button(p: &Palette, label: &str) -> egui::Button<'static> {
     )
     .fill(p.accent)
     .corner_radius(CornerRadius::same(6))
-    .min_size(egui::vec2(92.0, 30.0))
+    .min_size(egui::vec2(96.0, 32.0))
 }
 
 /// 次按钮（卡片底色 + 描边，悬停有反馈）。
 pub fn secondary_button(p: &Palette, label: &str) -> egui::Button<'static> {
     egui::Button::new(egui::RichText::new(label.to_owned()).color(p.text))
         .corner_radius(CornerRadius::same(6))
-        .min_size(egui::vec2(92.0, 30.0))
+        .min_size(egui::vec2(96.0, 32.0))
 }
 
 /// 顶栏标签页按钮：选中为强调色胶囊，未选中透明、悬停有浅底。
-pub fn tab_button(
+/// 分段按钮：选中为强调色胶囊，未选中透明、悬停有浅底；可指定尺寸（状态栏等小空间用）。
+pub fn tab_button_sized(
     ui: &mut egui::Ui,
     p: &Palette,
     selected: bool,
     label: &str,
+    size: egui::Vec2,
 ) -> egui::Response {
-    let (rect, resp) = ui.allocate_at_least(egui::vec2(64.0, 28.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_at_least(size, egui::Sense::click());
     let bg = if selected {
         p.accent
     } else if resp.hovered() {
@@ -220,7 +226,50 @@ pub fn tab_button(
     resp
 }
 
-/// 小号圆角按钮（主题切换等）。
+/// 描边按钮：透明底 + 细边框，悬停有浅底；`enabled=false` 时置灰不可点。
+pub fn outline_button(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    text_color: Color32,
+    min_size: egui::Vec2,
+    enabled: bool,
+) -> egui::Response {
+    let (text_color, border) = if enabled {
+        (text_color, p.card_stroke)
+    } else {
+        (p.muted, p.card_stroke)
+    };
+    let font = egui::FontId::proportional(14.0);
+    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font.clone(), text_color));
+    let size = egui::vec2(
+        min_size.x.max(galley.size().x + 36.0),
+        min_size.y,
+    );
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_at_least(size, sense);
+    let bg = if resp.hovered() && enabled {
+        p.hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(6), bg);
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(6),
+        Stroke::new(1.0_f32, border),
+        egui::epaint::StrokeKind::Inside,
+    );
+    let pos = rect.center() - galley.size() / 2.0;
+    ui.painter().galley(pos, galley, text_color);
+    resp
+}
+
+/// 小号圆角按钮（日志抽屉的收起/清空）。
 pub fn small_button(p: &Palette, label: &str) -> egui::Button<'static> {
     egui::Button::new(egui::RichText::new(label.to_owned()).color(p.muted))
         .corner_radius(CornerRadius::same(6))
@@ -240,4 +289,416 @@ pub fn card_title(ui: &mut egui::Ui, p: &Palette, title: &str) {
 /// 次要说明文字。
 pub fn hint(ui: &mut egui::Ui, p: &Palette, text: &str) {
     ui.label(egui::RichText::new(text.to_owned()).color(p.muted));
+}
+
+/// 给颜色加透明度，用来做浅色底/描边。
+pub fn tint(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
+/// 分段选择器按钮：选中为强调色胶囊，未选中透明、悬停有浅底。
+pub fn segment_button(ui: &mut egui::Ui, p: &Palette, selected: bool, label: &str) -> egui::Response {
+    let color = if selected { p.accent_text } else { p.muted };
+    let font = egui::FontId::proportional(13.5);
+    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font.clone(), color));
+    let size = egui::vec2(galley.size().x + 30.0, 30.0);
+    let (rect, resp) = ui.allocate_at_least(size, egui::Sense::click());
+    let bg = if selected {
+        p.accent
+    } else if resp.hovered() {
+        p.hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(6), bg);
+    let pos = rect.center() - galley.size() / 2.0;
+    ui.painter().galley(pos, galley, color);
+    resp
+}
+
+/// 状态横幅：同色系浅底 + 描边 + 彩色加粗文字，用于测试结果等提示。
+pub fn status_banner(ui: &mut egui::Ui, p: &Palette, color: Color32, text: &str) {
+    let alpha = if p.is_dark() { 40 } else { 24 };
+    egui::Frame::NONE
+        .fill(tint(color, alpha))
+        .stroke(Stroke::new(1.0_f32, tint(color, 100)))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.colored_label(
+                color,
+                egui::RichText::new(text.to_owned()).strong(),
+            );
+        });
+}
+
+/// 日志级别徽标：小圆角浅底块 + 彩色文字。
+pub fn level_badge(ui: &mut egui::Ui, p: &Palette, tag: &str, color: Color32) {
+    let galley = ui.fonts(|f| {
+        f.layout_no_wrap(
+            tag.to_owned(),
+            egui::FontId::proportional(10.5),
+            color,
+        )
+    });
+    let size = galley.size() + egui::vec2(10.0, 4.0);
+    let (rect, _) = ui.allocate_at_least(size, egui::Sense::hover());
+    let alpha = if p.is_dark() { 45 } else { 28 };
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(4), tint(color, alpha));
+    let pos = rect.center() - galley.size() / 2.0;
+    ui.painter().galley(pos, galley, color);
+}
+
+/// 齿轮图标按钮（设置入口，无文字）。
+pub fn gear_button(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
+    let (rect, resp) = ui.allocate_at_least(egui::vec2(32.0, 32.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), p.hover);
+    }
+    let c = rect.center();
+    let color = if resp.hovered() { p.text } else { p.muted };
+    // 8 个齿 + 外圈 + 中心轴
+    for i in 0..8 {
+        let a = i as f32 * std::f32::consts::PI / 4.0;
+        let tooth = egui::pos2(c.x + a.cos() * 7.4, c.y + a.sin() * 7.4);
+        ui.painter().circle_filled(tooth, 1.9, color);
+    }
+    ui.painter()
+        .circle_stroke(c, 6.2, Stroke::new(2.2_f32, color));
+    ui.painter().circle_filled(c, 2.0, color);
+    resp
+}
+
+/// 信息图标按钮（关于入口，无文字）。
+pub fn info_button(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
+    let (rect, resp) = ui.allocate_at_least(egui::vec2(32.0, 32.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), p.hover);
+    }
+    let c = rect.center();
+    let color = if resp.hovered() { p.text } else { p.muted };
+    ui.painter()
+        .circle_stroke(c, 9.0, Stroke::new(1.6_f32, color));
+    // 上面的点
+    ui.painter()
+        .circle_filled(egui::pos2(c.x, c.y - 4.6), 1.3, color);
+    // 下面的竖线
+    ui.painter().line_segment(
+        [egui::pos2(c.x, c.y - 1.6), egui::pos2(c.x, c.y + 4.6)],
+        Stroke::new(1.8_f32, color),
+    );
+    resp
+}
+
+/// 返回按钮：左箭头 + “返回”文字（设置页左上角，替代右上角关闭）。
+pub fn back_button(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
+    let font = egui::FontId::proportional(13.5);
+    let galley = ui.fonts(|f| f.layout_no_wrap("返回".to_owned(), font.clone(), p.muted));
+    let (rect, resp) = ui.allocate_at_least(
+        egui::vec2(galley.size().x + 44.0, 30.0),
+        egui::Sense::click(),
+    );
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), p.hover);
+    }
+    let color = if resp.hovered() { p.text } else { p.muted };
+    // 画左箭头
+    let tip = egui::pos2(rect.min.x + 15.0, rect.center().y);
+    ui.painter().line_segment(
+        [
+            egui::pos2(tip.x + 5.0, tip.y - 5.0),
+            egui::pos2(tip.x, tip.y),
+        ],
+        Stroke::new(1.8_f32, color),
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(tip.x, tip.y),
+            egui::pos2(tip.x + 5.0, tip.y + 5.0),
+        ],
+        Stroke::new(1.8_f32, color),
+    );
+    let galley = ui.fonts(|f| f.layout_no_wrap("返回".to_owned(), font, color));
+    ui.painter().galley(
+        egui::pos2(rect.min.x + 26.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    resp
+}
+
+/// 主题预览卡：缩略窗口示意图 + 名称，选中带强调色描边。
+pub fn theme_card(ui: &mut egui::Ui, p: &Palette, selected: bool, label: &str, dark: bool) -> egui::Response {
+    let size = egui::vec2(132.0, 92.0);
+    let (rect, resp) = ui.allocate_at_least(size, egui::Sense::click());
+    let preview = egui::Rect::from_min_size(rect.min, egui::vec2(132.0, 68.0));
+    let (bg, header, line, accent) = if dark {
+        (
+            Color32::from_rgb(0x14, 0x16, 0x1a),
+            Color32::from_rgb(0x1b, 0x1e, 0x24),
+            Color32::from_rgb(0x3a, 0x40, 0x4a),
+            p.accent,
+        )
+    } else {
+        (
+            Color32::from_rgb(0xf2, 0xf4, 0xf7),
+            Color32::WHITE,
+            Color32::from_rgb(0xd8, 0xdd, 0xe4),
+            p.accent,
+        )
+    };
+    ui.painter()
+        .rect_filled(preview, CornerRadius::same(8), bg);
+    // 顶栏
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(preview.min, egui::vec2(132.0, 14.0)),
+        CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 },
+        header,
+    );
+    // 内容块
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(
+            egui::pos2(preview.min.x + 10.0, preview.min.y + 24.0),
+            egui::vec2(48.0, 30.0),
+        ),
+        CornerRadius::same(4),
+        accent,
+    );
+    for i in 0..2 {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(preview.min.x + 66.0, preview.min.y + 26.0 + i as f32 * 14.0),
+                egui::vec2(56.0, 8.0),
+            ),
+            CornerRadius::same(4),
+            line,
+        );
+    }
+    // 选中描边
+    if selected {
+        ui.painter().rect_stroke(
+            preview,
+            CornerRadius::same(8),
+            Stroke::new(2.0_f32, p.accent),
+            egui::epaint::StrokeKind::Inside,
+        );
+    }
+    // 名称
+    let name_color = if selected { p.accent } else { p.muted };
+    let galley = ui.fonts(|f| {
+        f.layout_no_wrap(
+            label.to_owned(),
+            egui::FontId::proportional(13.0),
+            name_color,
+        )
+    });
+    ui.painter().galley(
+        egui::pos2(
+            rect.center().x - galley.size().x / 2.0,
+            preview.max.y + 8.0,
+        ),
+        galley,
+        name_color,
+    );
+    resp
+}
+
+/// 圆形主按钮外圈的进度环形态。
+#[derive(Clone, Copy)]
+pub enum RingMode {
+    /// 不画任何环（未开始同步 / 已结束）。
+    Hidden,
+    /// 双环：内圈下载进度、外圈上传进度。
+    Dual {
+        download: Option<f32>,
+        upload: Option<f32>,
+    },
+    /// 单环（只画外圈）：清理内存这类只有一个百分比的阶段。
+    Single {
+        progress: Option<f32>,
+        color: Color32,
+    },
+}
+
+/// 圆形主操作按钮：默认内圈是下载进度、外圈是上传进度，圈内是开始/取消。
+/// `enabled = false` 时不可点击（清理设备内存阶段不允许中断）。`size` 是整体直径。
+pub fn round_action_button(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    running: bool,
+    enabled: bool,
+    ring: RingMode,
+    size: f32,
+) -> egui::Response {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_at_least(egui::vec2(size, size), sense);
+    let c = rect.center();
+    let r_outer = size * 0.455; // 外圈
+    let r_inner = size * 0.375; // 内圈
+    let r_circle = size * 0.310;
+    let ring_w = (size * 0.030).max(4.0);
+
+    // 画一段进度弧（从顶部开始，顺时针）
+    let arc = |radius: f32, frac: f32, color: Color32| {
+        let frac = frac.clamp(0.0, 1.0);
+        if frac <= 0.0 {
+            return;
+        }
+        let segments = 72;
+        let start = -std::f32::consts::PI / 2.0;
+        for i in 0..segments {
+            let t0 = i as f32 / segments as f32;
+            let t1 = (i + 1) as f32 / segments as f32;
+            if t0 >= frac {
+                break;
+            }
+            let a0 = start + t0 * 2.0 * std::f32::consts::PI * frac;
+            let a1 = start + t1.min(frac) * 2.0 * std::f32::consts::PI * frac;
+            let p0 = egui::pos2(c.x + a0.cos() * radius, c.y + a0.sin() * radius);
+            let p1 = egui::pos2(c.x + a1.cos() * radius, c.y + a1.sin() * radius);
+            ui.painter().line_segment([p0, p1], Stroke::new(ring_w, color));
+        }
+    };
+
+    // 没有百分比时画一段旋转弧，表示“正在干活”
+    let spinner = |radius: f32, color: Color32| {
+        let t = ui.ctx().input(|i| i.time) as f32;
+        let segments = 28;
+        let start = t * 3.2;
+        for i in 0..segments {
+            let a0 = start + (i as f32 / segments as f32) * 1.6;
+            let a1 = start + ((i + 1) as f32 / segments as f32) * 1.6;
+            let p0 = egui::pos2(c.x + a0.cos() * radius, c.y + a0.sin() * radius);
+            let p1 = egui::pos2(c.x + a1.cos() * radius, c.y + a1.sin() * radius);
+            ui.painter()
+                .line_segment([p0, p1], Stroke::new(ring_w, color));
+        }
+    };
+
+    match ring {
+        RingMode::Hidden => {}
+        RingMode::Dual { download, upload } => {
+            // 外圈：上传进度
+            ui.painter()
+                .circle_stroke(c, r_outer, Stroke::new(ring_w, p.edit_bg));
+            if let Some(f) = upload {
+                arc(r_outer, f, p.accent);
+            }
+            // 内圈：下载进度（未知时转圈）
+            ui.painter()
+                .circle_stroke(c, r_inner, Stroke::new(ring_w, p.edit_bg));
+            match download {
+                Some(f) => arc(r_inner, f, p.success),
+                None if running => spinner(r_inner, p.info),
+                None => {}
+            }
+        }
+        RingMode::Single { progress, color } => {
+            // 单圈：只画进度弧本身（无进度时转圈），不画占位轨道
+            match progress {
+                Some(f) => arc(r_outer, f, color),
+                None if running => spinner(r_outer, color),
+                None => {}
+            }
+        }
+    }
+    // 悬停光环（不可点击时不提示）
+    if enabled && resp.hovered() {
+        ui.painter().circle_stroke(
+            c,
+            r_circle + 5.0,
+            Stroke::new(2.0_f32, tint(p.accent, 70)),
+        );
+    }
+    // 圆按钮本体：可取消时是危险色，清理中（不可中断）用信息色，空闲时是强调色
+    let bg = if !enabled {
+        p.info
+    } else if running {
+        p.danger
+    } else {
+        p.accent
+    };
+    ui.painter().circle_filled(c, r_circle, bg);
+    // 圈内文字
+    let galley = ui.fonts(|f| {
+        f.layout_no_wrap(
+            label.to_owned(),
+            egui::FontId::proportional(17.0),
+            p.accent_text,
+        )
+    });
+    let pos = c - galley.size() / 2.0;
+    ui.painter().galley(pos, galley, p.accent_text);
+    resp
+}
+
+/// 小圆角徽标（序号等）。
+pub fn mini_badge(ui: &mut egui::Ui, p: &Palette, text: &str) {
+    let galley = ui.fonts(|f| {
+        f.layout_no_wrap(
+            text.to_owned(),
+            egui::FontId::proportional(11.0),
+            p.muted,
+        )
+    });
+    let size = galley.size() + egui::vec2(10.0, 4.0);
+    let (rect, _) = ui.allocate_at_least(size, egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(4), p.edit_bg);
+    let pos = rect.center() - galley.size() / 2.0;
+    ui.painter().galley(pos, galley, p.muted);
+}
+
+/// iOS 风格开关：圆角轨道 + 圆形滑块，开为强调色。
+pub fn toggle_switch(ui: &mut egui::Ui, p: &Palette, on: &mut bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_at_least(egui::vec2(46.0, 24.0), egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+    }
+    let bg = if *on { p.accent } else { p.edit_bg };
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(12), bg);
+    if !*on {
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::same(12),
+            Stroke::new(1.0_f32, p.card_stroke),
+            egui::epaint::StrokeKind::Inside,
+        );
+    }
+    let knob_d = 18.0_f32;
+    let knob_x = if *on {
+        rect.max.x - knob_d - 3.0
+    } else {
+        rect.min.x + 3.0
+    };
+    let knob = egui::Rect::from_min_size(
+        egui::pos2(knob_x, rect.center().y - knob_d / 2.0),
+        egui::vec2(knob_d, knob_d),
+    );
+    ui.painter()
+        .rect_filled(knob, CornerRadius::same(9), if *on { p.accent_text } else { p.muted });
+    resp
+}
+
+/// 带标签的开关行：标签在左，开关靠右。
+pub fn toggle_row(ui: &mut egui::Ui, p: &Palette, label: &str, on: &mut bool) -> egui::Response {
+    let mut resp = None;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label.to_owned()).color(p.text));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            resp = Some(toggle_switch(ui, p, on));
+        });
+    });
+    resp.unwrap()
 }

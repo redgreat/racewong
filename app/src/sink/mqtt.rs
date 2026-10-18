@@ -5,9 +5,10 @@ use async_trait::async_trait;
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const ACK_TIMEOUT: Duration = Duration::from_secs(60);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct MqttSink {
     cfg: MqttConfig,
@@ -15,6 +16,8 @@ pub struct MqttSink {
     acks: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>>,
     connected: Arc<AtomicBool>,
     stopping: Arc<AtomicBool>,
+    /// 上传串行锁：ack 计数是共享通道，同时只有一个上传者在数
+    upload_lock: tokio::sync::Mutex<()>,
 }
 
 impl MqttSink {
@@ -27,26 +30,39 @@ impl MqttSink {
         let _ = self.client.disconnect().await;
     }
 
-    pub async fn new(cfg: MqttConfig) -> Result<Self, SinkError> {
+    /// `cancel` 非空时，等待 CONNACK 的过程中被取消会立刻返回错误。
+    pub async fn new(cfg: MqttConfig, cancel: Option<&AtomicBool>) -> Result<Self, SinkError> {
         if !cfg.ready() {
             return Err(SinkError::Config("MQTT 配置不完整".to_string()));
         }
-        let mut options = MqttOptions::new(cfg.client_id.clone(), cfg.broker.clone(), cfg.port);
+        // 同一台机器上可能同时存在多个连接（例如设置页的探测连接还开着），
+        // client_id 完全相同会被 broker 踢掉其中一个，所以每次连接都加随机后缀。
+        let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let client_id = format!("{}-{suffix}", cfg.client_id.trim());
+        let mut options = MqttOptions::new(client_id, cfg.broker.clone(), cfg.port);
         if !cfg.user.trim().is_empty() {
             options.set_credentials(cfg.user.clone(), cfg.password.clone());
         }
-        options.set_keep_alive(Duration::from_secs(30));
+        let keepalive = cfg.keepalive_secs.clamp(5, 600);
+        options.set_keep_alive(Duration::from_secs(keepalive as u64));
         let (client, mut eventloop) = AsyncClient::new(options, 32);
         let connected = Arc::new(AtomicBool::new(false));
         let stopping = Arc::new(AtomicBool::new(false));
+        let last_error = Arc::new(std::sync::Mutex::new(String::new()));
         let (ack_tx, ack_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let connected_task = connected.clone();
         let stopping_task = stopping.clone();
+        let last_error_task = last_error.clone();
         tokio::spawn(async move {
+            // 这个任务一旦退出，request channel 就会断开，之后所有 publish 都会报
+            // "Failed to send mqtt requests to eventloop"。rumqttc 的 eventloop
+            // 只要继续 poll 就会在断线后自动重连，所以除“主动停止”外绝不退出。
+            let mut announced = false;
             loop {
                 match eventloop.poll().await {
                     Ok(Event::Incoming(Packet::ConnAck(_))) => {
                         connected_task.store(true, Ordering::SeqCst);
+                        announced = false;
                     }
                     Ok(Event::Incoming(Packet::PubAck(_))) => {
                         let _ = ack_tx.send(());
@@ -56,13 +72,19 @@ impl MqttSink {
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        connected_task.store(false, Ordering::SeqCst);
+                        let was_connected = connected_task.swap(false, Ordering::SeqCst);
                         if stopping_task.load(Ordering::SeqCst) {
                             log::info!("MQTT 连接已按要求关闭");
-                        } else {
-                            log::error!("MQTT 事件循环意外结束: {e}");
+                            break;
                         }
-                        break;
+                        // 只在状态变化时记日志，避免 broker 长时间不在线时刷屏
+                        if was_connected || !announced {
+                            log::warn!("MQTT 连接中断: {e}，将自动重连");
+                            announced = true;
+                        }
+                        if let Ok(mut slot) = last_error_task.lock() {
+                            *slot = e.to_string();
+                        }
                     }
                 }
             }
@@ -74,27 +96,60 @@ impl MqttSink {
             acks: Arc::new(tokio::sync::Mutex::new(ack_rx)),
             connected,
             stopping,
+            upload_lock: tokio::sync::Mutex::new(()),
         };
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        while Instant::now() < deadline {
             if sink.is_connected() {
                 return Ok(sink);
             }
+            if let Some(flag) = cancel {
+                if flag.load(Ordering::SeqCst) {
+                    return Err(SinkError::Mqtt(crate::worker::CANCELLED.to_string()));
+                }
+            }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        Err(SinkError::Mqtt(format!("连接 broker {}:{} 超时", sink.cfg.broker, sink.cfg.port)))
+        // 把 eventloop 里记录的真实错误带出来，比干巴巴的“超时”有用得多
+        let detail = last_error.lock().map(|e| e.clone()).unwrap_or_default();
+        let msg = if detail.is_empty() {
+            format!("连接 broker {}:{} 超时", sink.cfg.broker, sink.cfg.port)
+        } else {
+            format!("连接 broker {}:{} 失败: {detail}", sink.cfg.broker, sink.cfg.port)
+        };
+        Err(SinkError::Mqtt(msg))
     }
-    async fn wait_ack(&self) -> SinkResult {
-        let result = tokio::time::timeout(ACK_TIMEOUT, async {
-            let mut rx = self.acks.lock().await;
-            rx.recv().await
-        })
-        .await;
-        match result {
-            Ok(Some(())) => Ok(()),
-            Ok(None) => Err(SinkError::Mqtt("MQTT 事件循环已退出".to_string())),
-            Err(_) => Err(SinkError::Mqtt("等待 PUBACK 超时".to_string())),
+
+    /// 等 n 个 PUBACK（流水线发布后批量计数）；连接断开时快速失败。
+    async fn wait_acks(&self, n: usize) -> SinkResult {
+        if n == 0 {
+            return Ok(());
         }
+        let deadline = Instant::now() + ACK_TIMEOUT.max(Duration::from_secs(30) * n as u32 / 64);
+        let mut got = 0usize;
+        while got < n {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(SinkError::Mqtt(format!(
+                    "等待 PUBACK 超时（已确认 {got}/{n}）"
+                )));
+            }
+            let mut rx = self.acks.lock().await;
+            match tokio::time::timeout(remaining.min(Duration::from_millis(500)), rx.recv()).await
+            {
+                Ok(Some(())) => got += 1,
+                Ok(None) => return Err(SinkError::Mqtt("MQTT 事件循环已退出".to_string())),
+                Err(_) => {
+                    drop(rx);
+                    if !self.is_connected() {
+                        return Err(SinkError::Mqtt(
+                            "MQTT 连接已断开，未收到发布确认".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -114,10 +169,15 @@ impl DataSink for MqttSink {
         if session.records.is_empty() {
             return Ok(());
         }
+        // 串行化：ack 计数通道是共享的
+        let _guard = self.upload_lock.lock().await;
         let total_records = session.records.len();
         let batch_count = total_records.div_ceil(RBX2_MAX_BATCH_RECORDS);
         let sync_total = session.sync_total() as u32;
 
+        // 先构建所有帧（每帧 ~9.7KB，一个 20 万条的段约 1600 帧 / 16MB，
+        // 相比 records 本身占用可接受；真正限制来自 request channel 的背压）
+        let mut frames: Vec<Vec<u8>> = Vec::with_capacity(batch_count);
         for batch_index in 0..batch_count {
             let start = batch_index * RBX2_MAX_BATCH_RECORDS;
             let end = (start + RBX2_MAX_BATCH_RECORDS).min(total_records);
@@ -147,19 +207,36 @@ impl DataSink for MqttSink {
                 device: session.device.clone(),
                 sync_date: first.local_date_numeric(),
             };
-            let frame = build_rbx2_frame(&batch);
-            self.client
-                .publish(self.cfg.topic.clone(), QoS::AtLeastOnce, false, frame.clone())
-                .await
-                .map_err(|e| SinkError::Mqtt(e.to_string()))?;
-            self.wait_ack().await?;
+            frames.push(build_rbx2_frame(&batch));
+        }
+
+        // 流水线发布：连续发一批（CHUNK 个）再统一等 ACK，避免逐包往返
+        const CHUNK: usize = 64;
+        let mut sent = 0usize;
+        while sent < batch_count {
+            let end = (sent + CHUNK).min(batch_count);
+            for frame in &frames[sent..end] {
+                self.client
+                    .publish(self.cfg.topic.clone(), QoS::AtLeastOnce, false, frame.clone())
+                    .await
+                    .map_err(|e| {
+                        if self.is_connected() {
+                            SinkError::Mqtt(format!("MQTT 发布失败: {e}"))
+                        } else {
+                            SinkError::Mqtt("MQTT 连接已断开，发布失败".to_string())
+                        }
+                    })?;
+            }
+            self.wait_acks(end - sent).await?;
             log::info!(
-                "MQTT 已确认批次: 主题={}, 记录={}/{}, 偏移={}",
+                "MQTT 已确认批次: 主题={}, 批次 {}-{}/{}, 记录={}",
                 self.cfg.topic,
-                records.len(),
-                total_records,
-                start
+                sent + 1,
+                end,
+                batch_count,
+                total_records
             );
+            sent = end;
         }
         Ok(())
     }

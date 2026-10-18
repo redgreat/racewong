@@ -3,6 +3,7 @@ use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures_util::Stream;
 use futures_util::StreamExt;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub type NotificationStream = Pin<Box<dyn Stream<Item = btleplug::api::ValueNotification> + Send>>;
@@ -16,11 +17,13 @@ pub async fn first_adapter() -> Result<Adapter, String> {
     Ok(adapters.remove(0))
 }
 
+/// 扫描设备；`cancel` 被置位时立即停止扫描并返回错误（由调用方翻译成“已取消”）。
 pub async fn find_device(
     adapter: &Adapter,
     name_filter: &str,
     last_address: Option<&str>,
     timeout: Duration,
+    cancel: &AtomicBool,
     mut on_device: impl FnMut(&str, &str),
 ) -> Result<Peripheral, String> {
     adapter
@@ -29,6 +32,9 @@ pub async fn find_device(
         .map_err(|e| format!("启动扫描失败: {e}"))?;
     let deadline = std::time::Instant::now() + timeout;
     let result = loop {
+        if cancel.load(Ordering::SeqCst) {
+            break None;
+        }
         let peripherals = adapter.peripherals().await.map_err(|e| format!("扫描失败: {e}"))?;
         let mut preferred: Option<Peripheral> = None;
         let mut named: Option<Peripheral> = None;

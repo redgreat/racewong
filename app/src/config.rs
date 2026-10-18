@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 pub const DEFAULT_MQTT_TOPIC: &str = "deskwong/racebox/data";
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct PgConfig {
     pub host: String,
     pub port: u16,
@@ -30,7 +30,7 @@ impl PgConfig {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct MqttConfig {
     pub broker: String,
     pub port: u16,
@@ -38,6 +38,13 @@ pub struct MqttConfig {
     pub password: String,
     pub topic: String,
     pub client_id: String,
+    /// 保活间隔（秒）。
+    #[serde(default = "default_keepalive")]
+    pub keepalive_secs: u32,
+}
+
+fn default_keepalive() -> u32 {
+    30
 }
 
 impl Default for MqttConfig {
@@ -49,6 +56,7 @@ impl Default for MqttConfig {
             password: String::new(),
             topic: DEFAULT_MQTT_TOPIC.to_string(),
             client_id: "racewong-app".to_string(),
+            keepalive_secs: default_keepalive(),
         }
     }
 }
@@ -80,13 +88,23 @@ pub enum SinkMode {
     Both,
 }
 
+impl SinkMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            SinkMode::Database => "PostgreSQL 直连",
+            SinkMode::Mqtt => "MQTT (RBX2)",
+            SinkMode::Both => "两者都传",
+        }
+    }
+}
+
 impl Default for SinkMode {
     fn default() -> Self {
         SinkMode::Database
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     pub pg: PgConfig,
     pub mqtt: MqttConfig,
@@ -96,8 +114,15 @@ pub struct Config {
     pub auto_erase: bool,
     pub spool_on_failure: bool,
     pub device_name_filter: String,
+    /// 蓝牙扫描超时（秒）。
+    #[serde(default = "default_scan_timeout")]
+    pub scan_timeout_secs: u32,
     pub last_device_address: Option<String>,
     pub last_device_name: Option<String>,
+}
+
+fn default_scan_timeout() -> u32 {
+    45
 }
 
 impl Default for Config {
@@ -110,6 +135,7 @@ impl Default for Config {
             auto_erase: true,
             spool_on_failure: true,
             device_name_filter: "RaceBox".to_string(),
+            scan_timeout_secs: default_scan_timeout(),
             last_device_address: None,
             last_device_name: None,
         }

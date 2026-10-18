@@ -159,7 +159,7 @@ async fn run_check() {
 
     if cfg.uses_mqtt() {
         print!("MQTT {}:{}/{} ... ", cfg.mqtt.broker, cfg.mqtt.port, cfg.mqtt.topic);
-        match crate::sink::mqtt::MqttSink::new(cfg.mqtt.clone()).await {
+        match crate::sink::mqtt::MqttSink::new(cfg.mqtt.clone(), None).await {
             Ok(sink) => {
                 println!("OK (已收到 CONNACK)");
                 sink.disconnect().await;
