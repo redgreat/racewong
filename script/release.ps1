@@ -62,9 +62,49 @@ function Get-Tool([string]$Name) {
     return (Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+# 直接执行并把输出留给终端（构建这类耗时命令用）。
 function Invoke-Checked([string]$Exe, [string[]]$ExeArgs) {
     & $Exe @ExeArgs
     return $LASTEXITCODE
+}
+
+# 执行并捕获输出：失败时能把真实原因（stderr）显示出来。
+# 返回 @{ Code = <退出码>; Output = <输出文本> }
+function Invoke-Cmd([string]$Exe, [string[]]$ExeArgs) {
+    $output = & $Exe @ExeArgs 2>&1
+    $code = $LASTEXITCODE
+    $text = ''
+    if ($null -ne $output) { $text = ($output | Out-String).Trim() }
+    return @{ Code = $code; Output = $text }
+}
+
+# 执行 git 并检查退出码，失败时带上 git 的真实输出。
+function Invoke-Git([string[]]$GitArgs) {
+    $r = Invoke-Cmd 'git' $GitArgs
+    if ($r.Code -ne 0) {
+        $detail = if ($r.Output) { "`n$($r.Output)" } else { '' }
+        Die "git $($GitArgs -join ' ') 失败（退出码 $($r.Code)）$detail"
+    }
+    return $r.Output
+}
+
+# 前置检查：提交身份、origin 远端，避免走到一半才炸。
+function Test-GitReady {
+    $name  = (Invoke-Cmd 'git' @('config', 'user.name')).Output
+    $email = (Invoke-Cmd 'git' @('config', 'user.email')).Output
+    if (-not $name -or -not $email) {
+        Die 'git 未配置提交身份，请先执行：git config --global user.name "你的名字" ; git config --global user.email "you@example.com"'
+    }
+    $remotes = (Invoke-Cmd 'git' @('remote')).Output
+    if ($remotes -notmatch '(^|\s)origin(\s|$)') { Die '没有 origin 远端，无法推送标签' }
+    Ok "提交身份 $name <$email>"
+}
+
+# 远端是否已有某个标签（用于"本地有、远端没有"时补推）。
+function Test-RemoteTag([string]$Tag) {
+    $r = Invoke-Cmd 'git' @('ls-remote', '--tags', 'origin', "refs/tags/$Tag")
+    if ($r.Code -ne 0) { return $false }
+    return -not [string]::IsNullOrWhiteSpace($r.Output)
 }
 
 # ---------------------------------------------------------------- 平台识别
@@ -121,8 +161,11 @@ function Get-CargoVersion {
 }
 
 function Get-LatestTag {
-    $tags = @(& git tag --list 'v*.*.*' --sort=-version:refname)
-    if ($tags.Count -gt 0) { return $tags[0] }
+    $r = Invoke-Cmd 'git' @('tag', '--list', 'v*.*.*', '--sort=-version:refname')
+    if ($r.Code -eq 0 -and $r.Output) {
+        $first = $r.Output -split "`r?`n" | Where-Object { $_ } | Select-Object -First 1
+        if ($first) { return $first.Trim() }
+    }
     return ''
 }
 
@@ -146,7 +189,11 @@ function Set-CargoVersion([string]$Ver) {
 # ---------------------------------------------------------------- Release 正文（git 备注）
 function Get-ReleaseNotes([string]$From, [string]$To) {
     $range = if ($From) { "$From..$To" } else { $To }
-    $lines = @(& git log --no-merges "--pretty=format:* %s (%h)" $range)
+    $r = Invoke-Cmd 'git' @('log', '--no-merges', "--pretty=format:* %s (%h)", $range)
+    $lines = @()
+    if ($r.Code -eq 0 -and $r.Output) {
+        $lines = @($r.Output -split "`r?`n" | Where-Object { $_ })
+    }
     if ($lines.Count -eq 0) { return "本次发布没有新的提交记录。" }
     $head = if ($From) { "## 变更记录（$From .. $To）" } else { "## 变更记录" }
     return ($head + "`n" + ($lines -join "`n"))
@@ -333,7 +380,7 @@ function Publish-Release([string]$Tag, [string]$Notes, [string[]]$Assets) {
         Warn '未安装 gh 且没有 GITHUB_TOKEN，跳过 Release；说明已写入 dist/release-notes.md'
         return
     }
-    $remote = (& git remote get-url origin | Select-Object -First 1)
+    $remote = (Invoke-Cmd 'git' @('remote', 'get-url', 'origin')).Output.Trim()
     if (-not $remote) { Warn '没有 origin 远端，跳过 Release'; return }
     $remote = $remote.Trim()
     if ($remote -notmatch 'github\.com[:/](.+?)(\.git)?$') { Warn "无法解析 GitHub 仓库: $remote"; return }
@@ -383,9 +430,10 @@ if ($NotesOnly) {
         if ($v -notmatch '^v') { $v = "v$v" }
         $toRef = $v
     }
-    $tags = @(& git tag --list 'v*.*.*' --sort=-version:refname)
-    $cur  = ''
-    try { $cur = (& git describe --tags --exact-match HEAD 2>$null | Select-Object -First 1) } catch { $cur = '' }
+    $tagOut = (Invoke-Cmd 'git' @('tag', '--list', 'v*.*.*', '--sort=-version:refname')).Output
+    $tags = @()
+    if ($tagOut) { $tags = @($tagOut -split "`r?`n" | Where-Object { $_ }) }
+    $cur  = (Invoke-Cmd 'git' @('describe', '--tags', '--exact-match', 'HEAD')).Output.Trim()
     $from = ''
     if ($cur) {
         if ($tags.Count -gt 1) { $from = $tags[1] }
@@ -409,18 +457,22 @@ if ($BuildOnly) {
 
 # ---- 完整发布 ----
 Step '检查工作区'
-$branch = (& git rev-parse --abbrev-ref HEAD | Select-Object -First 1)
+Test-GitReady
+$branch = (Invoke-Git @('rev-parse', '--abbrev-ref', 'HEAD')).Trim()
 if (-not $branch) { Die '无法获取当前分支' }
-$branch = $branch.Trim()
-$dirty = (& git status --porcelain)
+$dirty = Invoke-Git @('status', '--porcelain')
 if ($dirty -and -not $Force) { Die "工作区不干净，请先提交或暂存改动（或用 -Force 忽略）：`n$dirty" }
 Ok "分支 $branch"
 
-$null = & git fetch --tags origin 2>$null
+# 拉远端标签，避免本地残留标签把版本号顶得越来越高
+$null = Invoke-Cmd 'git' @('fetch', '--tags', 'origin')
 
 $verNoV = ''
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $latest = Get-LatestTag
+    if ($latest -and -not (Test-RemoteTag $latest)) {
+        Warn "本地标签 $latest 在远端不存在（多半是上次没推成功），仍以它为基准"
+    }
     $verNoV = Get-NextVersion $latest
     Ok "自动版本：$(if ($latest) { "$latest -> v$verNoV" } else { "v$verNoV（无历史标签）" })"
 } else {
@@ -429,8 +481,12 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
     if ($verNoV -notmatch '^\d+\.\d+\.\d+') { Die "版本格式错误: $Version（需要 v主版本.次版本.修订号）" }
 }
 $tag = "v$verNoV"
-if (& git tag --list $tag) { Die "标签 $tag 已存在" }
-Ok "目标版本 $tag"
+
+# 标签在三处可能的状态：本地有 / 远端有；远端有的话就不能再发一次
+$tagLocal  = -not [string]::IsNullOrWhiteSpace((Invoke-Git @('tag', '--list', $tag)))
+$tagRemote = Test-RemoteTag $tag
+if ($tagRemote) { Die "标签 $tag 已在远端存在，换个版本号（或先删远端标签）后再发" }
+if ($tagLocal) { Ok "本地已有标签 $tag（远端没有），跳过创建、稍后补推" } else { Ok "目标版本 $tag" }
 
 # Release 正文要在打新标签之前算好
 $prevTag = Get-LatestTag
@@ -442,31 +498,35 @@ if ($oldVer -ne $verNoV) {
     if ($DryRun) { Say "   [dry-run] app/Cargo.toml: $oldVer -> $verNoV" }
     else {
         $null = Set-CargoVersion $verNoV
-        $code = Invoke-Checked 'git' @('add', (Join-Path $AppDir 'Cargo.toml'))
-        if ($code -ne 0) { Die 'git add 失败' }
-        $code = Invoke-Checked 'git' @('commit', '-m', "chore(release): bump version to $verNoV")
-        if ($code -ne 0) { Die '提交失败' }
-        Ok "版本号 $oldVer -> $verNoV"
+        Invoke-Git @('add', (Join-Path $AppDir 'Cargo.toml'))
+        $r = Invoke-Cmd 'git' @('commit', '-m', "chore(release): bump version to $verNoV")
+        if ($r.Code -ne 0) {
+            if ($r.Output -match 'nothing to commit') { Ok '没有需要提交的改动' }
+            else { Die "提交失败：$($r.Output)" }
+        } else {
+            Ok "版本号 $oldVer -> $verNoV"
+        }
     }
 } else {
     Ok "版本号已是 $verNoV"
 }
 
 Step "打标签 $tag"
-if ($DryRun) { Say "   [dry-run] git tag -a $tag -m 'Release $tag'" }
-else {
-    $code = Invoke-Checked 'git' @('tag', '-a', $tag, '-m', "Release $tag")
-    if ($code -ne 0) { Die '创建标签失败' }
+if ($tagLocal) {
+    Ok '标签已存在，跳过创建'
+} elseif ($DryRun) {
+    Say "   [dry-run] git tag -a $tag -m 'Release $tag'"
+} else {
+    Invoke-Git @('tag', '-a', $tag, '-m', "Release $tag")
     Ok '标签已创建'
 }
 
 Step '推送提交与标签'
 if ($DryRun) { Say "   [dry-run] git push origin $branch && git push origin $tag" }
 else {
-    $code = Invoke-Checked 'git' @('push', 'origin', $branch)
-    if ($code -ne 0) { Warn "推送分支 $branch 失败（可能没有上游），继续推送标签" }
-    $code = Invoke-Checked 'git' @('push', 'origin', $tag)
-    if ($code -ne 0) { Die '推送标签失败' }
+    $r = Invoke-Cmd 'git' @('push', 'origin', $branch)
+    if ($r.Code -ne 0) { Warn "推送分支 $branch 失败：$($r.Output)" }
+    Invoke-Git @('push', 'origin', $tag)
     Ok "已推送 $tag"
 }
 

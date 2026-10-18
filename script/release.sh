@@ -67,6 +67,39 @@ run() { # run <cmd> [args...]  —— dry-run 时只打印
   "$@"
 }
 
+# 执行并捕获输出：CAP_CODE 退出码、CAP_OUT 输出（失败时能看到真实原因）
+CAP_CODE=0
+CAP_OUT=""
+capture() {
+  CAP_OUT="$("$@" 2>&1)" && CAP_CODE=0 || CAP_CODE=$?
+  return 0
+}
+
+gitq() { # gitq <args...> —— 失败就带着 git 的输出退出
+  capture git "$@"
+  if [ "$CAP_CODE" -ne 0 ]; then
+    die "git $* 失败（退出码 $CAP_CODE）
+$CAP_OUT"
+  fi
+  printf '%s' "$CAP_OUT"
+}
+
+git_ready() {
+  capture git config user.name;  local name="$CAP_OUT"
+  capture git config user.email; local email="$CAP_OUT"
+  if [ -z "$name" ] || [ -z "$email" ]; then
+    die 'git 未配置提交身份，请先执行：git config --global user.name "你的名字" && git config --global user.email "you@example.com"'
+  fi
+  capture git remote
+  case "$CAP_OUT" in *origin*) ;; *) die '没有 origin 远端，无法推送标签' ;; esac
+  ok "提交身份 $name <$email>"
+}
+
+remote_has_tag() { # remote_has_tag <tag>
+  capture git ls-remote --tags origin "refs/tags/$1"
+  [ "$CAP_CODE" -eq 0 ] && [ -n "$CAP_OUT" ]
+}
+
 host_os() {
   case "$(uname -s)" in
     Darwin)  echo macos ;;
@@ -110,7 +143,7 @@ set_cargo_version() { # set_cargo_version <ver>
   return 0
 }
 
-latest_tag() { git tag --list 'v*.*.*' --sort=-version:refname | head -n1; }
+latest_tag() { capture git tag --list 'v*.*.*' --sort=-version:refname; [ "$CAP_CODE" -eq 0 ] && printf '%s' "$CAP_OUT" | head -n1; }
 
 next_version() { # next_version <latest-tag>
   local latest="$1"
@@ -127,7 +160,8 @@ release_notes() { # release_notes <from> <to>
   if [ -n "$from" ]; then range="$from..$to"; else range="$to"; fi
   if [ -n "$from" ]; then printf '## 变更记录（%s .. %s）\n' "$from" "$to"; else printf '## 变更记录\n'; fi
   local lines
-  lines="$(git log --no-merges --pretty='format:* %s (%h)' "$range")"
+  capture git log --no-merges --pretty='format:* %s (%h)' "$range"
+  lines="$CAP_OUT"
   if [ -z "$lines" ]; then printf '本次发布没有新的提交记录。\n'; else printf '%s\n' "$lines"; fi
 }
 
@@ -363,15 +397,19 @@ if [ "$BUILD_ONLY" = "1" ]; then
 fi
 
 step '检查工作区'
-branch="$(git rev-parse --abbrev-ref HEAD)"
-if [ -n "$(git status --porcelain)" ] && [ "$FORCE" = "0" ]; then
+git_ready
+branch="$(gitq rev-parse --abbrev-ref HEAD)"
+if [ -n "$(gitq status --porcelain)" ] && [ "$FORCE" = "0" ]; then
   die "工作区不干净，请先提交或暂存改动（或用 --force 忽略）"
 fi
 ok "分支 $branch"
-git fetch --tags origin >/dev/null 2>&1 || true
+capture git fetch --tags origin   # 拉远端标签，避免本地残留标签把版本号顶高
 
 if [ -z "$VERSION" ]; then
   latest="$(latest_tag)"
+  if [ -n "$latest" ] && ! remote_has_tag "$latest"; then
+    warn "本地标签 $latest 在远端不存在（多半是上次没推成功），仍以它为基准"
+  fi
   ver="$(next_version "$latest")"
   if [ -n "$latest" ]; then ok "自动版本：$latest -> v$ver"; else ok "自动版本：v$ver（无历史标签）"; fi
 else
@@ -380,8 +418,12 @@ else
   [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || die "版本格式错误: $VERSION（需要 v主版本.次版本.修订号）"
 fi
 tag="v$ver"
-git tag --list "$tag" | grep -q . && die "标签 $tag 已存在"
-ok "目标版本 $tag"
+
+tag_local=0; tag_remote=0
+capture git tag --list "$tag"; [ -n "$CAP_OUT" ] && tag_local=1
+remote_has_tag "$tag" && tag_remote=1
+if [ "$tag_remote" = "1" ]; then die "标签 $tag 已在远端存在，换个版本号（或先删远端标签）后再发"; fi
+if [ "$tag_local" = "1" ]; then ok "本地已有标签 $tag（远端没有），跳过创建、稍后补推"; else ok "目标版本 $tag"; fi
 
 prev_tag="$(latest_tag)"
 notes="$(release_notes "$prev_tag" HEAD)"
@@ -394,18 +436,32 @@ if [ "$old_ver" != "$ver" ]; then
   else
     set_cargo_version "$ver"
     run git add "$APP_DIR/Cargo.toml" || die 'git add 失败'
-    run git commit -m "chore(release): bump version to $ver" || die '提交失败'
-    ok "版本号 $old_ver -> $ver"
+    if [ "$DRY_RUN" = "1" ]; then
+      printf '   [dry-run] git commit -m "chore(release): bump version to %s"\n' "$ver"
+    else
+      capture git commit -m "chore(release): bump version to $ver"
+      if [ "$CAP_CODE" -ne 0 ]; then
+        if printf '%s' "$CAP_OUT" | grep -q 'nothing to commit'; then
+          ok '没有需要提交的改动'
+        else
+          die "提交失败：$CAP_OUT"
+        fi
+      else
+        ok "版本号 $old_ver -> $ver"
+      fi
+    fi
   fi
 else
   ok "版本号已是 $ver"
 fi
 
 step "打标签 $tag"
-if [ "$DRY_RUN" = "1" ]; then
+if [ "$tag_local" = "1" ]; then
+  ok '标签已存在，跳过创建'
+elif [ "$DRY_RUN" = "1" ]; then
   printf "   [dry-run] git tag -a %s -m 'Release %s'\n" "$tag" "$tag"
 else
-  run git tag -a "$tag" -m "Release $tag" || die '创建标签失败'
+  gitq tag -a "$tag" -m "Release $tag" >/dev/null
   ok '标签已创建'
 fi
 
@@ -413,8 +469,9 @@ step '推送提交与标签'
 if [ "$DRY_RUN" = "1" ]; then
   printf "   [dry-run] git push origin %s && git push origin %s\n" "$branch" "$tag"
 else
-  git push origin "$branch" || warn "推送分支 $branch 失败（可能没有上游），继续推送标签"
-  run git push origin "$tag" || die '推送标签失败'
+  capture git push origin "$branch"
+  [ "$CAP_CODE" -ne 0 ] && warn "推送分支 $branch 失败：$CAP_OUT"
+  gitq push origin "$tag" >/dev/null
   ok "已推送 $tag"
 fi
 
