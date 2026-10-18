@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
 
+// 下面两个函数只在 Unix 主机（WSL/Linux/macOS 交叉编译 Windows 目标）用到，
+// Windows 主机上没有 std::os::unix，必须整段条件编译掉，否则 build script 编译不过。
+#[cfg(unix)]
 fn llvm_bin_dir() -> Option<PathBuf> {
     for dir in [
         "/usr/lib/llvm-18/bin",
@@ -15,6 +18,7 @@ fn llvm_bin_dir() -> Option<PathBuf> {
 }
 
 /// 在没有 MSVC 的机器上（WSL 交叉编译）为 winres 准备一个名为 rc.exe 的入口。
+#[cfg(unix)]
 fn prepare_rc_shim(out_dir: &Path) -> Option<PathBuf> {
     let llvm = llvm_bin_dir()?;
     let shim_dir = out_dir.join("rcshim");
@@ -30,6 +34,12 @@ fn prepare_rc_shim(out_dir: &Path) -> Option<PathBuf> {
             None
         }
     }
+}
+
+/// Windows 主机上不需要 llvm-rc 软链（直接用 MSVC 的 rc.exe）。
+#[cfg(not(unix))]
+fn prepare_rc_shim(_out_dir: &Path) -> Option<PathBuf> {
+    None
 }
 
 fn main() {
