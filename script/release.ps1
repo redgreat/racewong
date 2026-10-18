@@ -65,8 +65,10 @@ function Get-Tool([string]$Name) {
 }
 
 # 直接执行并把输出留给终端（构建这类耗时命令用）。
+# 注意：必须把输出吞掉，否则函数的返回值会变成「输出 + 退出码」的数组，
+# 调用方用 -ne 0 判断时会误判成失败（cargo 一有输出就"构建失败"）。
 function Invoke-Checked([string]$Exe, [string[]]$ExeArgs) {
-    & $Exe @ExeArgs
+    & $Exe @ExeArgs 2>&1 | Out-Host
     return $LASTEXITCODE
 }
 
