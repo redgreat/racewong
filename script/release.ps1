@@ -16,15 +16,25 @@
 #   .\script\release.ps1 -Version v1.2.0      # 指定版本
 #   .\script\release.ps1 -Version 1.2.0       # 也可以不带 v
 #   .\script\release.ps1 -NoBuild             # 只打标签 + 建 Release，包全交给 CI
+#   .\script\release.ps1 -Build               # 强制在本机构建当前平台的包（即使没地方上传）
 #   .\script\release.ps1 -BuildOnly           # 只构建当前平台安装包（CI 用），不做 git/gh 操作
 #   .\script\release.ps1 -NotesOnly           # 只输出 git 提交记录（当 Release 正文）
 #   .\script\release.ps1 -SkipTests -DryRun   # 演示：跳过测试、只打印不执行
+#
+# 关于「最后为什么还要构建」：
+#   标签推上去之后 GitHub Actions 会把 win/mac/linux 三个包都编好并上传，
+#   所以本机构建只在「本机能上传（gh 已登录 / 有 GITHUB_TOKEN）」时才有意义
+#   —— 它只是让当前平台的包早几分钟出现在 Release 里。
+#   本机没有凭据时脚本会自动跳过这一步（产物无处上传，纯浪费）；
+#   本机没有 cargo 时回退到 WSL 里的 script/build.sh。
+#   想强制本机构建就加 -Build。
 #
 # 需要：git、cargo（构建时）、gh（建 Release 时；没装也可以用 GITHUB_TOKEN 走 REST）
 
 param(
     [Parameter(Position = 0)][string]$Version = '',
     [switch]$BuildOnly,
+    [switch]$Build,
     [switch]$NoBuild,
     [switch]$NotesOnly,
     [switch]$SkipTests,
@@ -62,6 +72,17 @@ function Write-Utf8File([string]$Path, [string]$Text) {
 
 function Get-Tool([string]$Name) {
     return (Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+# D:\a\b -> /mnt/d/a/b，给 WSL 回退用
+function ConvertTo-WslPath([string]$Path) {
+    if ($Path -match '^([A-Za-z]):[\\/]?(.*)$') {
+        $drive = $Matches[1].ToLower()
+        $rest  = $Matches[2] -replace '\\', '/'
+        if ($rest) { return "/mnt/$drive/$rest" }
+        return "/mnt/$drive"
+    }
+    return ($Path -replace '\\', '/')
 }
 
 # 直接执行并把输出留给终端（构建这类耗时命令用）。
@@ -126,6 +147,14 @@ function Test-GhAuth {
     if (-not (Get-Tool 'gh')) { return $false }
     $r = Invoke-Cmd 'gh' @('auth', 'status')
     return ($r.Code -eq 0)
+}
+
+# 本机有没有把安装包传上去的手段（gh 已登录，或设了 token）。
+# 没有的话本机构建出来的包无处可去 —— 标签推上去后 CI 会把三个平台都编好。
+function Test-CanPublish {
+    if (Test-GhAuth) { return $true }
+    if ($env:GITHUB_TOKEN -or $env:GH_TOKEN) { return $true }
+    return $false
 }
 
 # ---------------------------------------------------------------- 平台识别
@@ -223,7 +252,26 @@ function Get-ReleaseNotes([string]$From, [string]$To) {
 # ---------------------------------------------------------------- 构建与打包
 function Invoke-Build([string]$Target) {
     Step "构建 $Target"
-    if (-not (Get-Tool 'cargo')) { Die '找不到 cargo，请先安装 Rust 工具链' }
+
+    # 本机没有工具链时，回退到 WSL 里的 script/build.sh 交叉编译（和 build.ps1 同一条路）。
+    # 产物落在同一个 app/target/<target>/release/ 下，后面的打包逻辑不用改。
+    if (-not (Get-Tool 'cargo')) {
+        $wsl = Get-Tool 'wsl.exe'
+        if ($wsl) {
+            $wslRoot = ConvertTo-WslPath $RepoRoot
+            $flags = @('--release', '--target', $Target)
+            if (-not $SkipTests) { $flags += '--test' }
+            $line = "cd '$wslRoot' && ./script/build.sh " + ($flags -join ' ')
+            Warn '本机没有 cargo，转到 WSL 里用 script/build.sh 交叉编译'
+            Ok "wsl -e bash -lc `"$line`""
+            & wsl.exe -e bash -lc $line
+            if ($LASTEXITCODE -ne 0) { Die "构建失败（target=$Target，WSL）" }
+            Ok '构建完成'
+            return
+        }
+        Die '找不到 cargo，请先安装 Rust 工具链；或者加 -NoBuild 让 GitHub Actions 构建（推荐）'
+    }
+
     Push-Location $AppDir
     $code = 0
     if (-not $SkipTests) {
@@ -484,7 +532,11 @@ if ($BuildOnly) {
 Step '检查工作区'
 Test-GitReady
 if (-not (Test-GhAuth)) {
-    Warn 'gh 未登录（`gh auth login`）：Release 与安装包交给 GitHub Actions 创建'
+    if ($env:GITHUB_TOKEN -or $env:GH_TOKEN) {
+        Warn 'gh 未登录，但检测到 GITHUB_TOKEN：Release 走 REST 接口创建'
+    } else {
+        Warn 'gh 未登录（`gh auth login`）：Release 与安装包交给 GitHub Actions 创建，本机将跳过构建'
+    }
 }
 $branch = (Invoke-Git @('rev-parse', '--abbrev-ref', 'HEAD')).Trim()
 if (-not $branch) { Die '无法获取当前分支' }
@@ -573,12 +625,17 @@ else {
 }
 
 $assets = @()
-if (-not $NoBuild) {
+if ($NoBuild) {
+    Ok '-NoBuild：本机不构建，三个平台的包由 GitHub Actions 产出'
+} elseif (-not $Build -and -not (Test-CanPublish)) {
+    # 标签已经推上去了，CI 会编好三个平台；本机编出来的包没地方上传，跳过
+    Warn '本机没有可用的 GitHub 凭据（gh 未登录、也没设 GITHUB_TOKEN），本地编出来的包无处上传'
+    Ok '标签已推送，三个平台的包由 GitHub Actions 构建并上传，本机跳过构建'
+    Ok '要强制在本机构建（只想留一份本地 zip 之类），加 -Build'
+} else {
     $target = Get-TargetForHost
     Invoke-Build $target
     $assets = @(New-Package $target $verNoV)
-} else {
-    Ok '-NoBuild：本机不构建，三个平台的包由 GitHub Actions 产出'
 }
 
 Publish-Release $tag $notes $assets

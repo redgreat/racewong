@@ -393,13 +393,15 @@ Linux 暂不支持托盘（`tray-icon` 的 Linux 后端要 GTK / AppIndicator �
 .\script\release.ps1
 .\script\release.ps1 -Version v0.2.0      # 指定版本
 .\script\release.ps1 -NoBuild             # 只打标签建 Release，包全交给 CI
-.\script\release.ps1 -BuildOnly           # 只构建当前平台的安装包
+.\script\release.ps1 -Build               # 强制本机构建当前平台的包
+.\script\release.ps1 -BuildOnly           # 只构建当前平台的安装包（CI 用）
 ```
 
 ```bash
 ./script/release.sh                       # 同上的 bash 版
 ./script/release.sh --version v0.2.0
 ./script/release.sh --no-build
+./script/release.sh --build               # 强制本机构建
 ./script/release.sh --build-only --out-dir dist
 ```
 
@@ -408,6 +410,10 @@ Linux 暂不支持托盘（`tray-icon` 的 Linux 后端要 GTK / AppIndicator �
 - 自动版本：取最新 `v*.*.*` 标签 patch +1，没有标签就用 `app/Cargo.toml` 的版本
 - Release 正文来自 **git 提交记录**（`上一个标签..HEAD` 的 `git log`）
 - 建 Release 用 `gh`；没装 `gh` 时可用 `GITHUB_TOKEN` 走 REST
+- **标签推上去就等于发布**：`.github/workflows/release.yml` 会并行编 win/mac/linux 三个包并上传。
+  所以本机的构建只是「让当前平台的包早几分钟出现」，而且**只有本机能上传时才有意义**
+  —— `gh` 未登录且没有 `GITHUB_TOKEN` 时脚本会自动跳过本机构建（否则编出来的包无处可去），
+  想强制构建加 `-Build` / `--build`。本机没有 cargo 时会回退到 WSL 里的 `script/build.sh`。
 - 本机只构建当前平台那一个包，产物形如：
   - `racewong-<ver>-windows-x86_64.zip`
   - `racewong-<ver>-macos-aarch64.tar.gz`（在 macOS 上还会出 `.dmg`，内含 `RaceBox 同步.app`）

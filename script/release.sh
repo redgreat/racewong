@@ -14,9 +14,15 @@
 #   ./script/release.sh                       # 自动 patch +1，走完整流程
 #   ./script/release.sh --version v1.2.0      # 指定版本（也可以不带 v）
 #   ./script/release.sh --no-build            # 只打标签 + 建 Release，包全交给 CI
+#   ./script/release.sh --build               # 强制在本机构建当前平台的包（即使没地方上传）
 #   ./script/release.sh --build-only          # 只构建当前平台安装包（CI 用）
 #   ./script/release.sh --notes-only          # 只输出 git 提交记录（当 Release 正文）
 #   ./script/release.sh --skip-tests --dry-run
+#
+# 关于「最后为什么还要构建」：
+#   标签推上去后 GitHub Actions 会把三个平台都编好并上传，本机构建只在
+#   「本机能上传（gh 已登录 / 有 GITHUB_TOKEN）」时才有意义。
+#   本机没有凭据时自动跳过这一步；没有 cargo 时会提示改用 --no-build。
 #
 # 需要：git、cargo（构建时）、gh（建 Release 时；没装也可以用 GITHUB_TOKEN 走 REST）
 
@@ -30,6 +36,7 @@ BIN_NAME="racewong-app"
 VERSION=""
 BUILD_ONLY=0
 NO_BUILD=0
+FORCE_BUILD=0
 NOTES_ONLY=0
 SKIP_TESTS=0
 FORCE=0
@@ -40,13 +47,14 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --version|-v)      VERSION="${2:-}"; shift 2 ;;
     --build-only)      BUILD_ONLY=1; shift ;;
+    --build)           FORCE_BUILD=1; shift ;;
     --no-build)        NO_BUILD=1; shift ;;
     --notes-only)      NOTES_ONLY=1; shift ;;
     --skip-tests)      SKIP_TESTS=1; shift ;;
     --force)           FORCE=1; shift ;;
     --dry-run)         DRY_RUN=1; shift ;;
     --out-dir)         OUT_DIR="${2:-}"; shift 2 ;;
-    -h|--help)         sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help)         sed -n '2,27p' "$0"; exit 0 ;;
     *)                 echo "未知参数: $1（用 --help 看用法）" >&2; exit 1 ;;
   esac
 done
@@ -168,12 +176,20 @@ release_notes() { # release_notes <from> <to>
 build_app() { # build_app <target>
   local target="$1"
   step "构建 $target"
-  have cargo || die '找不到 cargo，请先安装 Rust 工具链'
+  have cargo || die '找不到 cargo，请先安装 Rust 工具链；或者加 --no-build 让 GitHub Actions 构建（推荐）'
   ( cd "$APP_DIR"
     if [ "$SKIP_TESTS" = "0" ]; then run cargo test --bins --release || exit 1; fi
     run cargo build --release --locked --target "$target" || exit 1
   ) || die "构建失败（target=$target）"
   ok '构建完成'
+}
+
+# 本机有没有把安装包传上去的手段（gh 已登录，或设了 token）。
+# 没有的话本机构建出来的包无处可去 —— 标签推上去后 CI 会把三个平台都编好。
+can_publish() {
+  if [ -n "${GITHUB_TOKEN:-}${GH_TOKEN:-}" ]; then return 0; fi
+  have gh || return 1
+  gh auth status >/dev/null 2>&1
 }
 
 make_app_bundle() { # make_app_bundle <stage> <bin> <ver>
@@ -476,12 +492,16 @@ else
 fi
 
 assets=()
-if [ "$NO_BUILD" = "0" ]; then
+if [ "$NO_BUILD" = "1" ]; then
+  ok '--no-build：本机不构建，三个平台的包由 GitHub Actions 产出'
+elif [ "$FORCE_BUILD" = "0" ] && ! can_publish; then
+  warn '本机没有可用的 GitHub 凭据（gh 未登录、也没设 GITHUB_TOKEN），本地编出来的包无处上传'
+  ok '标签已推送，三个平台的包由 GitHub Actions 构建并上传，本机跳过构建'
+  ok '要强制在本机构建（只想留一份本地包之类），加 --build'
+else
   target="$(host_target)"
   build_app "$target"
   while read -r f; do [ -n "$f" ] && assets+=("$f"); done < <(make_package "$target" "$ver")
-else
-  ok '--no-build：本机不构建，三个平台的包由 GitHub Actions 产出'
 fi
 
 if [ ${#assets[@]} -gt 0 ]; then
