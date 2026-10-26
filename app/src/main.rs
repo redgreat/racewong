@@ -2,63 +2,106 @@
 
 mod ble;
 mod config;
+mod i18n;
 mod protocol;
 mod sink;
 mod style;
+mod tray;
 mod ui;
 mod worker;
 
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
+
 fn setup_fonts(ctx: &eframe::egui::Context) {
     let mut fonts = eframe::egui::FontDefinitions::default();
-    let candidates: &[(&str, &[&str])] = &[
+
+    // 每个槽位是一组候选路径，取第一个存在的。
+    //
+    // 为什么要三个槽位：微软雅黑（msyh）有中日韩共用汉字和西里尔字母，
+    // 但**没有韩文谚文**，只装它的话切到한국어就是一片豆腐块；日文虽然能用
+    // 汉字凑合，字形是中文写法，所以日文界面优先用日文字体。
+    let slots: &[(&str, &[&str])] = &[
         (
-            "windows",
+            "cjk",
             &[
                 "C:\\Windows\\Fonts\\msyh.ttc",
                 "C:\\Windows\\Fonts\\simhei.ttf",
                 "C:\\Windows\\Fonts\\simsun.ttc",
-            ],
-        ),
-        (
-            "macos",
-            &[
                 "/System/Library/Fonts/PingFang.ttc",
                 "/System/Library/Fonts/STHeiti Light.ttc",
-            ],
-        ),
-        (
-            "linux",
-            &[
                 "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
                 "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
                 "/usr/share/fonts/truetype/arphic/uming.ttc",
             ],
         ),
+        (
+            "kr",
+            &[
+                "C:\\Windows\\Fonts\\malgun.ttf",
+                "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+                "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+                "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.otf",
+            ],
+        ),
+        (
+            "jp",
+            &[
+                "C:\\Windows\\Fonts\\YuGothM.ttc",
+                "C:\\Windows\\Fonts\\msgothic.ttc",
+                "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+                "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+            ],
+        ),
     ];
-    for (_os, paths) in candidates {
+
+    for (key, paths) in slots {
         if let Some(path) = paths.iter().find(|p| std::path::Path::new(p).exists()) {
             if let Ok(data) = std::fs::read(path) {
                 fonts.font_data.insert(
-                    "cjk".to_owned(),
+                    (*key).to_owned(),
                     std::sync::Arc::new(eframe::egui::FontData::from_owned(data)),
                 );
-                fonts
-                    .families
-                    .entry(eframe::egui::FontFamily::Proportional)
-                    .or_default()
-                    .insert(0, "cjk".to_owned());
-                fonts
-                    .families
-                    .entry(eframe::egui::FontFamily::Monospace)
-                    .or_default()
-                    .push("cjk".to_owned());
-                break;
             }
         }
     }
+
+    // 排版顺序：当前语言专属字体 → 通用 CJK → 韩文 → 日文。
+    // egui 是按家族列表逐字回退的，排在前面的优先。
+    let mut order: Vec<&str> = Vec::new();
+    match crate::i18n::current() {
+        crate::i18n::Lang::Ko => order.push("kr"),
+        crate::i18n::Lang::Ja => order.push("jp"),
+        _ => {}
+    }
+    for key in ["cjk", "kr", "jp"] {
+        if !order.contains(&key) {
+            order.push(key);
+        }
+    }
+    let present: Vec<String> = order
+        .into_iter()
+        .filter(|k| fonts.font_data.contains_key(*k))
+        .map(str::to_owned)
+        .collect();
+
+    let proportional = fonts
+        .families
+        .entry(eframe::egui::FontFamily::Proportional)
+        .or_default();
+    // 逆序插到最前面，最终顺序就是 present 的顺序
+    for key in present.iter().rev() {
+        proportional.insert(0, (*key).clone());
+    }
+    let monospace = fonts
+        .families
+        .entry(eframe::egui::FontFamily::Monospace)
+        .or_default();
+    for key in present.iter() {
+        monospace.push((*key).clone());
+    }
+
     ctx.set_fonts(fonts);
 }
 
@@ -100,7 +143,7 @@ fn window_icon() -> Option<std::sync::Arc<eframe::egui::IconData>> {
     match eframe::icon_data::from_png_bytes(bytes) {
         Ok(icon) => Some(std::sync::Arc::new(icon)),
         Err(e) => {
-            eprintln!("窗口图标加载失败: {e}");
+            eprintln!("{}: {e}", crate::t!("窗口图标加载失败", "failed to load window icon"));
             None
         }
     }
@@ -125,35 +168,26 @@ pub fn write_ui_log(level: &str, message: &str) {
 /// `racewong-app --check`：不开窗口，直接按当前配置测 PG/MQTT 连通性。
 async fn run_check() {
     let cfg = config::load();
-    println!("配置文件: {}", config::config_path().display());
     println!(
-        "上传方式: {}",
+        "{}: {}",
+        crate::t!("配置文件", "config file"),
+        config::config_path().display()
+    );
+    println!(
+        "{}: {}",
+        crate::t!("上传方式", "upload channel"),
         match cfg.sink_mode {
             config::SinkMode::Database => "PostgreSQL",
             config::SinkMode::Mqtt => "MQTT",
-            config::SinkMode::Both => "PostgreSQL + MQTT",
         }
     );
 
     if cfg.uses_database() {
         print!("PostgreSQL {}:{}/{} ... ", cfg.pg.host, cfg.pg.port, cfg.pg.database);
-        let mut pg = tokio_postgres::Config::new();
-        pg.host(&cfg.pg.host)
-            .port(cfg.pg.port)
-            .dbname(&cfg.pg.database)
-            .user(&cfg.pg.user)
-            .password(&cfg.pg.password);
-        match pg.connect(tokio_postgres::NoTls).await {
-            Ok((client, connection)) => {
-                tokio::spawn(async move {
-                    let _ = connection.await;
-                });
-                match client.query_one("select 1", &[]).await {
-                    Ok(_) => println!("OK"),
-                    Err(e) => println!("连接成功但查询失败: {e}"),
-                }
-            }
-            Err(e) => println!("失败: {}", crate::sink::pg::describe_db_error(&e)),
+        // 和界面上的“测试连接”一致：走真实写入链路（事务内试写后回滚）
+        match crate::sink::pg::PgSink::probe(&cfg.pg).await {
+            Ok(detail) => println!("OK ({detail})"),
+            Err(e) => println!("{}: {e}", crate::t!("失败", "failed")),
         }
     }
 
@@ -161,10 +195,10 @@ async fn run_check() {
         print!("MQTT {}:{}/{} ... ", cfg.mqtt.broker, cfg.mqtt.port, cfg.mqtt.topic);
         match crate::sink::mqtt::MqttSink::new(cfg.mqtt.clone(), None).await {
             Ok(sink) => {
-                println!("OK (已收到 CONNACK)");
+                println!("OK ({})", crate::t!("已收到 CONNACK", "CONNACK received"));
                 sink.disconnect().await;
             }
-            Err(e) => println!("失败: {e}"),
+            Err(e) => println!("{}: {e}", crate::t!("失败", "failed")),
         }
     }
 }
@@ -179,7 +213,9 @@ fn main() -> eframe::Result<()> {
     let runtime = Runtime::new().expect("创建 tokio 运行时失败");
     let runtime = Arc::new(runtime);
     let cfg = config::load();
-    let (tx, rx) = std::sync::mpsc::channel();
+    // 用 tokio 的无界通道而不是 std 的：上传进度回调要在后台任务里
+    // 被 `&(dyn Fn(usize) + Send + Sync)` 捕获，std 的 Sender 满足不了 Sync 约束。
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_inner_size([980.0, 720.0])
         .with_min_inner_size([760.0, 560.0]);
@@ -192,7 +228,9 @@ fn main() -> eframe::Result<()> {
     };
     let app_runtime = runtime.clone();
     eframe::run_native(
-        "RaceBox 同步",
+        // 标题栏只写品牌名：它由窗口系统绘制，不跟着界面语言变，
+        // 带上“同步 / Sync”就得为 10 种语言各维护一份，不值得。
+        "RaceBox",
         native_options,
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);

@@ -5,14 +5,15 @@ use futures_util::StreamExt;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use crate::{t, tr};
 
 pub type NotificationStream = Pin<Box<dyn Stream<Item = btleplug::api::ValueNotification> + Send>>;
 
 pub async fn first_adapter() -> Result<Adapter, String> {
-    let manager = Manager::new().await.map_err(|e| format!("蓝牙管理器初始化失败: {e}"))?;
-    let mut adapters = manager.adapters().await.map_err(|e| format!("蓝牙适配器枚举失败: {e}"))?;
+    let manager = Manager::new().await.map_err(|e| tr!("蓝牙管理器初始化失败: {e}", "failed to initialise the Bluetooth manager: {e}"))?;
+    let mut adapters = manager.adapters().await.map_err(|e| tr!("蓝牙适配器枚举失败: {e}", "failed to enumerate Bluetooth adapters: {e}"))?;
     if adapters.is_empty() {
-        return Err("未找到蓝牙适配器，请确认蓝牙已开启".to_string());
+        return Err(t!("未找到蓝牙适配器，请确认蓝牙已开启", "no Bluetooth adapter found, make sure Bluetooth is on").to_string());
     }
     Ok(adapters.remove(0))
 }
@@ -29,13 +30,13 @@ pub async fn find_device(
     adapter
         .start_scan(ScanFilter::default())
         .await
-        .map_err(|e| format!("启动扫描失败: {e}"))?;
+        .map_err(|e| tr!("启动扫描失败: {e}", "failed to start scanning: {e}"))?;
     let deadline = std::time::Instant::now() + timeout;
     let result = loop {
         if cancel.load(Ordering::SeqCst) {
             break None;
         }
-        let peripherals = adapter.peripherals().await.map_err(|e| format!("扫描失败: {e}"))?;
+        let peripherals = adapter.peripherals().await.map_err(|e| tr!("扫描失败: {e}", "scan failed: {e}"))?;
         let mut preferred: Option<Peripheral> = None;
         let mut named: Option<Peripheral> = None;
         for p in peripherals {
@@ -71,10 +72,11 @@ pub async fn find_device(
     let _ = adapter.stop_scan().await;
     match result {
         Some(p) => Ok(p),
-        None => Err(format!(
+        None => Err(tr!(
             "扫描超时（{} 秒），未找到 {} 设备",
+            "scan timed out after {}s, no {} device found",
             timeout.as_secs(),
-            if name_filter.is_empty() { "蓝牙" } else { name_filter }
+            if name_filter.is_empty() { t!("蓝牙", "Bluetooth") } else { name_filter }
         )),
     }
 }
@@ -87,16 +89,16 @@ pub async fn device_info(peripheral: &Peripheral) -> (String, String) {
 }
 
 pub async fn connect(peripheral: &Peripheral) -> Result<(Characteristic, Characteristic), String> {
-    peripheral.connect().await.map_err(|e| format!("连接设备失败: {e}"))?;
+    peripheral.connect().await.map_err(|e| tr!("连接设备失败: {e}", "failed to connect to the device: {e}"))?;
     peripheral
         .discover_services()
         .await
-        .map_err(|e| format!("服务发现失败: {e}"))?;
+        .map_err(|e| tr!("服务发现失败: {e}", "service discovery failed: {e}"))?;
     let uart_service: btleplug::api::Service = peripheral
         .services()
         .into_iter()
         .find(|s| s.uuid.to_string() == crate::protocol::UART_SERVICE_UUID)
-        .ok_or_else(|| "设备无 RaceBox UART 服务".to_string())?;
+        .ok_or_else(|| t!("设备无 RaceBox UART 服务", "device has no RaceBox UART service").to_string())?;
     let mut rx_char = None;
     let mut tx_char = None;
     for c in peripheral.characteristics() {
@@ -111,7 +113,7 @@ pub async fn connect(peripheral: &Peripheral) -> Result<(Characteristic, Charact
     }
     match (rx_char, tx_char) {
         (Some(rx), Some(tx)) => Ok((rx, tx)),
-        _ => Err("设备缺少 RaceBox UART 收发特征".to_string()),
+        _ => Err(t!("设备缺少 RaceBox UART 收发特征", "device is missing the RaceBox UART characteristics").to_string()),
     }
 }
 
@@ -130,7 +132,7 @@ pub async fn write_command(peripheral: &Peripheral, characteristic: &Characteris
             .await
         {
             Ok(()) => Ok(()),
-            Err(_) => Err(format!("写命令失败: {e}")),
+            Err(_) => Err(tr!("写命令失败: {e}", "failed to write command: {e}")),
         },
     }
 }
@@ -139,7 +141,7 @@ pub async fn subscribe(peripheral: &Peripheral, characteristic: &Characteristic)
     peripheral
         .subscribe(characteristic)
         .await
-        .map_err(|e| format!("订阅通知失败: {e}"))
+        .map_err(|e| tr!("订阅通知失败: {e}", "failed to subscribe to notifications: {e}"))
 }
 
 pub async fn unsubscribe(peripheral: &Peripheral, characteristic: &Characteristic) {
@@ -150,7 +152,7 @@ pub async fn notification_stream(peripheral: &Peripheral) -> Result<Notification
     peripheral
         .notifications()
         .await
-        .map_err(|e| format!("获取通知流失败: {e}"))
+        .map_err(|e| tr!("获取通知流失败: {e}", "failed to get the notification stream: {e}"))
 }
 
 pub async fn next_notification(stream: &mut NotificationStream, timeout: Duration) -> Option<Vec<u8>> {

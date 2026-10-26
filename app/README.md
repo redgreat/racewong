@@ -130,7 +130,8 @@ app/    ui/                设置页 + 主页（设备、进度、日志）
 ## 4. 配置项
 
 - BLE：设备名过滤 `RaceBox`、上次连接地址缓存
-- sink 模式：`database` / `mqtt` / `both`，失败回落 spool 开关
+- sink 模式：`database` / `mqtt` 二选一（只能选一种，不做“同时上传”；
+  旧配置里的 `both` 会被当成 `database`，不会导致整份配置解析失败）
 - PostgreSQL：host / port / database / user / password
 - MQTT：broker / port / user / password / topic / client id / QoS
 - 行为：`auto_erase`（上传全部成功后是否自动清理设备内存）、
@@ -138,6 +139,9 @@ app/    ui/                设置页 + 主页（设备、进度、日志）
 - MQTT：`keepalive_secs`（保活间隔，10–300 秒）
 - 外观：`theme` = `dark` / `light`（设置页“外观”卡片切换，切换即保存；
   旧配置文件没有该字段时按 `serde(default)` 视为 `dark`，不会丢配置）
+- 语言：`lang` = `zh` / `en` / `ja` / `ko` / `pt` / `es` / `ru` / `fr` / `de` / `it`
+  （设置页“语言 / Language”卡片里的下拉列表，切换即保存；缺省为 `zh`）
+- 关闭行为：`close_action` = `Quit` / `Tray`（缺省 `Quit`）
 
 界面为 egui 自绘的卡片式布局，暗色 / 亮色两套主题共用同一套配色变量
 （`src/style.rs` 的 `Palette`），改颜色只动这一处。
@@ -152,8 +156,82 @@ app/    ui/                设置页 + 主页（设备、进度、日志）
   清除内存）；任务运行中只保留红色 **取消同步**（点击后变“取消中...”），worker 在
   扫描、MQTT 连接、下载、上传、擦除各检查点中断，设备数据不会被误删
 - 查询状态 / 清除内存不会连接 MQTT，只有完整同步才建立上传通道，启动更快
-- 设置页：上传方式用分段选择器；行为开关是 iOS 风格开关；设备扫描超时、
-  MQTT 保活间隔用滑块调节（均落盘到 config.json）
+- 设置页：上传方式、关闭行为用单选控件（一组里只能选一个），语言是下拉列表
+  （10 种语言，横排单选会挤成一坨）；行为开关是
+  iOS 风格开关；设备扫描超时、MQTT 保活间隔是数字输入框（均落盘到 config.json）
+
+### 同步前的通道自检
+
+完整同步会在**动设备之前**先检测上传通道：
+
+- PostgreSQL：走一遍真实写入链路（连库 → 开事务 → 用两条假记录试写 → 回滚），
+  20 秒超时。表缺列、列类型不匹配、没写权限这些都会在这一步暴露
+- MQTT：等到 broker 的 CONNACK 才算通过
+
+任一项不通过就直接中止，不会去下载设备数据——以前是先把几分钟的数据下完，
+到写库时才失败转本地缓存，等于白跑一趟。
+
+### 上传性能与取消行为
+
+- PostgreSQL 批量写入按 1000 行一批，并且**按批大小缓存预处理语句**。
+  一段几万条的数据会拆成几十批，每批 29 列 × 1000 行 = 29000 个占位符；
+  如果每批都直接 `execute(&sql, ..)`，客户端每批都要重新 prepare（解析 + 规划）
+  一遍这条两万多参数的语句，一段 5 万条要跑三四分钟。缓存后解析只发生一次。
+  每段的实际吞吐会写进日志文件：`PostgreSQL 写入完成: <文件名>, N 条, 耗时 X.Xs (Y 条/秒)`
+- 上传过程中界面会显示段内进度（`第 N 段上传中 3000 / 50054 条`），不再只有
+  “一段 0% 然后突然 100%”
+- 点“取消同步”会**立刻**生效：已经下载但还没上传的那一段直接写本地缓存
+  （毫秒级），不再等上传跑完；已经在飞的上传任务会继续跑完，但结果不再往界面上刷，
+  免得取消之后还一条条往外冒
+
+### 多语言
+
+`src/i18n.rs` 提供 `t!` / `tr!` 两个宏，**中文 / 英文两版就地写在调用点**：
+
+```rust
+ui.colored_label(p.muted, t!("主机", "Host"));
+let s = tr!("已上传 {} 条", "{} records uploaded", n);
+```
+
+其余 8 种语言（日 / 韩 / 葡 / 西 / 俄 / 法 / 德 / 意）放在 `src/i18n/` 下的三张表里：
+
+| 文件 | 内容 |
+| --- | --- |
+| `i18n/table.rs` | `Row` 结构、`row()` 构造、`(中文, English)` → 译文的索引 |
+| `i18n/table_ui.rs` | 静态文案（按钮、标题、阶段名…），142 条 |
+| `i18n/table_msg.rs` | 带 `{}` 占位符的模板，36 条 |
+
+一行一条，10 个参数按位置传：
+
+```rust
+row("主机", "Host", "ホスト", "호스트", "Host", "Host", "Хост", "Hôte", "Host", "Host"),
+```
+
+要点：
+
+- **查表 key 是 `(中文, English)` 这一对，不是只用中文**。`主题` 在 MQTT 配置里是
+  Topic、在外观里是 Theme，只用中文当 key 会串；`失败` 也有 `failed` / `Failed` 两种大小写。
+- **查不到就回退英文**（不是中文）：非中文用户读英文比读中文有用。
+- `tr!` 的模板只能用裸 `{}`。用**命名捕获**的调用点（`tr!("…: {e}", "…: {e}")`）拿不到
+  参数列表，这类文案只有中英两版，其他语言回退英文 —— 全项目还剩 34 条，都是
+  `xxx 失败: {e}` 这种技术性错误详情和后台日志。想让某条也支持，把调用点改成显式传参
+  （`tr!("失败: {}", "failed: {}", e)`）再往 `table_msg.rs` 加一行就行，`render_other`
+  里有占位符个数校验兜底，配错了也只会回退英文，不会渲染出缺值的半句话。
+- 字体：微软雅黑（msyh）有汉字和西里尔字母，但**没有韩文谚文**，所以 `setup_fonts`
+  会额外加载 Malgun Gothic（韩）/ Yu Gothic（日），按家族列表逐字回退。
+- 窗口标题固定是 `RaceBox`：标题栏由窗口系统绘制、不跟界面语言变，带上“同步”就得
+  为 10 种语言各维护一份，收益为零。
+- 同步页的大圆钮（直径 ~90px）里的文字走 `round_action_button` 的自适应排版：先在圆内
+  可用宽度上**按词换行**，还塞不下就**逐档缩小字号**（13.8px → 9px），所以德语
+  `Synchronisieren`、俄语 `Синхронизация` 这种长词也不会捅出圆外。「开始同步 /
+  取消同步」在非中文语言里特意用了单词形式（`Sincronizar` / `Parar`），整句
+  （`iniciar sincronização`）会缩到 10px 以下；完整说明在悬停提示里。
+
+语言存在全局原子量里（后台线程也要产出提示文字），`config::load()` 会顺手同步。
+切换语言后，已经产生的日志/结果文字仍是生成时的语言，这是有意为之（历史记录不改写）。
+
+`cargo test --bins` 里 `i18n` 有 7 个单测兜底：语言码往返、serde 往返、文案 key 不重复、
+每条都翻全了、占位符个数和中英一致、缺译文回退英文。
 
 ## 5. 实现顺序
 
@@ -201,7 +279,8 @@ BLE 用 `btleplug`（Windows 走 WinRT），MQTT 用 `rumqttc`，PostgreSQL 用 
 racewong-app.exe --check
 ```
 
-按当前配置依次测 PostgreSQL（真发一次 `select 1`）和 MQTT（等 CONNACK），
+按当前配置依次测 PostgreSQL（开事务、用两条假记录走一遍真实写入再回滚，
+表缺列 / 列类型对不上 / 没有写权限都会当场报出来）和 MQTT（等 CONNACK），
 失败会打印服务端原文，例如：
 
 ```
@@ -210,7 +289,7 @@ PostgreSQL fn.wongcw.cn:8432/eadm ... 失败: password authentication failed for
 
 设置页的“测试连接”也是走这两条路径，结果会同时显示在同步页的“提示”行、日志页，
 以及设置页对应卡片按钮旁边（进行中显示转圈，结束显示成功 / 失败 / 超时）。
-PostgreSQL 测试整体有 15 秒超时，主机不可达时不会一直转圈；MQTT 测试等 CONNACK，
+PostgreSQL 测试整体有 20 秒超时，主机不可达时不会一直转圈；MQTT 测试等 CONNACK，
 内部 10 秒超时。测试成功后 MQTT 的连接会保留到下一次测试或退出，避免打出误导性的断开错误。
 
 MQTT 连接的健壮性（`src/sink/mqtt.rs`）：
@@ -237,6 +316,31 @@ cargo install cargo-xwin
 XWIN_CACHE_DIR=/mnt/d/xwin-cache cargo xwin build --release --target x86_64-pc-windows-msvc
 ```
 
+上面的命令已经包进 `script/build.sh`，平时直接用脚本就行（自动判平台、打印产物路径）：
+
+```bash
+./script/build.sh              # WSL 下默认交叉编译出 Windows exe；其它平台编本机原生版
+./script/build.sh --debug      # debug 构建（带控制台，方便看日志）
+./script/build.sh --check      # 编完顺手跑 --check（PG 试写回滚 + MQTT CONNACK）
+./script/build.sh --run        # 编完直接启动客户端
+./script/build.sh --native --test --clean   # 只编 Linux 版、先跑单测、先 clean
+```
+
+Windows 原生构建用 `.\script\build.ps1`，参数是开关形式（`-Debug` `-Run` `-Check` `-Test` `-Clean`）；
+本机没装 Rust 工具链时它会自动转到 WSL 里调 `build.sh`（`-NoWsl` 可关掉这个回退）。
+
+两个脚本都会在编译前结束还在跑的客户端（`-NoKill` / `--no-kill` 可关掉）。原因是
+Windows 上正在运行的 exe 无法被删除或覆盖，rustc 写产物时会报：
+
+```
+error: failed to remove file `...\release\racewong-app.exe`
+Caused by: Input/output error (os error 5)
+```
+
+`os error 5` 就是 `ERROR_ACCESS_DENIED`——客户端还在跑（尤其是设置里选了「隐藏到托盘」，
+关窗口不退进程）。手工处理：托盘菜单里点「退出」，或任务管理器结束 `racewong-app.exe`。
+另外 Windows 目标加 `--run` 时是用 `cmd start` 后台拉起的，关掉终端不会把客户端一起带走。
+
 `rumqttc` 当前 `default-features = false`（不开 rustls），因此 MQTT 仅支持明文 1883
 ——这是为了绕开 ring 交叉编译需要 MSVC `llvm-lib` 的限制；后续如需 TLS，在装有
 MSVC Build Tools 的机器上把默认特性打开即可。
@@ -248,6 +352,31 @@ cargo check   # 类型检查
 cargo test    # src/protocol.rs 的协议单测（帧解析、记录解码、RBX2 组帧、CRC32）
 cargo build --release
 ```
+
+### 关闭窗口的行为（托盘常驻）
+
+设置 → 行为 → 「点关闭按钮时」，二选一：
+
+- **直接退出应用**（默认）：点右上角 × 就退出进程。
+- **隐藏到托盘，后台继续运行**：点 × 只把窗口藏起来，程序留在 Windows 通知区域
+  （macOS 是菜单栏），正在跑的同步任务不会中断。托盘菜单：`显示主窗口` / `退出`，
+  点 `退出` 才会真正结束进程。
+
+托盘图标只在选“隐藏到托盘”时才常驻；切回“直接退出”会立刻摘掉，不会留一个隐形图标。
+
+| | Windows | macOS |
+| --- | --- | --- |
+| 位置 | 通知区域（右下角，可能在 `^` 折叠区） | 菜单栏右上角 |
+| 恢复窗口 | 右键 → 显示主窗口 | 点图标 → 显示主窗口 |
+| 退出 | 右键 → 退出 | 菜单 → 退出，或 Cmd+Q |
+| 进程残留 | 无 | 仍会出现在 Dock 与 Cmd+Tab 里 |
+
+macOS 想做成「纯菜单栏应用」（不占 Dock），在 `script/release.sh` 生成的 `Info.plist`
+里加一行 `<key>LSUIElement</key><true/>` 即可；代价是 Dock 和 Cmd+Tab 里都看不到它，
+只能从菜单栏图标操作。
+
+Linux 暂不支持托盘（`tray-icon` 的 Linux 后端要 GTK / AppIndicator 系统库，会把
+`cargo test` 和原生构建拖上系统依赖），选这一项会退回直接退出，设置页会给出提示。
 
 ### 配置位置
 

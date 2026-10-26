@@ -1,3 +1,5 @@
+use crate::i18n::Lang;
+use crate::t;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -81,19 +83,34 @@ impl Default for Theme {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
+/// 上传通道：二选一，不做“同时上传”。
+///
+/// 老配置里可能存着 `"Both"`（早期版本有“两者都传”），所以这里手工反序列化：
+/// 认不出来的值一律按直连处理，避免整个 config.json 解析失败被重置成默认配置。
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Debug)]
 pub enum SinkMode {
     Database,
     Mqtt,
-    Both,
+}
+
+impl<'de> Deserialize<'de> for SinkMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "Mqtt" => SinkMode::Mqtt,
+            _ => SinkMode::Database,
+        })
+    }
 }
 
 impl SinkMode {
     pub fn label(self) -> &'static str {
         match self {
-            SinkMode::Database => "PostgreSQL 直连",
+            SinkMode::Database => t!("PostgreSQL 直连", "PostgreSQL direct"),
             SinkMode::Mqtt => "MQTT (RBX2)",
-            SinkMode::Both => "两者都传",
         }
     }
 }
@@ -104,13 +121,45 @@ impl Default for SinkMode {
     }
 }
 
+/// 点窗口关闭按钮（右上角 ×）时的行为，二选一。
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
+pub enum CloseAction {
+    /// 直接退出应用。
+    #[default]
+    Quit,
+    /// 隐藏到系统托盘（Windows 通知区域 / macOS 菜单栏），后台继续运行。
+    Tray,
+}
+
+impl CloseAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            CloseAction::Quit => t!("直接退出应用", "Quit the app"),
+            // macOS 上常驻的位置是菜单栏，不叫“托盘”
+            CloseAction::Tray => {
+                if cfg!(target_os = "macos") {
+                    t!("隐藏到菜单栏，后台继续运行", "Hide to menu bar and keep running")
+                } else {
+                    t!("隐藏到托盘，后台继续运行", "Hide to tray and keep running")
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     pub pg: PgConfig,
     pub mqtt: MqttConfig,
     pub sink_mode: SinkMode,
+    /// 点关闭按钮时的行为（老配置里没有这一项，默认直接退出）。
+    #[serde(default)]
+    pub close_action: CloseAction,
     #[serde(default)]
     pub theme: Theme,
+    /// 界面语言（老配置里没有这一项，默认中文）。
+    #[serde(default)]
+    pub lang: Lang,
     pub auto_erase: bool,
     pub spool_on_failure: bool,
     pub device_name_filter: String,
@@ -131,7 +180,9 @@ impl Default for Config {
             pg: PgConfig::default(),
             mqtt: MqttConfig::default(),
             sink_mode: SinkMode::default(),
+            close_action: CloseAction::default(),
             theme: Theme::default(),
+            lang: Lang::default(),
             auto_erase: true,
             spool_on_failure: true,
             device_name_filter: "RaceBox".to_string(),
@@ -144,11 +195,11 @@ impl Default for Config {
 
 impl Config {
     pub fn uses_database(&self) -> bool {
-        matches!(self.sink_mode, SinkMode::Database | SinkMode::Both)
+        matches!(self.sink_mode, SinkMode::Database)
     }
 
     pub fn uses_mqtt(&self) -> bool {
-        matches!(self.sink_mode, SinkMode::Mqtt | SinkMode::Both)
+        matches!(self.sink_mode, SinkMode::Mqtt)
     }
 }
 
@@ -182,7 +233,7 @@ pub fn log_path() -> PathBuf {
 
 pub fn load() -> Config {
     let path = config_path();
-    match std::fs::read_to_string(&path) {
+    let cfg = match std::fs::read_to_string(&path) {
         Ok(text) => match serde_json::from_str::<Config>(&text) {
             Ok(cfg) => cfg,
             Err(e) => {
@@ -191,13 +242,43 @@ pub fn load() -> Config {
             }
         },
         Err(_) => Config::default(),
-    }
+    };
+    // 语言是全局状态，读配置的地方就是唯一入口，在这里同步最省事
+    // （否则每个调用点都得记着自己 set 一次）
+    crate::i18n::set(cfg.lang);
+    cfg
 }
 
 pub fn save(cfg: &Config) -> std::io::Result<()> {
     let path = config_path();
     let text = serde_json::to_string_pretty(cfg).unwrap_or_else(|_| "{}".to_string());
     std::fs::write(&path, text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sink_mode_roundtrip() {
+        for mode in [SinkMode::Database, SinkMode::Mqtt] {
+            let text = serde_json::to_string(&mode).unwrap();
+            assert_eq!(serde_json::from_str::<SinkMode>(&text).unwrap(), mode);
+        }
+    }
+
+    #[test]
+    fn legacy_both_falls_back_to_database() {
+        // 老配置里可能还是 "Both"：不能让它把整个 config.json 解析失败（那样会重置成默认配置）
+        assert_eq!(
+            serde_json::from_str::<SinkMode>("\"Both\"").unwrap(),
+            SinkMode::Database
+        );
+        assert_eq!(
+            serde_json::from_str::<SinkMode>("\"Mqtt\"").unwrap(),
+            SinkMode::Mqtt
+        );
+    }
 }
 
 

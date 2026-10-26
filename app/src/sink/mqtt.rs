@@ -1,6 +1,7 @@
 use super::{DataSink, Session, SinkError, SinkResult};
 use crate::config::MqttConfig;
 use crate::protocol::{build_rbx2_frame, Rbx2Batch, RBX2_MAX_BATCH_RECORDS};
+use crate::{t, tr};
 use async_trait::async_trait;
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,7 +34,9 @@ impl MqttSink {
     /// `cancel` 非空时，等待 CONNACK 的过程中被取消会立刻返回错误。
     pub async fn new(cfg: MqttConfig, cancel: Option<&AtomicBool>) -> Result<Self, SinkError> {
         if !cfg.ready() {
-            return Err(SinkError::Config("MQTT 配置不完整".to_string()));
+            return Err(SinkError::Config(
+                t!("MQTT 配置不完整", "MQTT settings are incomplete").to_string(),
+            ));
         }
         // 同一台机器上可能同时存在多个连接（例如设置页的探测连接还开着），
         // client_id 完全相同会被 broker 踢掉其中一个，所以每次连接都加随机后缀。
@@ -113,9 +116,19 @@ impl MqttSink {
         // 把 eventloop 里记录的真实错误带出来，比干巴巴的“超时”有用得多
         let detail = last_error.lock().map(|e| e.clone()).unwrap_or_default();
         let msg = if detail.is_empty() {
-            format!("连接 broker {}:{} 超时", sink.cfg.broker, sink.cfg.port)
+            tr!(
+                "连接 broker {}:{} 超时",
+                "timed out connecting to broker {}:{}",
+                sink.cfg.broker,
+                sink.cfg.port
+            )
         } else {
-            format!("连接 broker {}:{} 失败: {detail}", sink.cfg.broker, sink.cfg.port)
+            tr!(
+                "连接 broker {}:{} 失败: {detail}",
+                "failed to connect to broker {}:{}: {detail}",
+                sink.cfg.broker,
+                sink.cfg.port
+            )
         };
         Err(SinkError::Mqtt(msg))
     }
@@ -130,20 +143,29 @@ impl MqttSink {
         while got < n {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(SinkError::Mqtt(format!(
-                    "等待 PUBACK 超时（已确认 {got}/{n}）"
+                return Err(SinkError::Mqtt(tr!(
+                    "等待 PUBACK 超时（已确认 {got}/{n}）",
+                    "timed out waiting for PUBACK ({got}/{n} acknowledged)"
                 )));
             }
             let mut rx = self.acks.lock().await;
             match tokio::time::timeout(remaining.min(Duration::from_millis(500)), rx.recv()).await
             {
                 Ok(Some(())) => got += 1,
-                Ok(None) => return Err(SinkError::Mqtt("MQTT 事件循环已退出".to_string())),
+                Ok(None) => {
+                    return Err(SinkError::Mqtt(
+                        t!("MQTT 事件循环已退出", "MQTT event loop exited").to_string(),
+                    ))
+                }
                 Err(_) => {
                     drop(rx);
                     if !self.is_connected() {
                         return Err(SinkError::Mqtt(
-                            "MQTT 连接已断开，未收到发布确认".to_string(),
+                            t!(
+                                "MQTT 连接已断开，未收到发布确认",
+                                "MQTT connection lost before publish was acknowledged"
+                            )
+                            .to_string(),
                         ));
                     }
                 }
@@ -165,7 +187,11 @@ impl DataSink for MqttSink {
         "MQTT"
     }
 
-    async fn upload_session(&self, session: &Session) -> SinkResult {
+    async fn upload_session(
+        &self,
+        session: &Session,
+        progress: &(dyn Fn(usize) + Send + Sync),
+    ) -> SinkResult {
         if session.records.is_empty() {
             return Ok(());
         }
@@ -221,9 +247,15 @@ impl DataSink for MqttSink {
                     .await
                     .map_err(|e| {
                         if self.is_connected() {
-                            SinkError::Mqtt(format!("MQTT 发布失败: {e}"))
+                            SinkError::Mqtt(tr!("MQTT 发布失败: {e}", "MQTT publish failed: {e}"))
                         } else {
-                            SinkError::Mqtt("MQTT 连接已断开，发布失败".to_string())
+                            SinkError::Mqtt(
+                                t!(
+                                    "MQTT 连接已断开，发布失败",
+                                    "MQTT connection lost, publish failed"
+                                )
+                                .to_string(),
+                            )
                         }
                     })?;
             }
@@ -237,6 +269,8 @@ impl DataSink for MqttSink {
                 total_records
             );
             sent = end;
+            // 已经确认的批次换算成记录数（最后一帧可能不满一批，用 min 收口）
+            progress((sent * RBX2_MAX_BATCH_RECORDS).min(total_records));
         }
         Ok(())
     }

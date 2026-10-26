@@ -3,14 +3,29 @@ pub mod pg;
 pub mod spool;
 
 use crate::protocol::Record;
-use serde::{Deserialize, Serialize};
+use crate::t;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+
+/// 上传进度回调：参数是**本段**已写入的记录数（从 0 开始累加，最后等于段内总数）。
+///
+/// 之所以按“段内条数”而不是全局条数：一段动辄几万条，上传要花好几秒，
+/// 界面上能看见条数在涨，才不会让人以为卡死了。
+///
+/// 注意：trait 方法里不用这个别名写参数，而是把 `&(dyn Fn(..) + Send + Sync)`
+/// 展开写——`async_trait` 展开时要自己给每个引用参数起生命周期名，
+/// 类型别名里的 `'_` 会让它不好判断。
+pub type ProgressFn<'a> = &'a (dyn Fn(usize) + Send + Sync);
 
 #[async_trait]
 pub trait DataSink: Send + Sync {
     fn name(&self) -> &'static str;
 
-    async fn upload_session(&self, session: &Session) -> SinkResult;
+    async fn upload_session(
+        &self,
+        session: &Session,
+        progress: &(dyn Fn(usize) + Send + Sync),
+    ) -> SinkResult;
 }
 
 #[derive(Debug, Clone)]
@@ -42,7 +57,7 @@ impl Session {
 
     pub fn display_name(&self) -> String {
         if self.records.is_empty() {
-            return "空数据段".to_string();
+            return t!("空数据段", "empty segment").to_string();
         }
         crate::protocol::session_file_name(&self.records[0], &self.records[self.records.len() - 1])
     }
@@ -60,7 +75,7 @@ impl std::fmt::Display for SinkError {
         match self {
             SinkError::Db(e) => write!(f, "PostgreSQL: {e}"),
             SinkError::Mqtt(e) => write!(f, "MQTT: {e}"),
-            SinkError::Config(e) => write!(f, "配置: {e}"),
+            SinkError::Config(e) => write!(f, "{}: {e}", t!("配置", "config")),
         }
     }
 }

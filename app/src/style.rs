@@ -6,6 +6,7 @@
 use eframe::egui::{self, Color32, CornerRadius, Margin, Stroke};
 
 use crate::config::Theme;
+use crate::t;
 use crate::worker::LogLevel;
 
 /// 一套完整配色。
@@ -296,25 +297,75 @@ pub fn tint(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }
 
-/// 分段选择器按钮：选中为强调色胶囊，未选中透明、悬停有浅底。
-pub fn segment_button(ui: &mut egui::Ui, p: &Palette, selected: bool, label: &str) -> egui::Response {
-    let color = if selected { p.accent_text } else { p.muted };
-    let font = egui::FontId::proportional(13.5);
-    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font.clone(), color));
-    let size = egui::vec2(galley.size().x + 30.0, 30.0);
+/// 单选框：左侧圆点 + 文字，整行可点。
+///
+/// 同一组里永远只有一个被选中——分段按钮那种“看起来像按钮”的样式容易被误读成
+/// 多选/多开，单选语义用单选控件表达最直观。
+pub fn radio_button(ui: &mut egui::Ui, p: &Palette, selected: bool, label: &str) -> egui::Response {
+    let text_color = if selected { p.text } else { p.muted };
+    let galley = ui.fonts(|f| {
+        f.layout_no_wrap(
+            label.to_owned(),
+            egui::FontId::proportional(13.5),
+            text_color,
+        )
+    });
+    let size = egui::vec2(galley.size().x + 34.0, 28.0);
     let (rect, resp) = ui.allocate_at_least(size, egui::Sense::click());
-    let bg = if selected {
-        p.accent
-    } else if resp.hovered() {
-        p.hover
-    } else {
-        Color32::TRANSPARENT
-    };
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), p.hover);
+    }
+    let c = egui::pos2(rect.min.x + 13.0, rect.center().y);
+    let ring = if selected { p.accent } else { p.muted };
     ui.painter()
-        .rect_filled(rect, CornerRadius::same(6), bg);
-    let pos = rect.center() - galley.size() / 2.0;
-    ui.painter().galley(pos, galley, color);
+        .circle_stroke(c, 6.0, Stroke::new(1.6_f32, ring));
+    if selected {
+        ui.painter().circle_filled(c, 3.2, p.accent);
+    }
+    let pos = egui::pos2(c.x + 13.0, rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(pos, galley, text_color);
     resp
+}
+
+/// 状态小图标：对勾 / 叉，直接用线段画。
+///
+/// 不用 "✓" "✗" 这类字符：默认字体里缺字时会被渲染成空心方框（看起来像个空复选框）。
+pub fn status_icon(ui: &mut egui::Ui, color: Color32, ok: bool) {
+    let (rect, _) = ui.allocate_at_least(egui::vec2(14.0, 14.0), egui::Sense::hover());
+    let c = rect.center();
+    let stroke = Stroke::new(1.8_f32, color);
+    if ok {
+        ui.painter().line_segment(
+            [
+                egui::pos2(c.x - 4.2, c.y + 0.4),
+                egui::pos2(c.x - 1.4, c.y + 3.4),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                egui::pos2(c.x - 1.4, c.y + 3.4),
+                egui::pos2(c.x + 4.4, c.y - 3.4),
+            ],
+            stroke,
+        );
+    } else {
+        ui.painter().line_segment(
+            [
+                egui::pos2(c.x - 3.6, c.y - 3.6),
+                egui::pos2(c.x + 3.6, c.y + 3.6),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                egui::pos2(c.x + 3.6, c.y - 3.6),
+                egui::pos2(c.x - 3.6, c.y + 3.6),
+            ],
+            stroke,
+        );
+    }
 }
 
 /// 状态横幅：同色系浅底 + 描边 + 彩色加粗文字，用于测试结果等提示。
@@ -397,7 +448,7 @@ pub fn info_button(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
 /// 返回按钮：左箭头 + “返回”文字（设置页左上角，替代右上角关闭）。
 pub fn back_button(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
     let font = egui::FontId::proportional(13.5);
-    let galley = ui.fonts(|f| f.layout_no_wrap("返回".to_owned(), font.clone(), p.muted));
+    let galley = ui.fonts(|f| f.layout_no_wrap(t!("返回", "Back").to_owned(), font.clone(), p.muted));
     let (rect, resp) = ui.allocate_at_least(
         egui::vec2(galley.size().x + 44.0, 30.0),
         egui::Sense::click(),
@@ -423,7 +474,7 @@ pub fn back_button(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
         ],
         Stroke::new(1.8_f32, color),
     );
-    let galley = ui.fonts(|f| f.layout_no_wrap("返回".to_owned(), font, color));
+    let galley = ui.fonts(|f| f.layout_no_wrap(t!("返回", "Back").to_owned(), font, color));
     ui.painter().galley(
         egui::pos2(rect.min.x + 26.0, rect.center().y - galley.size().y / 2.0),
         galley,
@@ -526,6 +577,7 @@ pub enum RingMode {
 }
 
 /// 圆形主操作按钮：默认内圈是下载进度、外圈是上传进度，圈内是开始/取消。
+/// 只有一条进度时（清理内存等）画在最贴近大圆的那一圈，不会出现“中间空一层”的观感。
 /// `enabled = false` 时不可点击（清理设备内存阶段不允许中断）。`size` 是整体直径。
 pub fn round_action_button(
     ui: &mut egui::Ui,
@@ -543,10 +595,24 @@ pub fn round_action_button(
     };
     let (rect, resp) = ui.allocate_at_least(egui::vec2(size, size), sense);
     let c = rect.center();
-    let r_outer = size * 0.455; // 外圈
-    let r_inner = size * 0.375; // 内圈
-    let r_circle = size * 0.310;
-    let ring_w = (size * 0.030).max(4.0);
+
+    // 几何：所有环都从大圆边缘往外一层层排，环和圆之间只留一条窄缝。
+    // 以前环是按整个方框的半径算的（0.455 / 0.375），单环时那道弧离圆有十几像素，
+    // 看起来就像中间空了一层“占位圈”。现在单环直接贴在大圆上，双环再往外紧挨一圈。
+    let ring_w = (size * 0.028).clamp(3.0, 5.0); // 环宽
+    let gap = ring_w * 1.1; // 圆边到第一层环的缝
+    let r_circle = size * 0.5 - ring_w * 2.0 - gap * 2.0 - 1.5; // 大圆半径
+    let r_ring1 = r_circle + gap + ring_w * 0.5; // 内环：下载进度 / 单环进度
+    let r_ring2 = r_ring1 + ring_w + gap * 0.85; // 外环：上传进度
+
+    // 圆按钮本体：可取消时是危险色，清理中（不可中断）用信息色，空闲时是强调色
+    let bg = if !enabled {
+        p.info
+    } else if running {
+        p.danger
+    } else {
+        p.accent
+    };
 
     // 画一段进度弧（从顶部开始，顺时针）
     let arc = |radius: f32, frac: f32, color: Color32| {
@@ -554,16 +620,16 @@ pub fn round_action_button(
         if frac <= 0.0 {
             return;
         }
-        let segments = 72;
-        let start = -std::f32::consts::PI / 2.0;
+        // 段数跟着弧长走：短弧也够平滑，长弧不会白画一堆点
+        let segments = ((frac * 96.0).ceil() as usize).max(3);
+        let start = -std::f32::consts::FRAC_PI_2;
         for i in 0..segments {
-            let t0 = i as f32 / segments as f32;
-            let t1 = (i + 1) as f32 / segments as f32;
-            if t0 >= frac {
-                break;
-            }
-            let a0 = start + t0 * 2.0 * std::f32::consts::PI * frac;
-            let a1 = start + t1.min(frac) * 2.0 * std::f32::consts::PI * frac;
+            // t 直接是“圆周比例”，不用再乘一次 frac（乘两次会让弧长变成 frac²，
+            // 50% 只画出 1/4 圈）
+            let t0 = frac * i as f32 / segments as f32;
+            let t1 = frac * (i + 1) as f32 / segments as f32;
+            let a0 = start + t0 * std::f32::consts::TAU;
+            let a1 = start + t1 * std::f32::consts::TAU;
             let p0 = egui::pos2(c.x + a0.cos() * radius, c.y + a0.sin() * radius);
             let p1 = egui::pos2(c.x + a1.cos() * radius, c.y + a1.sin() * radius);
             ui.painter().line_segment([p0, p1], Stroke::new(ring_w, color));
@@ -573,11 +639,12 @@ pub fn round_action_button(
     // 没有百分比时画一段旋转弧，表示“正在干活”
     let spinner = |radius: f32, color: Color32| {
         let t = ui.ctx().input(|i| i.time) as f32;
-        let segments = 28;
+        let segments = 32;
         let start = t * 3.2;
+        let sweep = 1.5;
         for i in 0..segments {
-            let a0 = start + (i as f32 / segments as f32) * 1.6;
-            let a1 = start + ((i + 1) as f32 / segments as f32) * 1.6;
+            let a0 = start + (i as f32 / segments as f32) * sweep;
+            let a1 = start + ((i + 1) as f32 / segments as f32) * sweep;
             let p0 = egui::pos2(c.x + a0.cos() * radius, c.y + a0.sin() * radius);
             let p1 = egui::pos2(c.x + a1.cos() * radius, c.y + a1.sin() * radius);
             ui.painter()
@@ -590,53 +657,62 @@ pub fn round_action_button(
         RingMode::Dual { download, upload } => {
             // 外圈：上传进度
             ui.painter()
-                .circle_stroke(c, r_outer, Stroke::new(ring_w, p.edit_bg));
+                .circle_stroke(c, r_ring2, Stroke::new(ring_w, p.edit_bg));
             if let Some(f) = upload {
-                arc(r_outer, f, p.accent);
+                arc(r_ring2, f, p.accent);
             }
             // 内圈：下载进度（未知时转圈）
             ui.painter()
-                .circle_stroke(c, r_inner, Stroke::new(ring_w, p.edit_bg));
+                .circle_stroke(c, r_ring1, Stroke::new(ring_w, p.edit_bg));
             match download {
-                Some(f) => arc(r_inner, f, p.success),
-                None if running => spinner(r_inner, p.info),
+                Some(f) => arc(r_ring1, f, p.success),
+                None if running => spinner(r_ring1, p.info),
                 None => {}
             }
         }
         RingMode::Single { progress, color } => {
-            // 单圈：只画进度弧本身（无进度时转圈），不画占位轨道
+            // 单环同样贴在大圆上，并补一条浅色轨道：
+            // 只有一段弧孤零零飘着会很奇怪，有轨道才像“进度条绕了一圈”
+            ui.painter()
+                .circle_stroke(c, r_ring1, Stroke::new(ring_w, p.edit_bg));
             match progress {
-                Some(f) => arc(r_outer, f, color),
-                None if running => spinner(r_outer, color),
+                Some(f) => arc(r_ring1, f, color),
+                None if running => spinner(r_ring1, color),
                 None => {}
             }
         }
     }
-    // 悬停光环（不可点击时不提示）
+
+    // 悬停光晕：贴在大圆边上一圈的淡色，不再占用环的位置
     if enabled && resp.hovered() {
-        ui.painter().circle_stroke(
-            c,
-            r_circle + 5.0,
-            Stroke::new(2.0_f32, tint(p.accent, 70)),
-        );
+        ui.painter().circle_filled(c, r_circle + 2.4, tint(bg, 110));
     }
-    // 圆按钮本体：可取消时是危险色，清理中（不可中断）用信息色，空闲时是强调色
-    let bg = if !enabled {
-        p.info
-    } else if running {
-        p.danger
-    } else {
-        p.accent
-    };
     ui.painter().circle_filled(c, r_circle, bg);
-    // 圈内文字
-    let galley = ui.fonts(|f| {
-        f.layout_no_wrap(
+
+    // 圈内文字：先在圆内可用宽度上按词换行，还是塞不下就逐档缩小字号。
+    //
+    // 只按直径定字号是不够的：中文「开始同步」4 个字，德语
+    // 「Synchronisierung starten」是它的四倍宽，固定字号必然横着捅出圆外。
+    let max_w = (r_circle * 1.62).max(40.0);
+    let max_h = (r_circle * 1.5).max(40.0);
+    let make_job = |font_size: f32| {
+        let mut job = egui::text::LayoutJob::simple(
             label.to_owned(),
-            egui::FontId::proportional(17.0),
+            egui::FontId::proportional(font_size),
             p.accent_text,
-        )
-    });
+            max_w,
+        );
+        // 只在词边界换行：德语那种超长单词被拦腰截断比缩小字号更难看
+        job.wrap.break_anywhere = false;
+        job.wrap.max_rows = 3;
+        job
+    };
+    let mut font_size = (size * 0.115).max(12.0);
+    let mut galley = ui.fonts(|f| f.layout_job(make_job(font_size)));
+    while font_size > 9.0 && (galley.size().x > max_w + 0.5 || galley.size().y > max_h) {
+        font_size -= 0.5;
+        galley = ui.fonts(|f| f.layout_job(make_job(font_size)));
+    }
     let pos = c - galley.size() / 2.0;
     ui.painter().galley(pos, galley, p.accent_text);
     resp

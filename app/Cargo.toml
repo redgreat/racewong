@@ -21,6 +21,12 @@ futures-util = "0.3"
 flexi_logger = "0.29"
 log = "0.4"
 
+# 托盘图标（Windows 通知区域 / macOS 菜单栏）。
+# 只在这两个平台引入：Linux 的托盘实现依赖 GTK/AppIndicator 系统库，
+# 会让 `cargo test` 和原生构建凭空多出系统依赖，而交叉编译 Windows 用不到。
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+tray-icon = "0.19"
+
 [build-dependencies]
 winres = "0.1"
 

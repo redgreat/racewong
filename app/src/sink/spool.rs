@@ -2,7 +2,11 @@ use super::{Session, SpoolMeta};
 use crate::config;
 use crate::protocol::{Record, RECORD_SIZE};
 use crate::sink::DataSink;
+use crate::tr;
+use crate::worker::{LogLevel, UiEvent};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::mpsc::UnboundedSender;
 
 fn pair_paths(stem: &str) -> (PathBuf, PathBuf) {
     let dir = config::spool_dir();
@@ -72,12 +76,20 @@ pub fn pending_count() -> usize {
     }
 }
 
-pub async fn replay(sinks: &[&dyn DataSink]) -> Vec<String> {
+/// 把本地缓存里的数据补传上去。
+///
+/// 以前这个函数把所有日志攒成一个 Vec，跑完才一次性交给界面——积压几十个文件时
+/// 界面上几分钟没有任何动静，看起来就像卡死了。现在改成边跑边发日志，
+/// 并且能被用户的“取消”中断（`cancel` 是界面上那个取消按钮的同一个标志）。
+pub async fn replay(
+    sinks: &[&dyn DataSink],
+    tx: &UnboundedSender<UiEvent>,
+    cancel: &AtomicBool,
+) {
     let dir = config::spool_dir();
-    let mut logs = Vec::new();
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
-        Err(_) => return logs,
+        Err(_) => return,
     };
     let mut json_files: Vec<PathBuf> = entries
         .filter_map(|e| e.ok())
@@ -86,30 +98,75 @@ pub async fn replay(sinks: &[&dyn DataSink]) -> Vec<String> {
         .collect();
     json_files.sort();
     if json_files.is_empty() {
-        return logs;
+        return;
     }
-    logs.push(format!("发现 {} 个待重放的本地缓存文件", json_files.len()));
+    let total = json_files.len();
+    let _ = tx.send(UiEvent::Log(
+        LogLevel::Info,
+        tr!(
+            "发现 {total} 个待重传的本地缓存文件，开始后台补传",
+            "found {total} cached segment(s) on disk, replaying in background"
+        ),
+    ));
+    let mut done = 0usize;
     for json_path in json_files {
+        if cancel.load(Ordering::SeqCst) {
+            let _ = tx.send(UiEvent::Log(
+                LogLevel::Warn,
+                tr!(
+                    "已取消，剩余 {} 个缓存文件留到下次启动再传",
+                    "cancelled, {} cached file(s) left for the next run",
+                    total - done
+                ),
+            ));
+            return;
+        }
         let Some(session) = read_session(&json_path) else {
-            logs.push(format!("缓存文件损坏，已跳过: {}", json_path.display()));
+            let _ = tx.send(UiEvent::Log(
+                LogLevel::Error,
+                tr!(
+                    "缓存文件损坏，已跳过: {}",
+                    "corrupted cache file skipped: {}",
+                    json_path.display()
+                ),
+            ));
+            done += 1;
             continue;
         };
         let bin_path = json_path.with_extension("bin");
         let mut failure: Option<String> = None;
         for sink in sinks {
-            if let Err(e) = sink.upload_session(&session).await {
-                failure = Some(format!("{}", e));
+            if let Err(e) = sink.upload_session(&session, &|_: usize| {}).await {
+                failure = Some(format!("{e}"));
                 break;
             }
         }
+        done += 1;
         match failure {
             None => {
                 let _ = std::fs::remove_file(&json_path);
                 let _ = std::fs::remove_file(&bin_path);
-                logs.push(format!("重放成功: {} ({} 条)", session.display_name(), session.records.len()));
+                let _ = tx.send(UiEvent::Log(
+                    LogLevel::Success,
+                    tr!(
+                        "补传成功 {done}/{total}: {} ({} 条)",
+                        "replayed {done}/{total}: {} ({} records)",
+                        session.display_name(),
+                        session.records.len()
+                    ),
+                ));
             }
-            Some(e) => logs.push(format!("重放失败 {}: {e}", session.display_name())),
+            Some(e) => {
+                let _ = tx.send(UiEvent::Log(
+                    LogLevel::Error,
+                    tr!(
+                        "补传失败 {}: {e}",
+                        "replay failed {}: {e}",
+                        session.display_name()
+                    ),
+                ));
+            }
         }
+        let _ = tx.send(UiEvent::SpoolPending(pending_count()));
     }
-    logs
 }
