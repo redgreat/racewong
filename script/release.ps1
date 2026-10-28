@@ -315,6 +315,41 @@ Description: RaceBox 同步桌面应用
     return ($code -eq 0)
 }
 
+/// 把暂存目录打成 zip。
+function New-Zip([string]$Stage, [string]$Name) {
+    $zip = Join-Path $OutDir "$Name.zip"
+    if (Test-Path $zip) { Remove-Item $zip -Force }
+    Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $zip -Force
+    Ok "产出 $Name.zip"
+    return $zip
+}
+
+/// 用 WiX Toolset 3 生成 MSI；不可用时返回 $null，由调用方退回 zip。
+function New-Msi([string]$Stage, [string]$Bin, [string]$Ver, [string]$Name) {
+    $candle = Get-Tool 'candle.exe'
+    $light  = Get-Tool 'light.exe'
+    if (-not $candle -or -not $light) {
+        Warn '没有 WiX Toolset 3（candle.exe / light.exe），改为打包 zip'
+        return $null
+    }
+    $wxs = Join-Path $RepoRoot 'app/installer/racewong.wxs'
+    if (-not (Test-Path $wxs)) {
+        Warn "缺少 $wxs，改为打包 zip"
+        return $null
+    }
+    $wixObj  = Join-Path $Stage 'racewong.wixobj'
+    $exeAbs  = (Resolve-Path $Bin).Path
+    $iconAbs = (Resolve-Path (Join-Path $AppDir 'assets/icon.ico')).Path
+    $code = Invoke-Checked $candle.Source @('-nologo', "-dVersion=$Ver", "-dExePath=$exeAbs", "-dIconPath=$iconAbs", '-out', $wixObj, $wxs)
+    if ($code -ne 0) { Warn 'WiX candle 编译失败，改为打包 zip'; return $null }
+    $msi = Join-Path $OutDir "$Name.msi"
+    if (Test-Path $msi) { Remove-Item $msi -Force }
+    $code = Invoke-Checked $light.Source @('-nologo', '-sval', '-out', $msi, $wixObj)
+    if ($code -ne 0) { Warn 'WiX light 生成 MSI 失败，改为打包 zip'; return $null }
+    Ok "产出 $Name.msi"
+    return $msi
+}
+
 function New-Package([string]$Target, [string]$Ver) {
     $os    = Get-OsLabel $Target
     $arch  = Get-ArchLabel $Target
@@ -340,28 +375,13 @@ function New-Package([string]$Target, [string]$Ver) {
 
     $assets = @()
     if ($os -eq 'windows') {
-        $candle = Get-Tool 'candle.exe'
-        $light = Get-Tool 'light.exe'
-        if (-not $candle -or -not $light) {
-            # 没有 WiX 就退回 zip，别让整条发布链断在这里
-            Warn '没有 WiX Toolset 3（candle.exe / light.exe），改为打包 zip'
-            $zip = Join-Path $OutDir "$name.zip"
-            if (Test-Path $zip) { Remove-Item $zip -Force }
-            Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
-            Ok "产出 $name.zip"
-            return @($zip)
+        # 优先出 MSI；WiX 缺失或编译/链接失败都退回 zip，不让整条发布链断在这里
+        $msi = New-Msi $stage $bin $Ver $name
+        if ($msi) {
+            $assets += $msi
+        } else {
+            $assets += (New-Zip $stage $name)
         }
-        $wixObj = Join-Path $stage 'racewong.wixobj'
-        $wxs = Join-Path $RepoRoot 'app/installer/racewong.wxs'
-        $exeAbs = (Resolve-Path $bin).Path
-        $iconAbs = (Resolve-Path (Join-Path $AppDir 'assets/icon.ico')).Path
-        $code = Invoke-Checked $candle.Source @('-nologo', "-dVersion=$Ver", "-dExePath=$exeAbs", "-dIconPath=$iconAbs", '-out', $wixObj, $wxs)
-        if ($code -ne 0) { Die 'WiX candle 编译失败' }
-        $msi = Join-Path $OutDir "$name.msi"
-        if (Test-Path $msi) { Remove-Item $msi -Force }
-        $code = Invoke-Checked $light.Source @('-nologo', '-sval', '-out', $msi, $wixObj)
-        if ($code -ne 0) { Die 'WiX light 生成 MSI 失败' }
-        $assets += $msi
     } else {
         $tgz = Join-Path $OutDir "$name.tar.gz"
         if (Test-Path $tgz) { Remove-Item $tgz -Force }

@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
-  <Product Id="*" Name="RaceBox 同步" Language="2052" Version="$(var.Version)"
+  <!-- Codepage 936(GBK) 才能容纳中文的产品名 / 快捷方式名，默认 1252 会报 LGHT0311 -->
+  <Product Id="*" Name="RaceBox 同步" Language="2052" Codepage="936" Version="$(var.Version)"
            Manufacturer="racewong" UpgradeCode="AE4F32D4-1D64-4EF9-9F89-53AC184B3B60">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser" />
     <MajorUpgrade DowngradeErrorMessage="已安装更新版本的 RaceBox 同步。" />
