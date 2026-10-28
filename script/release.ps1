@@ -7,8 +7,8 @@
 #   -> 用 git 提交记录生成 Release 说明 -> 创建/更新 GitHub Release -> 上传安装包
 #
 # 三个平台的安装包（本脚本只构建"当前这台机器"能构建的那一个，其余交给 GitHub Actions）：
-#   Windows x86-64 : racewong-<ver>-windows-x86_64.msi
-#   macOS   arm64  : racewong-<ver>-macos-aarch64.tar.gz（在 macOS 上还会出 .dmg）
+#   Windows x86-64 : racewong-<ver>-windows-x86_64.msi（没有 WiX 时退化为 .zip）
+#   macOS   arm64  : racewong-<ver>-macos-aarch64.tar.gz（只放可执行文件，不做 .app / dmg）
 #   Linux   x86-64 : racewong-<ver>-linux-x86_64.tar.gz（有 dpkg-deb 时还会出 .deb）
 #
 # 用法：
@@ -285,38 +285,6 @@ function Invoke-Build([string]$Target) {
     Ok '构建完成'
 }
 
-function New-AppBundle([string]$Stage, [string]$Bin, [string]$Ver) {
-    # macOS .app 结构：Contents/MacOS/<bin> + Info.plist + Resources
-    $contents = Join-Path $Stage 'RaceBox 同步.app/Contents'
-    $macos    = Join-Path $contents 'MacOS'
-    $res      = Join-Path $contents 'Resources'
-    New-Item -ItemType Directory -Path $macos -Force | Out-Null
-    New-Item -ItemType Directory -Path $res   -Force | Out-Null
-    Copy-Item $Bin (Join-Path $macos $BinName) -Force
-    $ico = Join-Path $AppDir 'assets/icon256.png'
-    if (Test-Path $ico) { Copy-Item $ico (Join-Path $res 'icon256.png') -Force }
-
-    $plist = @"
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleName</key><string>RaceBox 同步</string>
-  <key>CFBundleDisplayName</key><string>RaceBox 同步</string>
-  <key>CFBundleIdentifier</key><string>com.wangcw.racewong</string>
-  <key>CFBundleExecutable</key><string>$BinName</string>
-  <key>CFBundleVersion</key><string>$Ver</string>
-  <key>CFBundleShortVersionString</key><string>$Ver</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>LSMinimumSystemVersion</key><string>11.0</string>
-  <key>NSHighResolutionCapable</key><true/>
-  <key>NSBluetoothAlwaysUsageDescription</key><string>需要蓝牙权限以连接 RaceBox 设备</string>
-</dict>
-</plist>
-"@
-    Write-Utf8File (Join-Path $contents 'Info.plist') $plist
-}
-
 function New-Deb([string]$Stage, [string]$Bin, [string]$Ver, [string]$OutFile) {
     $root = "$Stage-deb"
     if (Test-Path $root) { Remove-Item $root -Recurse -Force }
@@ -359,14 +327,11 @@ function New-Package([string]$Target, [string]$Ver) {
     if ($os -eq 'windows') { $bin = "$bin.exe" }
     if (-not (Test-Path $bin)) { Die "找不到构建产物: $bin" }
 
-    if ($os -eq 'macos') {
-        New-AppBundle $stage $bin $Ver
-    } else {
-        $destName = if ($os -eq 'windows') { "$BinName.exe" } else { $BinName }
-        Copy-Item $bin (Join-Path $stage $destName) -Force
-        if ($os -eq 'windows' -and (Test-Path (Join-Path $AppDir 'assets/icon.ico'))) {
-            Copy-Item (Join-Path $AppDir 'assets/icon.ico') $stage -Force
-        }
+    # macOS 也不做 .app / dmg，直接给可执行文件（未签名，避免 Gatekeeper 拦截）
+    $destName = if ($os -eq 'windows') { "$BinName.exe" } else { $BinName }
+    Copy-Item $bin (Join-Path $stage $destName) -Force
+    if ($os -eq 'windows' -and (Test-Path (Join-Path $AppDir 'assets/icon.ico'))) {
+        Copy-Item (Join-Path $AppDir 'assets/icon.ico') $stage -Force
     }
     if (Test-Path (Join-Path $AppDir 'README.md')) {
         Copy-Item (Join-Path $AppDir 'README.md') (Join-Path $stage 'README.txt') -Force
@@ -377,7 +342,15 @@ function New-Package([string]$Target, [string]$Ver) {
     if ($os -eq 'windows') {
         $candle = Get-Tool 'candle.exe'
         $light = Get-Tool 'light.exe'
-        if (-not $candle -or -not $light) { Die '生成 MSI 需要 WiX Toolset 3（candle.exe / light.exe）' }
+        if (-not $candle -or -not $light) {
+            # 没有 WiX 就退回 zip，别让整条发布链断在这里
+            Warn '没有 WiX Toolset 3（candle.exe / light.exe），改为打包 zip'
+            $zip = Join-Path $OutDir "$name.zip"
+            if (Test-Path $zip) { Remove-Item $zip -Force }
+            Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
+            Ok "产出 $name.zip"
+            return @($zip)
+        }
         $wixObj = Join-Path $stage 'racewong.wixobj'
         $wxs = Join-Path $RepoRoot 'app/installer/racewong.wxs'
         $exeAbs = (Resolve-Path $bin).Path
@@ -396,12 +369,6 @@ function New-Package([string]$Target, [string]$Ver) {
         if ($code -ne 0) { Die '打包 tar.gz 失败' }
         $assets += $tgz
 
-        if ($os -eq 'macos' -and (Get-HostOS) -eq 'macos' -and (Get-Tool 'hdiutil')) {
-            $dmg = Join-Path $OutDir "$name.dmg"
-            if (Test-Path $dmg) { Remove-Item $dmg -Force }
-            $code = Invoke-Checked 'hdiutil' @('create', '-volname', "RaceBox 同步 $Ver", '-srcfolder', $stage, '-ov', '-format', 'UDZO', $dmg)
-            if ($code -eq 0) { $assets += $dmg } else { Warn '生成 dmg 失败，仅保留 tar.gz' }
-        }
         if ($os -eq 'linux' -and (Get-Tool 'dpkg-deb')) {
             $deb = Join-Path $OutDir "$name.deb"
             if (Test-Path $deb) { Remove-Item $deb -Force }
