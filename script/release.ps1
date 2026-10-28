@@ -7,7 +7,7 @@
 #   -> 用 git 提交记录生成 Release 说明 -> 创建/更新 GitHub Release -> 上传安装包
 #
 # 三个平台的安装包（本脚本只构建"当前这台机器"能构建的那一个，其余交给 GitHub Actions）：
-#   Windows x86-64 : racewong-<ver>-windows-x86_64.zip
+#   Windows x86-64 : racewong-<ver>-windows-x86_64.msi
 #   macOS   arm64  : racewong-<ver>-macos-aarch64.tar.gz（在 macOS 上还会出 .dmg）
 #   Linux   x86-64 : racewong-<ver>-linux-x86_64.tar.gz（有 dpkg-deb 时还会出 .deb）
 #
@@ -375,10 +375,20 @@ function New-Package([string]$Target, [string]$Ver) {
 
     $assets = @()
     if ($os -eq 'windows') {
-        $zip = Join-Path $OutDir "$name.zip"
-        if (Test-Path $zip) { Remove-Item $zip -Force }
-        Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
-        $assets += $zip
+        $candle = Get-Tool 'candle.exe'
+        $light = Get-Tool 'light.exe'
+        if (-not $candle -or -not $light) { Die '生成 MSI 需要 WiX Toolset 3（candle.exe / light.exe）' }
+        $wixObj = Join-Path $stage 'racewong.wixobj'
+        $wxs = Join-Path $RepoRoot 'app/installer/racewong.wxs'
+        $exeAbs = (Resolve-Path $bin).Path
+        $iconAbs = (Resolve-Path (Join-Path $AppDir 'assets/icon.ico')).Path
+        $code = Invoke-Checked $candle.Source @('-nologo', "-dVersion=$Ver", "-dExePath=$exeAbs", "-dIconPath=$iconAbs", '-out', $wixObj, $wxs)
+        if ($code -ne 0) { Die 'WiX candle 编译失败' }
+        $msi = Join-Path $OutDir "$name.msi"
+        if (Test-Path $msi) { Remove-Item $msi -Force }
+        $code = Invoke-Checked $light.Source @('-nologo', '-sval', '-out', $msi, $wixObj)
+        if ($code -ne 0) { Die 'WiX light 生成 MSI 失败' }
+        $assets += $msi
     } else {
         $tgz = Join-Path $OutDir "$name.tar.gz"
         if (Test-Path $tgz) { Remove-Item $tgz -Force }

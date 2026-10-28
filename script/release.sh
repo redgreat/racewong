@@ -7,7 +7,7 @@
 #
 # 三个平台的安装包（本脚本只构建"当前这台机器"能构建的那一个，其余交给 GitHub Actions）：
 #   Windows x86-64 : racewong-<ver>-windows-x86_64.zip
-#   macOS   arm64  : racewong-<ver>-macos-aarch64.tar.gz（在 macOS 上还会出 .dmg）
+#   macOS   arm64  : racewong-<ver>-macos-aarch64.dmg
 #   Linux   x86-64 : racewong-<ver>-linux-x86_64.tar.gz（有 dpkg-deb 时还会出 .deb）
 #
 # 用法：
@@ -216,6 +216,14 @@ make_app_bundle() { # make_app_bundle <stage> <bin> <ver>
 </dict>
 </plist>
 PLIST
+  chmod +x "$contents/MacOS/$BIN_NAME"
+  if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+    codesign --force --deep --options runtime --timestamp \
+      --sign "$APPLE_SIGNING_IDENTITY" "$stage/RaceBox 同步.app" || die 'Developer ID 签名失败'
+    codesign --verify --deep --strict --verbose=2 "$stage/RaceBox 同步.app" || die 'Developer ID 签名校验失败'
+  else
+    die '未配置 APPLE_SIGNING_IDENTITY，拒绝生成会被 Gatekeeper 拦截的 macOS 发布包'
+  fi
 }
 
 make_deb() { # make_deb <stage> <bin> <ver> <out.deb>
@@ -288,6 +296,24 @@ make_package() { # make_package <target> <ver>  —— 输出产出的文件（�
     make_zip "$stage" "$zip" || die '打包 zip 失败'
     ok "产出 $name.zip"
     echo "$zip"
+  elif [ "$os" = "macos" ]; then
+    [ "$(host_os)" = "macos" ] && have hdiutil || die '生成 macOS 安装包需要 macOS 与 hdiutil'
+    ln -s /Applications "$stage/Applications"
+    local dmg="$OUT_DIR/$name.dmg"
+    rm -f "$dmg"
+    hdiutil create -volname "RaceBox 同步 $ver" -srcfolder "$stage" -ov -format UDZO "$dmg" >/dev/null || die '生成 DMG 失败'
+    if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+      codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$dmg" || die 'DMG 签名失败'
+      if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ] || [ -z "${APPLE_APP_PASSWORD:-}" ]; then
+        die '已有签名证书但缺少 APPLE_ID / APPLE_TEAM_ID / APPLE_APP_PASSWORD，拒绝发布未公证 DMG'
+      fi
+      xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+        --password "$APPLE_APP_PASSWORD" --wait || die 'Apple 公证失败'
+      xcrun stapler staple "$dmg" || die '公证票据装订失败'
+      spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg" || die 'Gatekeeper 校验失败'
+    fi
+    ok "产出 $name.dmg"
+    echo "$dmg"
   else
     local tgz="$OUT_DIR/$name.tar.gz"
     rm -f "$tgz"
@@ -295,16 +321,6 @@ make_package() { # make_package <target> <ver>  —— 输出产出的文件（�
     ok "产出 $name.tar.gz"
     echo "$tgz"
 
-    if [ "$os" = "macos" ] && [ "$(host_os)" = "macos" ] && have hdiutil; then
-      local dmg="$OUT_DIR/$name.dmg"
-      rm -f "$dmg"
-      if hdiutil create -volname "RaceBox 同步 $ver" -srcfolder "$stage" -ov -format UDZO "$dmg" >/dev/null; then
-        ok "产出 $name.dmg"
-        echo "$dmg"
-      else
-        warn '生成 dmg 失败，仅保留 tar.gz'
-      fi
-    fi
     if [ "$os" = "linux" ] && have dpkg-deb; then
       local deb="$OUT_DIR/$name.deb"
       rm -f "$deb"

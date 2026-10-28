@@ -37,6 +37,12 @@ struct SessionRow {
     detail: String,
 }
 
+enum UpdateMsg {
+    Current,
+    Downloaded(crate::updater::UpdateInfo, std::path::PathBuf),
+    Failed(String),
+}
+
 pub struct App {
     cfg: Config,
     runtime: Arc<Runtime>,
@@ -103,6 +109,10 @@ pub struct App {
     quit_requested: bool,
     /// 窗口当前是否被收进了托盘。
     hidden_to_tray: bool,
+    update_tx: std::sync::mpsc::Sender<UpdateMsg>,
+    update_rx: std::sync::mpsc::Receiver<UpdateMsg>,
+    update_busy: bool,
+    update_result: Option<(String, LogLevel)>,
 }
 
 impl App {
@@ -115,6 +125,7 @@ impl App {
         let pg_port_buf = cfg.pg.port.to_string();
         let mqtt_port_buf = cfg.mqtt.port.to_string();
         let (probe_tx, probe_rx) = std::sync::mpsc::channel::<crate::sink::mqtt::MqttSink>();
+        let (update_tx, update_rx) = std::sync::mpsc::channel::<UpdateMsg>();
         let applied_theme = cfg.theme;
         let settings_snapshot = cfg.clone();
         let scan_timeout_buf = cfg.scan_timeout_secs.to_string();
@@ -168,6 +179,10 @@ impl App {
             tray_error: None,
             quit_requested: false,
             hidden_to_tray: false,
+            update_tx,
+            update_rx,
+            update_busy: false,
+            update_result: None,
         }
     }
 
@@ -417,12 +432,63 @@ impl App {
         while let Ok(sink) = self.probe_rx.try_recv() {
             self.mqtt_probe = Some(sink);
         }
+        while let Ok(message) = self.update_rx.try_recv() {
+            self.update_busy = false;
+            match message {
+                UpdateMsg::Current => {
+                    self.update_result = Some((
+                        tr!("当前已是最新版（{}）", "Already up to date ({})", env!("CARGO_PKG_VERSION")),
+                        LogLevel::Success,
+                    ));
+                }
+                UpdateMsg::Downloaded(info, path) => match crate::updater::launch_installer(&path) {
+                    Ok(()) => {
+                        self.update_result = Some((
+                            tr!("v{} 安装包已下载，正在打开安装器…", "v{} downloaded; opening installer…", info.version),
+                            LogLevel::Success,
+                        ));
+                        #[cfg(target_os = "windows")]
+                        {
+                            // 更新安装器需要替换当前 exe；即使用户配置了“关闭到托盘”，
+                            // 此处也必须真正退出，不能让旧进程继续占用文件。
+                            self.quit_requested = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                    Err(e) => self.update_result = Some((e, LogLevel::Error)),
+                },
+                UpdateMsg::Failed(e) => self.update_result = Some((e, LogLevel::Error)),
+            }
+        }
         if self.running {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
-        if self.pg_test.busy || self.mqtt_test.busy {
+        if self.pg_test.busy || self.mqtt_test.busy || self.update_busy {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
+    }
+
+    fn check_update(&mut self) {
+        if self.update_busy {
+            return;
+        }
+        self.update_busy = true;
+        self.update_result = Some((
+            t!("正在检查 GitHub Release…", "Checking GitHub Release…").to_string(),
+            LogLevel::Info,
+        ));
+        let tx = self.update_tx.clone();
+        self.runtime.spawn(async move {
+            let message = match crate::updater::check().await {
+                Ok(None) => UpdateMsg::Current,
+                Ok(Some(info)) => match crate::updater::download(&info).await {
+                    Ok(path) => UpdateMsg::Downloaded(info, path),
+                    Err(e) => UpdateMsg::Failed(e),
+                },
+                Err(e) => UpdateMsg::Failed(e),
+            };
+            let _ = tx.send(message);
+        });
     }
 
     fn start(&mut self, mode: RunMode) {
@@ -1358,6 +1424,31 @@ impl App {
                     self.set_lang(picked);
                 }
             });
+        });
+
+        ui.add_space(10.0);
+        // ---------- 软件更新 ----------
+        style::card(p).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            style::card_title(ui, p, t!("软件更新", "Software update"));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    p.muted,
+                    tr!("当前版本 {}", "Current version {}", env!("CARGO_PKG_VERSION")),
+                );
+                ui.add_space(12.0);
+                if ui.add_enabled(
+                    !self.update_busy,
+                    style::secondary_button(p, t!("检查并更新", "Check and update")),
+                ).clicked() {
+                    self.check_update();
+                }
+                if self.update_busy { ui.spinner(); }
+            });
+            if let Some((text, level)) = &self.update_result {
+                style::status_banner(ui, p, level_color(p, *level), text);
+            }
         });
 
         ui.add_space(10.0);

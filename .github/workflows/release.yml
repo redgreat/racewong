@@ -54,13 +54,43 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config libxkbcommon-dev libssl-dev
 
+      - name: Install WiX Toolset 3
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install wixtoolset --version=3.14.1 --yes --no-progress
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: app
 
+      - name: Import Apple Developer ID certificate
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE_P12" ] || [ -z "$APPLE_CERTIFICATE_PASSWORD" ]; then
+            echo "缺少 Apple Developer ID 证书 secrets，拒绝生成会被 Gatekeeper 拦截的 DMG"
+            exit 1
+          fi
+          KEYCHAIN="$RUNNER_TEMP/racewong.keychain-db"
+          CERT="$RUNNER_TEMP/developer-id.p12"
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$CERT"
+          security create-keychain -p actions "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p actions "$KEYCHAIN"
+          security import "$CERT" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple: -s -k actions "$KEYCHAIN"
+
       - name: Build and package
         shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: ${{ matrix.cmd }}
 
       - name: Verify exe is GUI subsystem (no console window)
@@ -110,7 +140,7 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           shopt -s nullglob
-          files=(dist/*.zip dist/*.tar.gz dist/*.dmg dist/*.deb)
+          files=(dist/*.msi dist/*.dmg dist/*.deb)
           if [ ${#files[@]} -eq 0 ]; then echo "没有可上传的安装包"; exit 1; fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${files[@]}" --clobber

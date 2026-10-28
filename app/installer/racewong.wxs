@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="RaceBox 同步" Language="2052" Version="$(var.Version)"
+           Manufacturer="racewong" UpgradeCode="AE4F32D4-1D64-4EF9-9F89-53AC184B3B60">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser" />
+    <MajorUpgrade DowngradeErrorMessage="已安装更新版本的 RaceBox 同步。" />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="AppIcon.ico" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/redgreat/racewong" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="INSTALLFOLDER" Name="RaceBox Sync" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ProgramMenuDir" Name="RaceBox 同步" />
+      </Directory>
+    </Directory>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="AppFiles" Guid="C832494C-66BB-419D-A592-533435AA291B">
+        <File Id="AppExe" Source="$(var.ExePath)" KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuDir" Name="RaceBox 同步"
+                    WorkingDirectory="INSTALLFOLDER" Advertise="yes" Icon="AppIcon.ico" />
+        </File>
+      </Component>
+      <Component Id="StartMenuCleanup" Guid="5532E157-0B8D-48C6-A58B-1DDF4D772BF4">
+        <RemoveFolder Id="RemoveProgramMenuDir" Directory="ProgramMenuDir" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\racewong\RaceBoxSync" Name="installed"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="MainFeature" Title="RaceBox 同步" Level="1">
+      <ComponentRef Id="AppFiles" />
+      <ComponentRef Id="StartMenuCleanup" />
+    </Feature>
+  </Product>
+</Wix>

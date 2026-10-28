@@ -8,6 +8,7 @@ mod sink;
 mod style;
 mod tray;
 mod ui;
+mod updater;
 mod worker;
 
 use std::sync::Arc;
