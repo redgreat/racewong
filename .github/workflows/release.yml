@@ -73,7 +73,7 @@ jobs:
           choco install wixtoolset --yes --no-progress --ignore-checksums
           if ($LASTEXITCODE -ne 0) { Write-Host "choco 返回 $LASTEXITCODE，继续检查是否可用" }
           if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
-            Write-Host '::warning::WiX Toolset 3 不可用，Windows 将退化为 zip 包'
+            throw 'WiX Toolset 3 不可用，无法生成要求的 MSI 安装包'
           }
 
       - name: Cache cargo
@@ -81,7 +81,7 @@ jobs:
         with:
           workspaces: app
 
-      # macOS 不签名不公证，只发布可执行文件压缩包（未签名的 dmg/app 会被 Gatekeeper 拦截）
+      # macOS 生成 ad-hoc 签名的 DMG；没有 Developer ID，因此用户首次运行仍需手动放行。
       - name: Build and package
         shell: bash
         run: ${{ matrix.cmd }}
@@ -133,7 +133,7 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           shopt -s nullglob
-          files=(dist/*.msi dist/*.zip dist/*.dmg dist/*.deb dist/*.tar.gz)
+          files=(dist/*.msi dist/*.dmg dist/*.deb)
           if [ ${#files[@]} -eq 0 ]; then echo "没有可上传的安装包"; exit 1; fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${files[@]}" --clobber

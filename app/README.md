@@ -249,21 +249,14 @@ row("主机", "Host", "ホスト", "호스트", "Host", "Host", "Хост", "Hô
 - Windows Release 只发布 `racewong-<版本>-windows-x86_64.msi`。MSI 按用户安装到
   `%LOCALAPPDATA%\RaceBox Sync`，同一 `UpgradeCode` 的新版本会直接覆盖升级，无需先卸载，
   也不要求管理员权限。
-- macOS Release 只发布 `racewong-<版本>-macos-aarch64.dmg`。CI 必须配置 Developer ID
-  签名和 Apple 公证；缺任一项时发布作业会失败，不会上传一个被 Gatekeeper 拦截的包。
+- macOS Release 发布 `racewong-<版本>-macos-aarch64.dmg`，内含 ad-hoc 签名的 `.app`。
+  当前未配置 Developer ID 和 Apple 公证，因此首次运行仍需用户在系统设置中手动放行。
 - 设置页的“检查并更新”调用 GitHub `releases/latest`。发现更高的语义化版本后自动下载
-  当前平台的 MSI/DMG；Windows 拉起 MSI 覆盖升级并退出旧进程，macOS 打开已公证 DMG，
+  当前平台的 MSI/DMG；Windows 拉起 MSI 覆盖升级并退出旧进程，macOS 打开 DMG，
   用户把应用拖入 Applications 覆盖旧版本。
 
-macOS GitHub Actions 所需 Repository secrets：
-
-- `APPLE_CERTIFICATE_P12`：Developer ID Application 证书 `.p12` 的 base64 内容
-- `APPLE_CERTIFICATE_PASSWORD`：`.p12` 密码
-- `APPLE_SIGNING_IDENTITY`：如 `Developer ID Application: Name (TEAMID)`
-- `APPLE_ID`、`APPLE_TEAM_ID`、`APPLE_APP_PASSWORD`：`notarytool` 公证凭据
-
-Apple 要求站外分发的软件使用 Developer ID 签名并公证；这部分不能用自签名或 ad-hoc
-签名绕过。证书和密码只放 GitHub Actions secrets，不写进仓库或安装包。
+ad-hoc 签名只保证 Apple Silicon 上应用包结构完整，并不建立 Gatekeeper 信任。以后取得
+Developer ID 后，应恢复正式签名和公证，再取消手动放行提示。
 
 ## 6. 图标
 

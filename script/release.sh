@@ -6,8 +6,8 @@
 #   -> 用 git 提交记录生成 Release 说明 -> 创建/更新 GitHub Release -> 上传安装包
 #
 # 三个平台的安装包（本脚本只构建"当前这台机器"能构建的那一个，其余交给 GitHub Actions）：
-#   Windows x86-64 : racewong-<ver>-windows-x86_64.zip（装了 WiX 时还会出 .msi）
-#   macOS   arm64  : racewong-<ver>-macos-aarch64.tar.gz（只放可执行文件，不做 .app / dmg）
+#   Windows x86-64 : racewong-<ver>-windows-x86_64.msi
+#   macOS   arm64  : racewong-<ver>-macos-aarch64.dmg（无 Developer ID，需用户手动放行）
 #   Linux   x86-64 : racewong-<ver>-linux-x86_64.tar.gz（有 dpkg-deb 时还会出 .deb）
 #
 # 用法：
@@ -192,6 +192,36 @@ can_publish() {
   gh auth status >/dev/null 2>&1
 }
 
+make_app_bundle() { # make_app_bundle <stage> <bin> <ver>
+  local stage="$1" bin="$2" ver="$3"
+  local contents="$stage/RaceBox 同步.app/Contents"
+  mkdir -p "$contents/MacOS" "$contents/Resources"
+  cp "$bin" "$contents/MacOS/$BIN_NAME"
+  chmod +x "$contents/MacOS/$BIN_NAME"
+  [ -f "$APP_DIR/assets/icon256.png" ] && cp "$APP_DIR/assets/icon256.png" "$contents/Resources/icon256.png"
+  cat > "$contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>RaceBox 同步</string>
+  <key>CFBundleDisplayName</key><string>RaceBox 同步</string>
+  <key>CFBundleIdentifier</key><string>com.wangcw.racewong</string>
+  <key>CFBundleExecutable</key><string>$BIN_NAME</string>
+  <key>CFBundleVersion</key><string>$ver</string>
+  <key>CFBundleShortVersionString</key><string>$ver</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSBluetoothAlwaysUsageDescription</key><string>需要蓝牙权限以连接 RaceBox 设备</string>
+</dict>
+</plist>
+PLIST
+  # Apple Silicon 要求代码对象具有签名；没有 Developer ID 时使用 ad-hoc 签名。
+  # 这只能保证包结构可运行，不能通过 Gatekeeper 信任校验。
+  codesign --force --deep --sign - "$stage/RaceBox 同步.app" || die 'macOS ad-hoc 签名失败'
+}
+
 make_deb() { # make_deb <stage> <bin> <ver> <out.deb>
   local stage="$1" bin="$2" ver="$3" out="$4"
   local root="${stage}-deb"
@@ -245,9 +275,12 @@ make_package() { # make_package <target> <ver>  —— 输出产出的文件（�
   [ "$os" = "windows" ] && bin="$bin.exe"
   [ -f "$bin" ] || die "找不到构建产物: $bin"
 
-  # macOS 也不做 .app / dmg，直接给可执行文件（未签名，避免 Gatekeeper 拦截）
-  cp "$bin" "$stage/$BIN_NAME"
-  chmod +x "$stage/$BIN_NAME"
+  if [ "$os" = "macos" ]; then
+    make_app_bundle "$stage" "$bin" "$ver"
+  else
+    cp "$bin" "$stage/$BIN_NAME"
+    chmod +x "$stage/$BIN_NAME"
+  fi
   if [ "$os" = "windows" ] && [ -f "$APP_DIR/assets/icon.ico" ]; then
     cp "$APP_DIR/assets/icon.ico" "$stage/"
   fi
@@ -260,6 +293,15 @@ make_package() { # make_package <target> <ver>  —— 输出产出的文件（�
     make_zip "$stage" "$zip" || die '打包 zip 失败'
     ok "产出 $name.zip"
     echo "$zip"
+  elif [ "$os" = "macos" ]; then
+    have hdiutil || die '生成 DMG 需要 macOS hdiutil'
+    ln -s /Applications "$stage/Applications"
+    local dmg="$OUT_DIR/$name.dmg"
+    rm -f "$dmg"
+    hdiutil create -volname "RaceBox 同步 $ver" -srcfolder "$stage" -ov -format UDZO "$dmg" >/dev/null \
+      || die '生成 DMG 失败'
+    ok "产出 $name.dmg（未公证）"
+    echo "$dmg"
   else
     local tgz="$OUT_DIR/$name.tar.gz"
     rm -f "$tgz"

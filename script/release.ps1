@@ -7,8 +7,8 @@
 #   -> 用 git 提交记录生成 Release 说明 -> 创建/更新 GitHub Release -> 上传安装包
 #
 # 三个平台的安装包（本脚本只构建"当前这台机器"能构建的那一个，其余交给 GitHub Actions）：
-#   Windows x86-64 : racewong-<ver>-windows-x86_64.msi（没有 WiX 时退化为 .zip）
-#   macOS   arm64  : racewong-<ver>-macos-aarch64.tar.gz（只放可执行文件，不做 .app / dmg）
+#   Windows x86-64 : racewong-<ver>-windows-x86_64.msi
+#   macOS   arm64  : racewong-<ver>-macos-aarch64.dmg（CI 的 macOS runner 生成）
 #   Linux   x86-64 : racewong-<ver>-linux-x86_64.tar.gz（有 dpkg-deb 时还会出 .deb）
 #
 # 用法：
@@ -315,7 +315,7 @@ Description: RaceBox 同步桌面应用
     return ($code -eq 0)
 }
 
-/// 把暂存目录打成 zip。
+# 把暂存目录打成 zip。
 function New-Zip([string]$Stage, [string]$Name) {
     $zip = Join-Path $OutDir "$Name.zip"
     if (Test-Path $zip) { Remove-Item $zip -Force }
@@ -324,28 +324,26 @@ function New-Zip([string]$Stage, [string]$Name) {
     return $zip
 }
 
-/// 用 WiX Toolset 3 生成 MSI；不可用时返回 $null，由调用方退回 zip。
+# 用 WiX Toolset 3 生成 MSI；安装包是发布硬要求，不再退回单 exe/zip。
 function New-Msi([string]$Stage, [string]$Bin, [string]$Ver, [string]$Name) {
     $candle = Get-Tool 'candle.exe'
     $light  = Get-Tool 'light.exe'
     if (-not $candle -or -not $light) {
-        Warn '没有 WiX Toolset 3（candle.exe / light.exe），改为打包 zip'
-        return $null
+        Die '没有 WiX Toolset 3（candle.exe / light.exe），无法生成 MSI'
     }
     $wxs = Join-Path $RepoRoot 'app/installer/racewong.wxs'
     if (-not (Test-Path $wxs)) {
-        Warn "缺少 $wxs，改为打包 zip"
-        return $null
+        Die "缺少 $wxs，无法生成 MSI"
     }
     $wixObj  = Join-Path $Stage 'racewong.wixobj'
     $exeAbs  = (Resolve-Path $Bin).Path
     $iconAbs = (Resolve-Path (Join-Path $AppDir 'assets/icon.ico')).Path
     $code = Invoke-Checked $candle.Source @('-nologo', "-dVersion=$Ver", "-dExePath=$exeAbs", "-dIconPath=$iconAbs", '-out', $wixObj, $wxs)
-    if ($code -ne 0) { Warn 'WiX candle 编译失败，改为打包 zip'; return $null }
+    if ($code -ne 0) { Die 'WiX candle 编译失败' }
     $msi = Join-Path $OutDir "$Name.msi"
     if (Test-Path $msi) { Remove-Item $msi -Force }
     $code = Invoke-Checked $light.Source @('-nologo', '-sval', '-out', $msi, $wixObj)
-    if ($code -ne 0) { Warn 'WiX light 生成 MSI 失败，改为打包 zip'; return $null }
+    if ($code -ne 0) { Die 'WiX light 生成 MSI 失败' }
     Ok "产出 $Name.msi"
     return $msi
 }
@@ -375,13 +373,9 @@ function New-Package([string]$Target, [string]$Ver) {
 
     $assets = @()
     if ($os -eq 'windows') {
-        # 优先出 MSI；WiX 缺失或编译/链接失败都退回 zip，不让整条发布链断在这里
+        # Windows Release 只接受 MSI，生成失败就让 CI 明确失败。
         $msi = New-Msi $stage $bin $Ver $name
-        if ($msi) {
-            $assets += $msi
-        } else {
-            $assets += (New-Zip $stage $name)
-        }
+        $assets += $msi
     } else {
         $tgz = Join-Path $OutDir "$name.tar.gz"
         if (Test-Path $tgz) { Remove-Item $tgz -Force }
