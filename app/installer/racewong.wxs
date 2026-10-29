@@ -3,12 +3,17 @@
   <!-- Codepage 936(GBK) 才能容纳中文的产品名 / 快捷方式名，默认 1252 会报 LGHT0311 -->
   <Product Id="*" Name="RaceBox 同步" Language="2052" Codepage="936" Version="$(var.Version)"
            Manufacturer="racewong" UpgradeCode="AE4F32D4-1D64-4EF9-9F89-53AC184B3B60">
-    <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser" />
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser" Platform="x64" />
     <MajorUpgrade DowngradeErrorMessage="已安装更新版本的 RaceBox 同步。" />
     <MediaTemplate EmbedCab="yes" />
     <Icon Id="AppIcon.ico" SourceFile="$(var.IconPath)" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/redgreat/racewong" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="安装完成后启动 RaceBox 同步" />
+    <Property Id="WixShellExecTarget" Value="[#AppExe]" />
+    <CustomAction Id="LaunchApplication" BinaryKey="WixCA" DllEntry="WixShellExec"
+                  Impersonate="yes" Return="asyncNoWait" />
 
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="LocalAppDataFolder">
@@ -20,13 +25,13 @@
     </Directory>
 
     <DirectoryRef Id="INSTALLFOLDER">
-      <Component Id="AppFiles" Guid="C832494C-66BB-419D-A592-533435AA291B">
+      <Component Id="AppFiles" Guid="C832494C-66BB-419D-A592-533435AA291B" Win64="yes">
         <File Id="AppExe" Source="$(var.ExePath)" KeyPath="yes">
           <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuDir" Name="RaceBox 同步"
                     WorkingDirectory="INSTALLFOLDER" Advertise="yes" Icon="AppIcon.ico" />
         </File>
       </Component>
-      <Component Id="StartMenuCleanup" Guid="5532E157-0B8D-48C6-A58B-1DDF4D772BF4">
+      <Component Id="StartMenuCleanup" Guid="5532E157-0B8D-48C6-A58B-1DDF4D772BF4" Win64="yes">
         <RemoveFolder Id="RemoveProgramMenuDir" Directory="ProgramMenuDir" On="uninstall" />
         <RegistryValue Root="HKCU" Key="Software\racewong\RaceBoxSync" Name="installed"
                        Type="integer" Value="1" KeyPath="yes" />
@@ -37,5 +42,12 @@
       <ComponentRef Id="AppFiles" />
       <ComponentRef Id="StartMenuCleanup" />
     </Feature>
+
+    <UI>
+      <UIRef Id="WixUI_InstallDir" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication">
+        WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed
+      </Publish>
+    </UI>
   </Product>
 </Wix>

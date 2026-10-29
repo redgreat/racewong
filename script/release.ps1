@@ -342,7 +342,13 @@ function New-Msi([string]$Stage, [string]$Bin, [string]$Ver, [string]$Name) {
     if ($code -ne 0) { Die 'WiX candle 编译失败' }
     $msi = Join-Path $OutDir "$Name.msi"
     if (Test-Path $msi) { Remove-Item $msi -Force }
-    $code = Invoke-Checked $light.Source @('-nologo', '-sval', '-out', $msi, $wixObj)
+    $code = Invoke-Checked $light.Source @(
+        '-nologo', '-sval',
+        '-ext', 'WixUIExtension',
+        '-ext', 'WixUtilExtension',
+        '-cultures:zh-cn',
+        '-out', $msi, $wixObj
+    )
     if ($code -ne 0) { Die 'WiX light 生成 MSI 失败' }
     Ok "产出 $Name.msi"
     return $msi
