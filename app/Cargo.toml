@@ -1,6 +1,6 @@
 [package]
 name = "racewong-app"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "RaceBox BLE sync desktop app: download, PostgreSQL/MQTT upload, device memory erase"
 
