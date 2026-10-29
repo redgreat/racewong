@@ -105,7 +105,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: dist/*
+          # 只上传最终发布文件。macOS 的 DMG 暂存目录含 /Applications 符号链接，
+          # 若用 dist/* 会让 artifact 上传器遍历链接目标并长时间卡住。
+          path: |
+            dist/*.msi
+            dist/*.dmg
+            dist/*.deb
           if-no-files-found: error
 
   publish:
