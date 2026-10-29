@@ -216,6 +216,13 @@ impl App {
 
     /// 处理托盘菜单与窗口关闭请求。
     fn handle_close_and_tray(&mut self, ctx: &egui::Context) {
+        // Windows 在主窗口不可见且没有其它界面动画时，可能不会因为托盘菜单回调里的
+        // request_repaint() 及时进入下一次 update。保持一个很低频的心跳，让隐藏窗口后
+        // “显示主窗口 / 退出”两条命令都一定会被消费；5 Hz 对空闲占用可以忽略。
+        if self.tray.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+
         // 托盘菜单：显示主窗口 / 退出
         loop {
             let Some(cmd) = self.tray.as_ref().and_then(|t| t.poll()) else {
