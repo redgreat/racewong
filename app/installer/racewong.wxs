@@ -51,6 +51,9 @@
       <Directory Id="ProgramMenuFolder">
         <Directory Id="ProgramMenuDir" Name="RaceBox同步" />
       </Directory>
+      <!-- 桌面目录本身不建子目录，但必须声明出来，否则下面引用 DesktopFolder
+           的组件会报 LGHT0094（未解析的符号）。Id 用系统目录名，不带 Name。 -->
+      <Directory Id="DesktopFolder" />
     </Directory>
 
     <DirectoryRef Id="INSTALLFOLDER">
@@ -98,18 +101,78 @@
       <ComponentRef Id="DesktopShortcut" />
     </Feature>
 
-    <UI>
-      <!-- WixUI_InstallDir 的默认序列：欢迎 -> 许可协议 -> 安装目录 -> 确认安装。
-           协议正文由 WixUILicenseRtf 提供。 -->
-      <UIRef Id="WixUI_InstallDir" />
+    <!-- 安装向导序列。
+         这里没有 <UIRef Id="WixUI_InstallDir" />，而是把 WiX 那套序列原样搬进来
+         自己写一遍，原因只有一个：要多一个“创建桌面快捷方式”勾选框。
+         WiX 的对话框全打在一个 ui.wixlib 里，只要引了 WixUI_InstallDir，
+         InstallDirDlg 就必然被拉进来，于是：
+           1. 自己再定义一份同名对话框 -> LGHT0091 Duplicate symbol；
+           2. 把对话框改名、但 Publish 里仍写 Dialog="InstallDirDlg" -> light 会优先
+              绑到 wixlib 里的那份，自己的定义又成了重复符号。
+         所以两头都得改：整个 UI 序列自己写，对话框也换个 Id（RaceBoxInstallDirDlg），
+         所有指向它的 Publish 同步改名。其余对话框（欢迎 / 许可协议 / 确认 / 浏览 /
+         进度 / 出错…）仍按 Id 从 wixlib 取，不用抄。
+         下面的 Publish 与 WiX 3.14 的 WixUI_InstallDir.wxs 逐条一致，只是把
+         InstallDirDlg 换成了 RaceBoxInstallDirDlg；改了会直接影响页面跳转。 -->
+    <UI Id="RaceBoxUI">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
 
-      <!-- 重写 InstallDirDlg 只为多一个“创建桌面快捷方式”勾选框。
-           WixUI_InstallDir 没有能插控件的位置，只能整页替换：下面的控件与 WiX
-           自带的 InstallDirDlg 逐个对应（Id / 坐标 / 文案全一致），只多了 CheckBox
-           和它下面那行说明。
-           替换是安全的——WixUI_InstallDir 里“点 Next / Back 去哪一页”的 Publish
-           是按 Dialog + Control 的 Id 挂上去的，控件 Id 没变就照样生效。 -->
-      <Dialog Id="InstallDirDlg" Width="370" Height="270" Title="!(loc.InstallDirDlg_Title)">
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+      <Property Id="WixUI_Mode" Value="InstallDir" />
+      <Property Id="ARPNOMODIFY" Value="1" />
+
+      <DialogRef Id="BrowseDlg" />
+      <DialogRef Id="DiskCostDlg" />
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+
+      <Publish Dialog="BrowseDlg" Control="OK" Event="DoAction" Value="WixUIValidatePath" Order="3">1</Publish>
+      <Publish Dialog="BrowseDlg" Control="OK" Event="SpawnDialog" Value="InvalidDirDlg" Order="4"><![CDATA[NOT WIXUI_DONTVALIDATEPATH AND WIXUI_INSTALLDIR_VALID<>"1"]]></Publish>
+
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999">1</Publish>
+
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="LicenseAgreementDlg">NOT Installed</Publish>
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg">Installed AND PATCH</Publish>
+
+      <Publish Dialog="LicenseAgreementDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg">1</Publish>
+      <Publish Dialog="LicenseAgreementDlg" Control="Next" Event="NewDialog" Value="RaceBoxInstallDirDlg">LicenseAccepted = "1"</Publish>
+
+      <Publish Dialog="RaceBoxInstallDirDlg" Control="Back" Event="NewDialog" Value="LicenseAgreementDlg">1</Publish>
+      <Publish Dialog="RaceBoxInstallDirDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1">1</Publish>
+      <Publish Dialog="RaceBoxInstallDirDlg" Control="Next" Event="DoAction" Value="WixUIValidatePath" Order="2">NOT WIXUI_DONTVALIDATEPATH</Publish>
+      <Publish Dialog="RaceBoxInstallDirDlg" Control="Next" Event="SpawnDialog" Value="InvalidDirDlg" Order="3"><![CDATA[NOT WIXUI_DONTVALIDATEPATH AND WIXUI_INSTALLDIR_VALID<>"1"]]></Publish>
+      <Publish Dialog="RaceBoxInstallDirDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="4">WIXUI_DONTVALIDATEPATH OR WIXUI_INSTALLDIR_VALID="1"</Publish>
+      <Publish Dialog="RaceBoxInstallDirDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1">1</Publish>
+      <Publish Dialog="RaceBoxInstallDirDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2">1</Publish>
+
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="RaceBoxInstallDirDlg" Order="1">NOT Installed</Publish>
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2">Installed AND NOT PATCH</Publish>
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2">Installed AND PATCH</Publish>
+
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg">1</Publish>
+
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg">1</Publish>
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg">1</Publish>
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg">1</Publish>
+
+      <!-- 完成页的“安装完成后启动” -->
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication">
+        WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed
+      </Publish>
+
+      <!-- 安装目录页。11 个原有控件与 WiX 自带的 InstallDirDlg 逐属性一致
+           （Id / 类型 / 坐标 / 文案），只在末尾多了勾选框和一行说明。
+           按钮“点去哪一页”由上面那批 Publish 按 Dialog + Control 的 Id 挂上去，
+           原有控件 Id 一个都不能改。 -->
+      <Dialog Id="RaceBoxInstallDirDlg" Width="370" Height="270" Title="!(loc.InstallDirDlg_Title)">
         <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)" />
         <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)" />
         <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
@@ -127,18 +190,18 @@
         <Control Id="ChangeFolder" Type="PushButton" X="20" Y="120" Width="56" Height="17" Text="!(loc.InstallDirDlgChange)" />
 
         <!-- 新增：桌面快捷方式。CheckBoxValue 是“勾上时写进属性的值”，
-             取消勾选时 MSI 会把 DESKTOPSHORTCUT 清空。 -->
+             取消勾选时 MSI 会把 DESKTOPSHORTCUT 清空（不是置 0），
+             所以组件条件写的是 DESKTOPSHORTCUT = 1。 -->
         <Control Id="DesktopShortcutCheckBox" Type="CheckBox" X="20" Y="150" Width="330" Height="17"
                  Text="创建桌面快捷方式" Property="DESKTOPSHORTCUT" CheckBoxValue="1" />
         <Control Id="DesktopShortcutHint" Type="Text" X="36" Y="170" Width="314" Height="15"
                  NoPrefix="yes" Transparent="yes"
                  Text="取消勾选则只在开始菜单里放一个入口，桌面保持干净。" />
       </Dialog>
-
-      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication">
-        WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed
-      </Publish>
     </UI>
+
+    <!-- 字体、位图、UIText 等公共资源，仍由 WiX 提供 -->
+    <UIRef Id="WixUI_Common" />
 
     <!-- 界面序列和静默（/qn）执行序列都要走一遍，否则静默升级拿不到旧目录 -->
     <InstallUISequence>
