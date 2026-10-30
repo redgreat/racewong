@@ -324,6 +324,10 @@ function New-Zip([string]$Stage, [string]$Name) {
     return $zip
 }
 
+# 把 UTF-8 的协议正文转成 RTF 的实现放在 wix-license.ps1 里，
+# 单独抽出去是为了能脱离整个发布流程验证产物。
+. (Join-Path $PSScriptRoot 'wix-license.ps1')
+
 # 用 WiX Toolset 3 生成 MSI；安装包是发布硬要求，不再退回单 exe/zip。
 function New-Msi([string]$Stage, [string]$Bin, [string]$Ver, [string]$Name) {
     $candle = Get-Tool 'candle.exe'
@@ -335,10 +339,38 @@ function New-Msi([string]$Stage, [string]$Bin, [string]$Ver, [string]$Name) {
     if (-not (Test-Path $wxs)) {
         Die "缺少 $wxs，无法生成 MSI"
     }
+
+    # 许可协议：UTF-8 正文 -> RTF（安装向导的“许可协议”页用）
+    $licenseTxt = Join-Path $RepoRoot 'app/installer/license.zh.txt'
+    if (-not (Test-Path $licenseTxt)) {
+        Die "缺少 $licenseTxt，无法生成 MSI"
+    }
+    $licenseRtf = Join-Path $Stage 'license.zh.rtf'
+    $rtf = ConvertTo-LicenseRtf ([System.IO.File]::ReadAllText($licenseTxt, [System.Text.Encoding]::UTF8))
+    [System.IO.File]::WriteAllText($licenseRtf, $rtf, [System.Text.Encoding]::ASCII)
+
+    # 安装向导的品牌图（横幅 + 欢迎页背景），由 app/tools/make_installer_art.py 生成
+    $bannerBmp = Join-Path $RepoRoot 'app/installer/banner.bmp'
+    $dialogBmp = Join-Path $RepoRoot 'app/installer/dialog.bmp'
+    foreach ($art in @($bannerBmp, $dialogBmp)) {
+        if (-not (Test-Path $art)) {
+            Die "缺少 $art，无法生成 MSI（先跑 app/tools/make_installer_art.py）"
+        }
+    }
+
     $wixObj  = Join-Path $Stage 'racewong.wixobj'
     $exeAbs  = (Resolve-Path $Bin).Path
     $iconAbs = (Resolve-Path (Join-Path $AppDir 'assets/icon.ico')).Path
-    $code = Invoke-Checked $candle.Source @('-nologo', "-dVersion=$Ver", "-dExePath=$exeAbs", "-dIconPath=$iconAbs", '-out', $wixObj, $wxs)
+    $code = Invoke-Checked $candle.Source @(
+        '-nologo',
+        "-dVersion=$Ver",
+        "-dExePath=$exeAbs",
+        "-dIconPath=$iconAbs",
+        "-dLicenseRtf=$licenseRtf",
+        "-dBannerBmp=$((Resolve-Path $bannerBmp).Path)",
+        "-dDialogBmp=$((Resolve-Path $dialogBmp).Path)",
+        '-out', $wixObj, $wxs
+    )
     if ($code -ne 0) { Die 'WiX candle 编译失败' }
     $msi = Join-Path $OutDir "$Name.msi"
     if (Test-Path $msi) { Remove-Item $msi -Force }

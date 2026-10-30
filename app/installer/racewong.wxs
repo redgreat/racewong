@@ -1,33 +1,62 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <!-- Codepage 936(GBK) 才能容纳中文的产品名 / 快捷方式名，默认 1252 会报 LGHT0311 -->
-  <Product Id="*" Name="RaceBox 同步" Language="2052" Codepage="936" Version="$(var.Version)"
+  <Product Id="*" Name="RaceBox同步" Language="2052" Codepage="936" Version="$(var.Version)"
            Manufacturer="racewong" UpgradeCode="AE4F32D4-1D64-4EF9-9F89-53AC184B3B60">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser" Platform="x64" />
-    <MajorUpgrade DowngradeErrorMessage="已安装更新版本的 RaceBox 同步。" />
+    <MajorUpgrade DowngradeErrorMessage="已安装更新版本的 RaceBox同步。" />
     <MediaTemplate EmbedCab="yes" />
+
+    <!-- “程序和功能”里显示的图标与说明 -->
     <Icon Id="AppIcon.ico" SourceFile="$(var.IconPath)" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
+    <Property Id="ARPCOMMENTS" Value="RaceBox 蓝牙同步桌面应用" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/redgreat/racewong" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/redgreat/racewong#readme" />
+    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/redgreat/racewong/releases" />
+
+    <!-- 蓝牙走 WinRT，Windows 10 以下没有对应 API -->
+    <Condition Message="RaceBox同步 需要 Windows 10 或更高版本。">
+      Installed OR VersionNT &gt;= 1000
+    </Condition>
+
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
-    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="安装完成后启动 RaceBox 同步" />
+    <!-- 完成页的“安装完成后启动”复选框，默认勾上 -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="安装完成后启动 RaceBox同步" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
     <Property Id="WixShellExecTarget" Value="[#AppExe]" />
     <CustomAction Id="LaunchApplication" BinaryKey="WixCA" DllEntry="WixShellExec"
                   Impersonate="yes" />
+
+    <!-- 桌面快捷方式：默认创建。勾选框直接绑这个属性，取消勾选时 MSI 会把属性清空，
+         下面 DesktopShortcut 组件的条件随之变成 false，快捷方式就不会被装上。
+         不记“上次的选择”——要记就得往注册表写 0/1，而属性被清空后再写进整型注册表值
+         会直接让安装报错，为这点便利不值当。 -->
+    <Property Id="DESKTOPSHORTCUT" Value="1" />
+
+    <!-- 升级时沿用上一次的安装目录。
+         客户端内置的更新器是 `msiexec /qn`（全程无界面），静默安装时没有人能
+         改目录，不把旧路径找回来的话，用户当初装在 D 盘也会被搬回默认位置。
+         旧路径由安装时写进注册表的 InstallDir 提供（见下面的 Component）。 -->
+    <Property Id="PREVIOUSINSTALLDIR">
+      <RegistrySearch Id="PreviousInstallDirSearch" Root="HKCU"
+                      Key="Software\racewong\RaceBoxSync" Name="InstallDir" Type="raw" />
+    </Property>
+    <CustomAction Id="UsePreviousInstallDir" Property="INSTALLFOLDER" Value="[PREVIOUSINSTALLDIR]" />
 
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="LocalAppDataFolder">
         <Directory Id="INSTALLFOLDER" Name="RaceBox Sync" />
       </Directory>
       <Directory Id="ProgramMenuFolder">
-        <Directory Id="ProgramMenuDir" Name="RaceBox 同步" />
+        <Directory Id="ProgramMenuDir" Name="RaceBox同步" />
       </Directory>
     </Directory>
 
     <DirectoryRef Id="INSTALLFOLDER">
       <Component Id="AppFiles" Guid="C832494C-66BB-419D-A592-533435AA291B" Win64="yes">
         <File Id="AppExe" Source="$(var.ExePath)" KeyPath="yes">
-          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuDir" Name="RaceBox 同步"
+          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuDir" Name="RaceBox同步"
                     WorkingDirectory="INSTALLFOLDER" Advertise="yes" Icon="AppIcon.ico" />
         </File>
       </Component>
@@ -35,19 +64,102 @@
         <RemoveFolder Id="RemoveProgramMenuDir" Directory="ProgramMenuDir" On="uninstall" />
         <RegistryValue Root="HKCU" Key="Software\racewong\RaceBoxSync" Name="installed"
                        Type="integer" Value="1" KeyPath="yes" />
+        <!-- 记下真实安装路径，供下次静默升级还原（格式化属性在写入时展开成最终路径） -->
+        <RegistryValue Root="HKCU" Key="Software\racewong\RaceBoxSync" Name="InstallDir"
+                       Type="string" Value="[INSTALLFOLDER]" />
+        <!-- App Paths：Win+R 里能直接敲 racewong-app，任务管理器的“打开文件位置”也能定位 -->
+        <RegistryValue Root="HKCU"
+                       Key="Software\Microsoft\Windows\CurrentVersion\App Paths\racewong-app.exe"
+                       Type="string" Value="[#AppExe]" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\Microsoft\Windows\CurrentVersion\App Paths\racewong-app.exe"
+                       Name="Path" Type="string" Value="[INSTALLFOLDER]" />
+        <RemoveRegistryKey Root="HKCU"
+                           Key="Software\Microsoft\Windows\CurrentVersion\App Paths\racewong-app.exe"
+                           Action="removeOnUninstall" />
       </Component>
     </DirectoryRef>
 
-    <Feature Id="MainFeature" Title="RaceBox 同步" Level="1">
+    <!-- 桌面快捷方式单独一个组件：整块由 DESKTOPSHORTCUT 控制装不装，
+         卸载时随组件一起删掉，不需要额外的 RemoveFile。 -->
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="63E3AEC2-A17A-4C2E-8D6F-F3B5C6A18CF9" Win64="yes">
+        <Condition>DESKTOPSHORTCUT = 1</Condition>
+        <Shortcut Id="DesktopShortcutLink" Name="RaceBox同步" Target="[#AppExe]"
+                  WorkingDirectory="INSTALLFOLDER" Icon="AppIcon.ico" />
+        <RegistryValue Root="HKCU" Key="Software\racewong\RaceBoxSync"
+                       Name="DesktopShortcutInstalled" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="MainFeature" Title="RaceBox同步" Level="1">
       <ComponentRef Id="AppFiles" />
       <ComponentRef Id="StartMenuCleanup" />
+      <ComponentRef Id="DesktopShortcut" />
     </Feature>
 
     <UI>
+      <!-- WixUI_InstallDir 的默认序列：欢迎 -> 许可协议 -> 安装目录 -> 确认安装。
+           协议正文由 WixUILicenseRtf 提供。 -->
       <UIRef Id="WixUI_InstallDir" />
+
+      <!-- 重写 InstallDirDlg 只为多一个“创建桌面快捷方式”勾选框。
+           WixUI_InstallDir 没有能插控件的位置，只能整页替换：下面的控件与 WiX
+           自带的 InstallDirDlg 逐个对应（Id / 坐标 / 文案全一致），只多了 CheckBox
+           和它下面那行说明。
+           替换是安全的——WixUI_InstallDir 里“点 Next / Back 去哪一页”的 Publish
+           是按 Dialog + Control 的 Id 挂上去的，控件 Id 没变就照样生效。 -->
+      <Dialog Id="InstallDirDlg" Width="370" Height="270" Title="!(loc.InstallDirDlg_Title)">
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg">1</Publish>
+        </Control>
+
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes" Text="!(loc.InstallDirDlgDescription)" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15" Transparent="yes" NoPrefix="yes" Text="!(loc.InstallDirDlgTitle)" />
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="!(loc.InstallDirDlgBannerBitmap)" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+
+        <Control Id="FolderLabel" Type="Text" X="20" Y="60" Width="290" Height="30" NoPrefix="yes" Text="!(loc.InstallDirDlgFolderLabel)" />
+        <Control Id="Folder" Type="PathEdit" X="20" Y="100" Width="320" Height="18" Property="WIXUI_INSTALLDIR" Indirect="yes" />
+        <Control Id="ChangeFolder" Type="PushButton" X="20" Y="120" Width="56" Height="17" Text="!(loc.InstallDirDlgChange)" />
+
+        <!-- 新增：桌面快捷方式。CheckBoxValue 是“勾上时写进属性的值”，
+             取消勾选时 MSI 会把 DESKTOPSHORTCUT 清空。 -->
+        <Control Id="DesktopShortcutCheckBox" Type="CheckBox" X="20" Y="150" Width="330" Height="17"
+                 Text="创建桌面快捷方式" Property="DESKTOPSHORTCUT" CheckBoxValue="1" />
+        <Control Id="DesktopShortcutHint" Type="Text" X="36" Y="170" Width="314" Height="15"
+                 NoPrefix="yes" Transparent="yes"
+                 Text="取消勾选则只在开始菜单里放一个入口，桌面保持干净。" />
+      </Dialog>
+
       <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication">
         WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed
       </Publish>
     </UI>
+
+    <!-- 界面序列和静默（/qn）执行序列都要走一遍，否则静默升级拿不到旧目录 -->
+    <InstallUISequence>
+      <Custom Action="UsePreviousInstallDir" Before="CostFinalize">
+        PREVIOUSINSTALLDIR AND NOT INSTALLFOLDER
+      </Custom>
+    </InstallUISequence>
+    <InstallExecuteSequence>
+      <Custom Action="UsePreviousInstallDir" Before="CostFinalize">
+        PREVIOUSINSTALLDIR AND NOT INSTALLFOLDER
+      </Custom>
+    </InstallExecuteSequence>
   </Product>
+
+  <!-- 安装许可协议：中文，由 script/release.ps1 从 license.zh.txt 转成 RTF 后传进来。
+       WiX 只接受 RTF（RichText 控件），纯文本或 UTF-8 会显示成乱码。 -->
+  <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+
+  <!-- 安装向导的品牌图。都是 24 位 BMP、按 493 宽设计，MSI 会缩到 370 显示。
+       横幅上只放右角一个小标记：WixUI 把每页的标题/描述文字透明地画在横幅上，
+       左侧约 305px 是文字区。 -->
+  <WixVariable Id="WixUIBannerBmp" Value="$(var.BannerBmp)" />
+  <WixVariable Id="WixUIDialogBmp" Value="$(var.DialogBmp)" />
 </Wix>
