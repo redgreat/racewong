@@ -23,11 +23,15 @@ futures-util = "0.3"
 flexi_logger = "0.29"
 log = "0.4"
 
-# 鎵樼洏鍥炬爣锛圵indows 閫氱煡鍖哄煙 / macOS 鑿滃崟鏍忥級銆?# 鍙湪杩欎袱涓钩鍙板紩鍏ワ細Linux 鐨勬墭鐩樺疄鐜颁緷璧?GTK/AppIndicator 绯荤粺搴擄紝
-# 浼氳 `cargo test` 鍜屽師鐢熸瀯寤哄嚟绌哄鍑虹郴缁熶緷璧栵紝鑰屼氦鍙夌紪璇?Windows 鐢ㄤ笉鍒般€?[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+# 托盘图标（Windows 通知区域 / macOS 菜单栏）。
+# 只在这两个平台引入：Linux 的托盘实现依赖 GTK/AppIndicator 系统库，
+# 会让 `cargo test` 和原生构建凭空多出系统依赖，而交叉编译 Windows 用不到。
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 tray-icon = "0.19"
 
-# 鍙栦富绐楀彛鐨?HWND锛堟墭鐩樿彍鍗曠洿鎺ユ搷浣滅獥鍙ｇ敤锛夈€?# eframe / winit 鏈潵灏变緷璧栧悓涓€涓?0.6锛岃繖閲屽彧鏄樉寮忓０鏄庯紝涓嶄細澶氱紪璇戜竴浠姐€?[target.'cfg(target_os = "windows")'.dependencies]
+# 取主窗口的 HWND（托盘菜单直接操作窗口用）。
+# eframe / winit 本来就依赖同一个 0.6，这里只是显式声明，不会多编译一份。
+[target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6"
 
 [build-dependencies]

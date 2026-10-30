@@ -151,15 +151,17 @@
         PREVIOUSINSTALLDIR AND NOT INSTALLFOLDER
       </Custom>
     </InstallExecuteSequence>
+    <!-- 安装许可协议：中文，由 script/release.ps1 从 license.zh.txt 转成 RTF 后传进来。
+         WiX 只接受 RTF（RichText 控件），纯文本或 UTF-8 会显示成乱码。
+
+         WixVariable 的合法父元素是 Product / Fragment / Module / Bundle，不能挂在
+         <Wix> 根节点下（candle 会报 CNDL0005），所以这三条都放在 Product 里。 -->
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+
+    <!-- 安装向导的品牌图。都是 24 位 BMP、按 493 宽设计，MSI 会缩到 370 显示。
+         横幅上只放右角一个小标记：WixUI 把每页的标题/描述文字透明地画在横幅上，
+         左侧约 305px 是文字区。 -->
+    <WixVariable Id="WixUIBannerBmp" Value="$(var.BannerBmp)" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(var.DialogBmp)" />
   </Product>
-
-  <!-- 安装许可协议：中文，由 script/release.ps1 从 license.zh.txt 转成 RTF 后传进来。
-       WiX 只接受 RTF（RichText 控件），纯文本或 UTF-8 会显示成乱码。 -->
-  <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
-
-  <!-- 安装向导的品牌图。都是 24 位 BMP、按 493 宽设计，MSI 会缩到 370 显示。
-       横幅上只放右角一个小标记：WixUI 把每页的标题/描述文字透明地画在横幅上，
-       左侧约 305px 是文字区。 -->
-  <WixVariable Id="WixUIBannerBmp" Value="$(var.BannerBmp)" />
-  <WixVariable Id="WixUIDialogBmp" Value="$(var.DialogBmp)" />
 </Wix>
