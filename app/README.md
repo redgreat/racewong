@@ -291,10 +291,18 @@ row("主机", "Host", "ホスト", "호스트", "Host", "Host", "Хост", "Hô
   `DesktopShortcut` 组件里、组件条件是 `DESKTOPSHORTCUT = 1`，卸载时随组件一起消失。
   取消勾选时 MSI 会把属性**清空**（不是置 0），所以条件写成 `= 1` 而不是 `<> 0`。
   这个选择不跨版本记忆：属性被清空后再写进整型注册表值会直接让安装报错，不值得。
-- **安装目录页是整页替换的**：`WixUI_InstallDir` 没有能插控件的位置，只能在 `.wxs` 里
-  重写 `<Dialog Id="InstallDirDlg">`（WiX 链接器用本地定义覆盖扩展库里的那份）。
-  控件 Id、坐标、文案必须与 WiX 自带的那份逐字一致——`WixUI_InstallDir` 里
-  “点 Next / Back 去哪一页”的 `Publish` 是按 `Dialog + Control` 的 Id 挂上去的。
+- **安装目录页是自己重写的**：`WixUI_InstallDir` 没有能插控件的位置，而 WiX 把**所有**
+  对话框打在一个 `ui.wixlib` 里——只要引了它，`InstallDirDlg` 就必然被拉进来，同名覆盖
+  会报 `LGHT0091 Duplicate symbol`。所以 `.wxs` 里不再 `UIRef` 那个序列，而是把
+  WiX 3.14 的 `WixUI_InstallDir.wxs` 整段搬过来自己写（`<UI Id="RaceBoxUI">`），
+  末尾只留 `UIRef WixUI_Common` 取字体/位图/UIText，其余对话框仍按 Id 从扩展库取。
+  - 自己的对话框 Id 是 `RaceBoxInstallDirDlg`，**必须改名**：把对话框改名、但
+    `Publish` 里仍写 `Dialog="InstallDirDlg"` 时，light 会把引用绑到 wixlib 那份，
+    自己的定义反而成了重复符号。所有指向它的 `Publish` 已同步改名。
+  - 11 个原有控件的 Id / 类型 / 坐标 / 文案与 WiX 官方那份逐属性一致
+    （`ChangeFolder`、`Next`、`Cancel` 的跳转全靠 `Publish` 按 Id 挂载，一个都不能改）。
+  - 改完应比对 MSI 表确认没动到导航：`InstallUISequence` 41 行、`ControlEvent` 774 行，
+    与改动前的基线完全一致，只多出勾选框那两个控件。
 - **品牌图**：`app/installer/banner.bmp`（493×58，各页顶部横幅）和
   `dialog.bmp`（493×312，欢迎/完成页背景），由 `app/tools/make_installer_art.py` 生成，
   和 exe 图标共用 `app/tools/racebox_mark.py` 里的同一份矢量数据。
@@ -304,6 +312,26 @@ row("主机", "Host", "ホスト", "호스트", "Host", "Host", "Хост", "Hô
 - **其它常规项**：控制面板里的图标 / 说明 / 帮助链接 / 更新说明链接（`ARP*`）、
   `Win+R` 能直接敲 `racewong-app`（App Paths，卸载时清掉）、
   Windows 10 以下直接拒绝安装（蓝牙走 WinRT，`VersionNT >= 1000`）。
+
+#### 本地验证安装包
+
+改 `.wxs` 后不必等 CI（一轮约 4 分钟）。WiX 3.14 的二进制包解压即用，免安装：
+
+```powershell
+# https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip
+candle.exe -nologo -dVersion=0.1.9 -dExePath=<exe> -dIconPath=app/assets/icon.ico `
+  -dLicenseRtf=<rtf> -dBannerBmp=app/installer/banner.bmp -dDialogBmp=app/installer/dialog.bmp `
+  -out out/r.wixobj app/installer/racewong.wxs
+light.exe -nologo -sval -ext WixUIExtension -ext WixUtilExtension -cultures:zh-cn `
+  -out out/r.msi out/r.wixobj
+```
+
+想确认向导没被改坏，用同包的 `Microsoft.Deployment.WindowsInstaller.dll` 读表比对
+改动前后的 MSI：`Dialog` / `InstallUISequence` / `ControlEvent` 三张表应与基线一致
+（只多出新增的控件）。注意 MSI SQL 里 `Sequence`、`Property`、`Condition`、`Text`
+是保留字，`SELECT Sequence, ...` 会报语法错误，用 `SELECT *` 再自己拆；
+记录要取 `.ToString()`，`GetString(i)` 取出来是空串。
+`dark.exe` 反编译出的 wxs 只保留 `<UIRef>`，看不到 UI 表，别指望它。
 
 ad-hoc 签名只保证 Apple Silicon 上应用包结构完整，并不建立 Gatekeeper 信任。以后取得
 Developer ID 后，应恢复正式签名和公证，再取消手动放行提示。
