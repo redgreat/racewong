@@ -332,7 +332,7 @@ publish_release() { # publish_release <tag> <notes> <assets...>
   if have gh; then
     if ! gh release view "$tag" >/dev/null 2>&1; then
       step "创建 GitHub Release $tag"
-      local args=(release create "$tag" --title "RaceBox 同步 $tag" --notes-file "$OUT_DIR/release-notes.md")
+      local args=(release create "$tag" --title "RaceBox同步 $tag" --notes-file "$OUT_DIR/release-notes.md")
       [[ "$tag" == *-* ]] && args+=(--prerelease)
       run gh "${args[@]}" || die '创建 Release 失败'
       [ "$DRY_RUN" = "0" ] && ok 'Release 已创建'
@@ -370,7 +370,7 @@ publish_release() { # publish_release <tag> <notes> <assets...>
     [[ "$tag" == *-* ]] && prerelease=true
     release_id="$(curl -fsS -X POST -H "Authorization: Bearer $token" -H 'Accept: application/vnd.github+json' \
       -H 'Content-Type: application/json' \
-      -d "$(printf '{"tag_name":"%s","name":"RaceBox 同步 %s","body":%s,"draft":false,"prerelease":%s}' \
+      -d "$(printf '{"tag_name":"%s","name":"RaceBox同步 %s","body":%s,"draft":false,"prerelease":%s}' \
              "$tag" "$tag" "$(printf '%s' "$notes" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" "$prerelease")" \
       "https://api.github.com/repos/$repo/releases" | sed -n 's/^  "id": \([0-9]*\),$/\1/p' | head -n1)"
     ok 'Release 已创建'

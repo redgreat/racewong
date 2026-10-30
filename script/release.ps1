@@ -448,7 +448,7 @@ function Publish-Release([string]$Tag, [string]$Notes, [string[]]$Assets) {
         }
         if (-not $exists) {
             Step "创建 GitHub Release $Tag"
-            $ghArgs = @('release', 'create', $Tag, '--title', "RaceBox 同步 $Tag", '--notes-file', $notesFile)
+            $ghArgs = @('release', 'create', $Tag, '--title', "RaceBox同步 $Tag", '--notes-file', $notesFile)
             if ($Tag -match '-') { $ghArgs += '--prerelease' }
             if ($DryRun) { Say "   [dry-run] gh $($ghArgs -join ' ')" }
             else {
@@ -502,7 +502,7 @@ function Publish-Release([string]$Tag, [string]$Notes, [string[]]$Assets) {
         else {
             $payload = @{
                 tag_name   = $Tag
-                name       = "RaceBox 同步 $Tag"
+                name       = "RaceBox同步 $Tag"
                 body       = $Notes
                 draft      = $false
                 prerelease = ($Tag -match '-')

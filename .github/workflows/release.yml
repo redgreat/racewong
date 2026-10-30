@@ -143,6 +143,6 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${files[@]}" --clobber
           else
-            gh release create "$TAG" --title "RaceBox 同步 $TAG" --notes-file dist/release-notes.md "${files[@]}"
+            gh release create "$TAG" --title "RaceBox同步 $TAG" --notes-file dist/release-notes.md "${files[@]}"
           fi
           echo "https://github.com/${{ github.repository }}/releases/tag/$TAG"
