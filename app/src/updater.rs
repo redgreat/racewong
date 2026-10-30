@@ -100,29 +100,63 @@ pub async fn download(info: &UpdateInfo) -> Result<PathBuf, String> {
     Ok(target)
 }
 
+/// 启动安装程序。
+///
+/// Windows 走**完全静默**升级（`/qn`，不弹任何向导）：
+///
+/// * 安装位置用当前 exe 所在目录传给 MSI（`INSTALLFOLDER=`），这样升级一定
+///   落在上次的目录里，不会因为静默安装没人能改路径而被搬回默认位置；
+/// * 不能直接 spawn msiexec —— 它要覆盖的就是正在运行的 exe。先写一个短命
+///   `cmd` 脚本，等 2 秒（够本进程退出、文件锁释放）再装，装完把程序重新拉起来；
+/// * 留一份安装日志在 `%TEMP%\racewong-update\install.log`，静默安装失败时能查。
 pub fn launch_installer(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut c = std::process::Command::new("msiexec.exe");
-        c.args(["/i", &path.to_string_lossy(), "/passive", "/norestart"]);
-        c
-    };
+    {
+        let dir = std::env::temp_dir().join("racewong-update");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let install_dir = exe.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let script = dir.join("apply-update.cmd");
+        let log = dir.join("install.log");
+
+        // ping 当 sleep 用：`timeout` 在无控制台的进程里会直接报错
+        let body = format!(
+            "@echo off\r\n\
+             ping -n 3 127.0.0.1 >nul\r\n\
+             msiexec.exe /i \"{msi}\" /qn /norestart INSTALLFOLDER=\"{dir}\" /l*v \"{log}\"\r\n\
+             if exist \"{exe}\" start \"\" \"{exe}\"\r\n\
+             del \"%~f0\"\r\n",
+            msi = path.display(),
+            dir = install_dir.display(),
+            log = log.display(),
+            exe = exe.display(),
+        );
+        std::fs::write(&script, body).map_err(|e| format!("写入升级脚本失败: {e}"))?;
+        return std::process::Command::new("cmd.exe")
+            .arg("/c")
+            .arg(&script)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("无法启动安装器: {e}"));
+    }
+
     #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut c = std::process::Command::new("open");
-        c.arg(path);
-        c
-    };
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut c = std::process::Command::new("xdg-open");
-        c.arg(path);
-        c
-    };
-    command
+    return std::process::Command::new("open")
+        .arg(path)
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("无法启动安装器: {e}"))
+        .map_err(|e| format!("无法启动安装器: {e}"));
+
+    #[cfg(target_os = "linux")]
+    return std::process::Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("无法启动安装器: {e}"));
+
+    #[allow(unreachable_code)]
+    Err("当前平台不支持自动更新".to_string())
 }
 
 #[cfg(test)]

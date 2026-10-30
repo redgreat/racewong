@@ -4,6 +4,7 @@ mod ble;
 mod config;
 mod i18n;
 mod protocol;
+mod single_instance;
 mod sink;
 mod style;
 mod tray;
@@ -211,6 +212,12 @@ fn main() -> eframe::Result<()> {
         runtime.block_on(run_check());
         return Ok(());
     }
+    // 单实例：托盘常驻时窗口只是藏起来，用户再点一次快捷方式就会起第二个进程，
+    // 通知区域于是多出一个同名图标。这里抢不到互斥体就把已有窗口拉到前台再退出。
+    // `--check` 是短命的一次性探测，不参与这个限制。
+    if !single_instance::claim() {
+        return Ok(());
+    }
     let runtime = Runtime::new().expect("创建 tokio 运行时失败");
     let runtime = Arc::new(runtime);
     let cfg = config::load();
@@ -236,7 +243,30 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
             style::apply(&cc.egui_ctx, cfg.theme);
-            Ok(Box::new(ui::App::new(app_runtime, cfg, tx, rx)))
+            // 托盘菜单要用原生句柄直接操作窗口（藏进托盘后 egui 的命令不一定生效）
+            let window_handle = native_window_handle(cc);
+            Ok(Box::new(ui::App::new(
+                app_runtime,
+                cfg,
+                tx,
+                rx,
+                window_handle,
+            )))
         }),
     )
+}
+
+/// 取主窗口的原生句柄：Windows 上是 HWND，其它平台返回 0（用不到）。
+fn native_window_handle(cc: &eframe::CreationContext<'_>) -> isize {
+    #[cfg(target_os = "windows")]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if let Ok(handle) = cc.window_handle() {
+            if let RawWindowHandle::Win32(w) = handle.as_raw() {
+                return w.hwnd.get();
+            }
+        }
+    }
+    let _ = cc;
+    0
 }

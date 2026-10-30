@@ -252,8 +252,58 @@ row("主机", "Host", "ホスト", "호스트", "Host", "Host", "Хост", "Hô
 - macOS Release 发布 `racewong-<版本>-macos-aarch64.dmg`，内含 ad-hoc 签名的 `.app`。
   当前未配置 Developer ID 和 Apple 公证，因此首次运行仍需用户在系统设置中手动放行。
 - 设置页的“检查并更新”调用 GitHub `releases/latest`。发现更高的语义化版本后自动下载
-  当前平台的 MSI/DMG；Windows 拉起 MSI 覆盖升级并退出旧进程，macOS 打开 DMG，
-  用户把应用拖入 Applications 覆盖旧版本。
+  当前平台的 MSI/DMG；Windows **完全静默覆盖升级**（`msiexec /qn`，不弹任何向导、
+  不要求点“下一步”），macOS 打开 DMG，用户把应用拖入 Applications 覆盖旧版本。
+
+### Windows 静默升级的细节
+
+- **安装位置沿用上一次**：更新器把当前 exe 所在目录作为 `INSTALLFOLDER=` 传给 MSI；
+  MSI 自己也会在安装时把路径写进 `HKCU\Software\racewong\RaceBoxSync\InstallDir`，
+  升级时用 `RegistrySearch` 读回来兜底（手动双击 MSI 升级走的是这条路）。
+  两条路径都保证“装哪儿就在哪儿升”，不会因为静默安装没人能改目录而被搬回默认位置。
+- **为什么不在进程里直接调 msiexec**：MSI 要覆盖的正是当前正在运行的 exe，Windows 上
+  被占用的文件无法替换。更新器会写一个短命 `cmd` 脚本到
+  `%TEMP%\racewong-update\apply-update.cmd`，等 2 秒让本进程退出、文件锁释放，
+  再执行 `msiexec /qn /norestart`，装完把程序重新拉起来。
+- **失败怎么查**：静默安装的完整日志在 `%TEMP%\racewong-update\install.log`。
+
+### 安装许可协议
+
+安装向导里有一页中文许可协议（欢迎 → **许可协议** → 安装目录 → 确认安装）。
+
+- 正文维护在 `app/installer/license.zh.txt`（UTF-8，人读）
+- 打包时由 `script/wix-license.ps1` 的 `ConvertTo-LicenseRtf` 转成 RTF 传给 WiX 的
+  `WixUILicenseRtf`——WiX 的许可页是 RichText 控件，只认 RTF，中文必须写成
+  `\uNNNN?` 转义，否则就是乱码
+- 改完协议不用手动转，`release.ps1` 生成 MSI 时会现转；想单独看产物：
+  `. .\script\wix-license.ps1` 后调 `ConvertTo-LicenseRtf`
+
+### 安装向导里的选项与品牌图
+
+向导一共四页：欢迎 → 许可协议 → **安装目录（含选项）** → 确认安装，装完是完成页。
+
+| 位置 | 内容 | 默认 |
+| --- | --- | --- |
+| 安装目录页 | `创建桌面快捷方式` 勾选框 | 勾上 |
+| 完成页 | `安装完成后启动 RaceBox同步` 勾选框 | 勾上 |
+
+- **桌面快捷方式**绑在 `DESKTOPSHORTCUT` 属性上（`CheckBoxValue="1"`），快捷方式单独放在
+  `DesktopShortcut` 组件里、组件条件是 `DESKTOPSHORTCUT = 1`，卸载时随组件一起消失。
+  取消勾选时 MSI 会把属性**清空**（不是置 0），所以条件写成 `= 1` 而不是 `<> 0`。
+  这个选择不跨版本记忆：属性被清空后再写进整型注册表值会直接让安装报错，不值得。
+- **安装目录页是整页替换的**：`WixUI_InstallDir` 没有能插控件的位置，只能在 `.wxs` 里
+  重写 `<Dialog Id="InstallDirDlg">`（WiX 链接器用本地定义覆盖扩展库里的那份）。
+  控件 Id、坐标、文案必须与 WiX 自带的那份逐字一致——`WixUI_InstallDir` 里
+  “点 Next / Back 去哪一页”的 `Publish` 是按 `Dialog + Control` 的 Id 挂上去的。
+- **品牌图**：`app/installer/banner.bmp`（493×58，各页顶部横幅）和
+  `dialog.bmp`（493×312，欢迎/完成页背景），由 `app/tools/make_installer_art.py` 生成，
+  和 exe 图标共用 `app/tools/racebox_mark.py` 里的同一份矢量数据。
+  两张图都按 493 宽设计、由 MSI 缩到 370 显示（WiX 自带素材也是这个套路）。
+  横幅上**只能把 logo 放右边**：WixUI 把每页的标题（X=15,Y=6）和描述（X=25,Y=23，
+  宽 280）透明地画在横幅上，左边是文字区，放 logo 会压字。
+- **其它常规项**：控制面板里的图标 / 说明 / 帮助链接 / 更新说明链接（`ARP*`）、
+  `Win+R` 能直接敲 `racewong-app`（App Paths，卸载时清掉）、
+  Windows 10 以下直接拒绝安装（蓝牙走 WinRT，`VersionNT >= 1000`）。
 
 ad-hoc 签名只保证 Apple Silicon 上应用包结构完整，并不建立 Gatekeeper 信任。以后取得
 Developer ID 后，应恢复正式签名和公证，再取消手动放行提示。
@@ -265,11 +315,22 @@ Developer ID 后，应恢复正式签名和公证，再取消手动放行提示�
 | `assets/icon.ico` | exe 资源图标（16/24/32/48/64/256，32 位带透明），由 `winres` 在 `build.rs` 中嵌入 |
 | `assets/icon256.png` | 运行时窗口图标，`main.rs` 里 `include_bytes!` + `eframe::icon_data::from_png_bytes` |
 
-两个图标都由 `app/tools/make_icon.py` 生成（Pillow 绘制：深蓝圆角方底 + 白色赛道走线 + 起点/终点标记）：
+两个图标都由 `app/tools/make_icon.py` 生成。图形直接用官网的品牌标记：从
+`https://www.racebox.pro/assets/img/RaceBoxLogo.svg` 里取出那条 marker path，
+按 M/C/S/V/H/L/Z 拍平成多边形（三次贝塞尔每段采样 24 点）后填充品牌红
+`#EA2127`、透明底，8 倍超采样再缩到目标尺寸——和官网 favicon 是同一个形状。
+不引 SVG 渲染库，是因为只为一枚图标装 cairosvg / resvg 不划算。
+
+拍平逻辑和标记数据单独放在 `app/tools/racebox_mark.py`，安装向导的两张品牌图
+（`installer/banner.bmp` / `installer/dialog.bmp`，见 §8）也用它，形状保证一致。
 
 ```powershell
-.venv\Scripts\python.exe app\tools\make_icon.py
+.venv\Scripts\python.exe app\tools\make_icon.py            # exe / 窗口 / 托盘图标
+.venv\Scripts\python.exe app\tools\make_installer_art.py  # 安装向导横幅与背景
 ```
+
+界面主题色也取自官网：主色 `#EA2127`，中性色 `#2C2C2C` / `#666` / `#808186` /
+`#F1F1F3` / `#E4E4EC`，见 `app/src/style.rs` 的 `palette()`。
 
 `build.rs` 行为：
 
@@ -381,13 +442,32 @@ cargo build --release
 | | Windows | macOS |
 | --- | --- | --- |
 | 位置 | 通知区域（右下角，可能在 `^` 折叠区） | 菜单栏右上角 |
-| 恢复窗口 | 右键 → 显示主窗口 | 点图标 → 显示主窗口 |
+| 恢复窗口 | 左键点图标，或右键 → 显示主窗口 | 点图标 → 显示主窗口 |
 | 退出 | 右键 → 退出 | 菜单 → 退出，或 Cmd+Q |
 | 进程残留 | 无 | 仍会出现在 Dock 与 Cmd+Tab 里 |
+
+**为什么托盘菜单要直接调 Win32**：窗口用 `ViewportCommand::Visible(false)` 藏起来之后，
+egui 侧的 `Visible(true)` / `Close` 命令经常落不了地——表现就是右键菜单里
+「显示主窗口」「退出」点了没反应，托盘图标赖在通知区域里，只能去任务管理器结束进程。
+所以 `src/tray.rs` 在菜单回调里直接用 HWND 调 `ShowWindow` / `PostMessage(WM_CLOSE)`，
+不依赖 egui 是否还在出帧；HWND 由 `main.rs` 从 `CreationContext::window_handle()` 取出后
+传给 `App`。队列只用来同步界面内部状态（`hidden_to_tray`），另外左键点图标也能唤回窗口，
+是菜单事件万一没送到时的备用路径。
 
 macOS 想做成「纯菜单栏应用」（不占 Dock），在 `script/release.sh` 生成的 `Info.plist`
 里加一行 `<key>LSUIElement</key><true/>` 即可；代价是 Dock 和 Cmd+Tab 里都看不到它，
 只能从菜单栏图标操作。
+
+**单实例**：`src/single_instance.rs` 在启动时抢一个命名互斥体
+（`Local\racewong-RaceBoxSync-single-instance`）。托盘常驻时窗口只是藏起来、进程还在，
+用户再点一次开始菜单快捷方式就会起第二个进程——两个进程各注册一个托盘图标，通知区域
+里于是出现两个一模一样的「RaceBox同步」，而且旧那个的窗口是隐藏的、点了也没反应。
+现在第二个进程发现互斥体已存在，就用 `FindWindowW("RaceBox")` 找到旧窗口、
+`ShowWindow` + `SetForegroundWindow` 把它拉回前台，然后自己退出（不弹任何提示）。
+互斥体建不出来或找不到旧窗口时一律放行，宁可多开也不能让用户点了打不开。
+
+**名称**：通知区域的 tooltip、关于面板、安装包与开始菜单快捷方式统一叫「RaceBox同步」
+（无空格）；其它语言显示 `RaceBox Sync`，品牌名不翻译。
 
 Linux 暂不支持托盘（`tray-icon` 的 Linux 后端要 GTK / AppIndicator 系统库，会把
 `cargo test` 和原生构建拖上系统依赖），选这一项会退回直接退出，设置页会给出提示。

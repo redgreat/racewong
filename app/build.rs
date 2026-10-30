@@ -69,7 +69,7 @@ fn main() {
         res.set("LegalCopyright", "racewong");
     } else {
         res.set("FileDescription", "RaceBox 蓝牙同步桌面应用");
-        res.set("ProductName", "RaceBox 同步");
+        res.set("ProductName", "RaceBox同步");
         res.set("LegalCopyright", "racewong");
     }
 
@@ -85,12 +85,9 @@ fn main() {
         ))
     };
 
-    match result {
-        Ok(()) => {
-            if !cfg!(windows) {
-                println!("cargo:warning=exe 图标已通过 llvm-rc 嵌入");
-            }
-        }
-        Err(e) => println!("cargo:warning=未能嵌入 exe 图标: {e}"),
+    // 成功不吭声：`cargo:warning` 会以警告的形式打到终端上，一行“已嵌入”夹在
+    // 编译输出里看着像出了问题。只有真的没嵌上才值得提醒。
+    if let Err(e) = result {
+        println!("cargo:warning=未能嵌入 exe 图标: {e}");
     }
 }

@@ -759,7 +759,7 @@ pub const ROWS: &[Row] = &[
     ),
     // ---------------- 主界面 ----------------
     row(
-        "RaceBox 同步",
+        "RaceBox同步",
         "RaceBox Sync",
         "RaceBox 同期",
         "RaceBox 동기화",

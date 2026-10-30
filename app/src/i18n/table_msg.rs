@@ -449,4 +449,16 @@ pub const ROWS: &[Row] = &[
         "{}, aber wegen fehlgeschlagener Uploads wurde der Gerätespeicher nicht gelöscht",
         "{}, ma ci sono stati invii falliti, quindi la memoria del dispositivo non è stata cancellata",
     ),
+    row(
+        "v{} 已下载，正在后台静默安装…",
+        "v{} downloaded; installing silently…",
+        "v{} をダウンロードしました。バックグラウンドでサイレントインストール中…",
+        "v{} 다운로드 완료. 백그라운드에서 자동 설치 중…",
+        "v{} transferido; a instalar silenciosamente em segundo plano…",
+        "v{} descargado; instalando en silencio en segundo plano…",
+        "v{} загружено; тихая установка в фоне…",
+        "v{} téléchargé ; installation silencieuse en arrière-plan…",
+        "v{} heruntergeladen; stille Installation läuft im Hintergrund…",
+        "v{} scaricato; installazione silenziosa in background…",
+    ),
 ];

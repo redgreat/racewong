@@ -3593,7 +3593,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "racewong-app"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-trait",
  "btleplug",
@@ -3604,6 +3604,7 @@ dependencies = [
  "flexi_logger",
  "futures-util",
  "log",
+ "raw-window-handle",
  "reqwest",
  "rumqttc",
  "semver",

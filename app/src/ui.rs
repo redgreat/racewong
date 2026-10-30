@@ -109,6 +109,11 @@ pub struct App {
     quit_requested: bool,
     /// 窗口当前是否被收进了托盘。
     hidden_to_tray: bool,
+    /// 主窗口的原生句柄（Windows 的 HWND；其它平台为 0）。
+    ///
+    /// 托盘菜单点击时直接用它把窗口拉回来 / 关掉：窗口藏进托盘后，
+    /// egui 侧的 `Visible(true)` / `Close` 命令经常落不了地。
+    window_handle: isize,
     update_tx: std::sync::mpsc::Sender<UpdateMsg>,
     update_rx: std::sync::mpsc::Receiver<UpdateMsg>,
     update_busy: bool,
@@ -121,6 +126,7 @@ impl App {
         cfg: Config,
         tx: UnboundedSender<UiEvent>,
         rx: UnboundedReceiver<UiEvent>,
+        window_handle: isize,
     ) -> Self {
         let pg_port_buf = cfg.pg.port.to_string();
         let mqtt_port_buf = cfg.mqtt.port.to_string();
@@ -179,6 +185,7 @@ impl App {
             tray_error: None,
             quit_requested: false,
             hidden_to_tray: false,
+            window_handle,
             update_tx,
             update_rx,
             update_busy: false,
@@ -203,7 +210,7 @@ impl App {
         let Some(ctx) = self.ctx.clone() else {
             return;
         };
-        match crate::tray::Tray::new(&ctx) {
+        match crate::tray::Tray::new(&ctx, self.window_handle) {
             Ok(tray) => {
                 self.tray = Some(tray);
                 self.tray_error = None;
@@ -216,6 +223,13 @@ impl App {
 
     /// 处理托盘菜单与窗口关闭请求。
     fn handle_close_and_tray(&mut self, ctx: &egui::Context) {
+        // 托盘里点了「退出」：标志位在点击时就立好了（窗口藏起来时不一定还有帧，
+        // 队列里的命令可能来不及消费），这里必须先认下来，否则下面会把这次
+        // 关闭请求当成「收进托盘」再 CancelClose 一次，窗口就再也关不掉了。
+        if crate::tray::quit_requested() {
+            self.quit_requested = true;
+        }
+
         // Windows 在主窗口不可见且没有其它界面动画时，可能不会因为托盘菜单回调里的
         // request_repaint() 及时进入下一次 update。保持一个很低频的心跳，让隐藏窗口后
         // “显示主窗口 / 退出”两条命令都一定会被消费；5 Hz 对空闲占用可以忽略。
@@ -451,7 +465,7 @@ impl App {
                 UpdateMsg::Downloaded(info, path) => match crate::updater::launch_installer(&path) {
                     Ok(()) => {
                         self.update_result = Some((
-                            tr!("v{} 安装包已下载，正在打开安装器…", "v{} downloaded; opening installer…", info.version),
+                            tr!("v{} 已下载，正在后台静默安装…", "v{} downloaded; installing silently…", info.version),
                             LogLevel::Success,
                         ));
                         #[cfg(target_os = "windows")]
@@ -1797,7 +1811,7 @@ impl eframe::App for App {
                         }
                         ui.add_space(8.0);
                         ui.label(
-                            egui::RichText::new(t!("RaceBox 同步", "RaceBox Sync"))
+                            egui::RichText::new(t!("RaceBox同步", "RaceBox Sync"))
                                 .strong()
                                 .size(18.0)
                                 .color(p.text),

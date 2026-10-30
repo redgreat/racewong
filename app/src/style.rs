@@ -2,6 +2,11 @@
 //!
 //! 所有颜色、圆角、间距都集中在这里，界面代码只通过 [`Palette`] 取色，
 //! 保证两个主题下观感一致。
+//!
+//! 配色跟 RaceBox 官网（racebox.pro）对齐：主色是品牌红 `#EA2127`，
+//! 中性色用官网的 `#2C2C2C` / `#666` / `#808186` / `#F1F1F3` / `#E4E4EC`。
+//! 只有 `info` 留了一支低饱和蓝——它同时是超链接色，纯红黑灰里没有能表示
+//! “可点、可看”的语义色，硬塞红色会和主按钮抢注意力。
 
 use eframe::egui::{self, Color32, CornerRadius, Margin, Stroke};
 
@@ -23,6 +28,11 @@ pub struct Palette {
     pub card_stroke: Color32,
     /// 输入框背景。
     pub edit_bg: Color32,
+    /// 进度环的底槽。
+    ///
+    /// 不能用 `edit_bg`：浅色下 `#F7F7F9` 压在 `#F1F1F3` 上、深色下 `#202022`
+    /// 压在 `#1A1A1C` 上，几乎看不出还有一条轨道，进度弧就成了孤零零一段。
+    pub track: Color32,
     /// 悬停浅底。
     pub hover: Color32,
     /// 主文字。
@@ -37,6 +47,9 @@ pub struct Palette {
     pub warn: Color32,
     pub error: Color32,
     /// 危险操作按钮底色（取消、清除内存等）。
+    ///
+    /// 主色本身就是红色，这里再用红就和「开始同步」分不出来了，所以取消态用
+    /// 官网那种深炭色：状态一换，颜色明显变了，不用读文字也知道在跑。
     pub danger: Color32,
     pub info: Color32,
 }
@@ -45,39 +58,41 @@ pub fn palette(theme: Theme) -> Palette {
     match theme {
         Theme::Dark => Palette {
             theme,
-            bg: Color32::from_rgb(0x14, 0x16, 0x1a),
-            header: Color32::from_rgb(0x1b, 0x1e, 0x24),
-            card: Color32::from_rgb(0x20, 0x24, 0x2b),
-            card_stroke: Color32::from_rgb(0x2e, 0x34, 0x3d),
-            edit_bg: Color32::from_rgb(0x16, 0x19, 0x1f),
-            hover: Color32::from_rgb(0x2a, 0x30, 0x39),
-            text: Color32::from_rgb(0xe8, 0xea, 0xed),
-            muted: Color32::from_rgb(0x99, 0xa2, 0xad),
-            accent: Color32::from_rgb(0x4c, 0x8d, 0xff),
+            bg: Color32::from_rgb(0x1a, 0x1a, 0x1c),
+            header: Color32::from_rgb(0x23, 0x23, 0x25),
+            card: Color32::from_rgb(0x2c, 0x2c, 0x2e),
+            card_stroke: Color32::from_rgb(0x3b, 0x3b, 0x3f),
+            edit_bg: Color32::from_rgb(0x20, 0x20, 0x22),
+            track: Color32::from_rgb(0x3b, 0x3b, 0x3f),
+            hover: Color32::from_rgb(0x38, 0x38, 0x3c),
+            text: Color32::from_rgb(0xec, 0xec, 0xee),
+            muted: Color32::from_rgb(0x9b, 0x9b, 0xa1),
+            accent: Color32::from_rgb(0xea, 0x21, 0x27),
             accent_text: Color32::WHITE,
             success: Color32::from_rgb(0x3f, 0xb9, 0x50),
             warn: Color32::from_rgb(0xd2, 0x99, 0x22),
             error: Color32::from_rgb(0xf8, 0x51, 0x49),
-            danger: Color32::from_rgb(0xc4, 0x3c, 0x33),
-            info: Color32::from_rgb(0x6c, 0xb6, 0xff),
+            danger: Color32::from_rgb(0x4c, 0x4c, 0x50),
+            info: Color32::from_rgb(0x8f, 0xb0, 0xd4),
         },
         Theme::Light => Palette {
             theme,
-            bg: Color32::from_rgb(0xf2, 0xf4, 0xf7),
+            bg: Color32::from_rgb(0xf1, 0xf1, 0xf3),
             header: Color32::WHITE,
             card: Color32::WHITE,
-            card_stroke: Color32::from_rgb(0xd8, 0xdd, 0xe4),
-            edit_bg: Color32::from_rgb(0xf6, 0xf8, 0xfa),
-            hover: Color32::from_rgb(0xe8, 0xee, 0xf7),
-            text: Color32::from_rgb(0x1f, 0x23, 0x28),
-            muted: Color32::from_rgb(0x5c, 0x66, 0x70),
-            accent: Color32::from_rgb(0x25, 0x63, 0xeb),
+            card_stroke: Color32::from_rgb(0xe4, 0xe4, 0xec),
+            edit_bg: Color32::from_rgb(0xf7, 0xf7, 0xf9),
+            track: Color32::from_rgb(0xe4, 0xe4, 0xec),
+            hover: Color32::from_rgb(0xef, 0xef, 0xf3),
+            text: Color32::from_rgb(0x2c, 0x2c, 0x2c),
+            muted: Color32::from_rgb(0x6e, 0x6f, 0x75),
+            accent: Color32::from_rgb(0xea, 0x21, 0x27),
             accent_text: Color32::WHITE,
-            success: Color32::from_rgb(0x1a, 0x7f, 0x37),
-            warn: Color32::from_rgb(0x9a, 0x67, 0x00),
-            error: Color32::from_rgb(0xcf, 0x22, 0x2e),
-            danger: Color32::from_rgb(0xcf, 0x22, 0x2e),
-            info: Color32::from_rgb(0x09, 0x63, 0xd8),
+            success: Color32::from_rgb(0x17, 0x80, 0x3d),
+            warn: Color32::from_rgb(0xb4, 0x53, 0x09),
+            error: Color32::from_rgb(0xc8, 0x1e, 0x24),
+            danger: Color32::from_rgb(0x2c, 0x2c, 0x2c),
+            info: Color32::from_rgb(0x4f, 0x6b, 0x8a),
         },
     }
 }
@@ -490,16 +505,16 @@ pub fn theme_card(ui: &mut egui::Ui, p: &Palette, selected: bool, label: &str, d
     let preview = egui::Rect::from_min_size(rect.min, egui::vec2(132.0, 68.0));
     let (bg, header, line, accent) = if dark {
         (
-            Color32::from_rgb(0x14, 0x16, 0x1a),
-            Color32::from_rgb(0x1b, 0x1e, 0x24),
-            Color32::from_rgb(0x3a, 0x40, 0x4a),
+            Color32::from_rgb(0x1a, 0x1a, 0x1c),
+            Color32::from_rgb(0x23, 0x23, 0x25),
+            Color32::from_rgb(0x45, 0x45, 0x4a),
             p.accent,
         )
     } else {
         (
-            Color32::from_rgb(0xf2, 0xf4, 0xf7),
+            Color32::from_rgb(0xf1, 0xf1, 0xf3),
             Color32::WHITE,
-            Color32::from_rgb(0xd8, 0xdd, 0xe4),
+            Color32::from_rgb(0xe4, 0xe4, 0xec),
             p.accent,
         )
     };
@@ -657,13 +672,13 @@ pub fn round_action_button(
         RingMode::Dual { download, upload } => {
             // 外圈：上传进度
             ui.painter()
-                .circle_stroke(c, r_ring2, Stroke::new(ring_w, p.edit_bg));
+                .circle_stroke(c, r_ring2, Stroke::new(ring_w, p.track));
             if let Some(f) = upload {
                 arc(r_ring2, f, p.accent);
             }
             // 内圈：下载进度（未知时转圈）
             ui.painter()
-                .circle_stroke(c, r_ring1, Stroke::new(ring_w, p.edit_bg));
+                .circle_stroke(c, r_ring1, Stroke::new(ring_w, p.track));
             match download {
                 Some(f) => arc(r_ring1, f, p.success),
                 None if running => spinner(r_ring1, p.info),
@@ -674,7 +689,7 @@ pub fn round_action_button(
             // 单环同样贴在大圆上，并补一条浅色轨道：
             // 只有一段弧孤零零飘着会很奇怪，有轨道才像“进度条绕了一圈”
             ui.painter()
-                .circle_stroke(c, r_ring1, Stroke::new(ring_w, p.edit_bg));
+                .circle_stroke(c, r_ring1, Stroke::new(ring_w, p.track));
             match progress {
                 Some(f) => arc(r_ring1, f, color),
                 None if running => spinner(r_ring1, color),

@@ -29,6 +29,11 @@ log = "0.4"
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 tray-icon = "0.19"
 
+# 取主窗口的 HWND（托盘菜单直接操作窗口用）。
+# eframe / winit 本来就依赖同一个 0.6，这里只是显式声明，不会多编译一份。
+[target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle = "0.6"
+
 [build-dependencies]
 winres = "0.1"
 
