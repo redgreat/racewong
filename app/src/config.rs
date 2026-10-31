@@ -4,6 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const DEFAULT_MQTT_TOPIC: &str = "deskwong/racebox/data";
+pub const DEFAULT_MQTT_CLIENT_ID: &str = "racewong-app";
+/// 端口没填时用的默认值。
+///
+/// 默认配置里端口是 0（= 没填），不是 5432 / 1883：装完打开设置页不该看到
+/// 任何别人的地址信息，端口也一并不预填，真要用的时候再填。
+pub const DEFAULT_PG_PORT: u16 = 5432;
+pub const DEFAULT_MQTT_PORT: u16 = 1883;
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct PgConfig {
@@ -16,11 +23,12 @@ pub struct PgConfig {
 
 impl Default for PgConfig {
     fn default() -> Self {
+        // 首次安装不带任何地址信息：装的是别人的机器，别把开发者的库地址塞给用户
         Self {
-            host: "fn.wongcw.cn".to_string(),
-            port: 8432,
-            database: "eadm".to_string(),
-            user: "user_eadm".to_string(),
+            host: String::new(),
+            port: 0,
+            database: String::new(),
+            user: String::new(),
             password: String::new(),
         }
     }
@@ -29,6 +37,15 @@ impl Default for PgConfig {
 impl PgConfig {
     pub fn ready(&self) -> bool {
         !self.host.trim().is_empty() && !self.database.trim().is_empty() && !self.user.trim().is_empty()
+    }
+
+    /// 端口没填（0）时用 PostgreSQL 的默认端口。
+    pub fn port_or_default(&self) -> u16 {
+        if self.port == 0 {
+            DEFAULT_PG_PORT
+        } else {
+            self.port
+        }
     }
 }
 
@@ -51,13 +68,14 @@ fn default_keepalive() -> u32 {
 
 impl Default for MqttConfig {
     fn default() -> Self {
+        // 同 PgConfig：Broker / 端口 / 主题都不预填，弹窗里只用灰色提示给出建议值
         Self {
-            broker: "127.0.0.1".to_string(),
-            port: 1883,
+            broker: String::new(),
+            port: 0,
             user: String::new(),
             password: String::new(),
-            topic: DEFAULT_MQTT_TOPIC.to_string(),
-            client_id: "racewong-app".to_string(),
+            topic: String::new(),
+            client_id: String::new(),
             keepalive_secs: default_keepalive(),
         }
     }
@@ -65,7 +83,32 @@ impl Default for MqttConfig {
 
 impl MqttConfig {
     pub fn ready(&self) -> bool {
-        !self.broker.trim().is_empty() && self.port > 0 && !self.topic.trim().is_empty()
+        !self.broker.trim().is_empty()
+    }
+
+    /// 端口没填（0）时用 MQTT 的默认端口。
+    pub fn port_or_default(&self) -> u16 {
+        if self.port == 0 {
+            DEFAULT_MQTT_PORT
+        } else {
+            self.port
+        }
+    }
+
+    /// 主题 / Client ID 允许留空：留空就用内置的默认值，弹窗里那两个灰色
+    /// 提示文字写的就是它们。
+    pub fn topic_or_default(&self) -> &str {
+        match self.topic.trim() {
+            "" => DEFAULT_MQTT_TOPIC,
+            t => t,
+        }
+    }
+
+    pub fn client_id_or_default(&self) -> &str {
+        match self.client_id.trim() {
+            "" => DEFAULT_MQTT_CLIENT_ID,
+            id => id,
+        }
     }
 }
 

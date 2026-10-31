@@ -113,7 +113,7 @@ async fn connect(cfg: &PgConfig) -> Result<tokio_postgres::Client, SinkError> {
     let mut pg_cfg = tokio_postgres::Config::new();
     pg_cfg
         .host(&cfg.host)
-        .port(cfg.port)
+        .port(cfg.port_or_default())
         .dbname(&cfg.database)
         .user(&cfg.user)
         .password(&cfg.password);

@@ -216,8 +216,11 @@ pub fn window(p: &Palette) -> egui::Frame {
 ///
 /// egui 没有内置「模态窗口」，不加这层的话弹窗开着时照样能点后面的返回、
 /// 设置、输入框——看起来像弹窗，实际还在操作背后的页面。
-/// 画在 `Order::Middle`，且要在弹窗之前创建：同层按创建顺序叠放，
-/// 这样它在面板（Background）之上、弹窗之下。
+///
+/// **必须画在 `Order::Middle`，调用方的弹窗则要显式 `Order::Foreground`。**
+/// 同一层里的 Area 会按「最后被点过的」重新排序：遮罩是可交互的，用户点一下
+/// 背景，egui 就把它提到同层最上面——弹窗被压在下面，整窗变灰、点不动也关不掉。
+/// 分到两层之后两者永远不会互换位置。
 pub fn modal_shield(ctx: &egui::Context, p: &Palette) {
     let screen = ctx.screen_rect();
     egui::Area::new(egui::Id::new("modal_shield"))
@@ -295,62 +298,42 @@ pub fn tab_button_sized(
     resp
 }
 
+/// 按钮文字的左右内边距之和（一边 18px）。
+///
+/// [`row_button_width`] 和 [`outline_button_impl`] 共用这个数：算宽度时按
+/// “文字 + 36”，画的时候再把文字宽度限制在“按钮宽 - 24”，两边口径一致，
+/// 中文下就不会出现“算出来 92px、画出来却截了两个字”的错位。
+const BUTTON_PAD_X: f32 = 36.0;
+
 /// 描边按钮：透明底 + 细边框，悬停有浅底；`enabled=false` 时置灰不可点。
+///
+/// `size.x` 是**精确**宽度，不是最小宽度：文字放不下就截断加省略号，
+/// 绝不把按钮顶宽。原来这里是 `max(min_size.x, 文字宽 + 36)`，遇到德/俄/葡
+/// 这种译文比中文长一截的语言，三个按钮会被各自的文字撑成三种宽度、
+/// 整行顶出卡片右边——主页那排「查询状态 / 清除内存 / 本地文件」就是这么歪的。
 pub fn outline_button(
     ui: &mut egui::Ui,
     p: &Palette,
     label: &str,
     text_color: Color32,
-    min_size: egui::Vec2,
+    size: egui::Vec2,
     enabled: bool,
 ) -> egui::Response {
-    let (text_color, border) = if enabled {
-        (text_color, p.card_stroke)
-    } else {
-        (p.muted, p.card_stroke)
-    };
-    let font = egui::FontId::proportional(14.0);
-    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font.clone(), text_color));
-    let size = egui::vec2(
-        min_size.x.max(galley.size().x + 36.0),
-        min_size.y,
-    );
-    let sense = if enabled {
-        egui::Sense::click()
-    } else {
-        egui::Sense::hover()
-    };
-    let (rect, resp) = ui.allocate_at_least(size, sense);
-    let bg = if resp.hovered() && enabled {
-        p.hover
-    } else {
-        Color32::TRANSPARENT
-    };
-    ui.painter().rect_filled(rect, CornerRadius::same(6), bg);
-    ui.painter().rect_stroke(
-        rect,
-        CornerRadius::same(6),
-        Stroke::new(1.0_f32, border),
-        egui::epaint::StrokeKind::Inside,
-    );
-    let pos = rect.center() - galley.size() / 2.0;
-    ui.painter().galley(pos, galley, text_color);
-    resp
+    outline_button_impl(ui, p, label, text_color, size, enabled, false)
 }
 
 /// 描边按钮，但多一个「已选中」状态：选中时是强调色实心胶囊。
 ///
-/// 用来做“切换开关”类的按钮（比如主页上的「选择本地文件」）：点一下打开、
+/// 用来做“切换开关”类的按钮（比如主页上的「本地文件」）：点一下打开、
 /// 再点一下关掉，光靠描边看不出来现在是开还是关，所以选中态必须有实色。
 pub fn toggle_outline_button(
     ui: &mut egui::Ui,
     p: &Palette,
     label: &str,
     selected: bool,
-    min_size: egui::Vec2,
+    size: egui::Vec2,
     enabled: bool,
 ) -> egui::Response {
-    let font = egui::FontId::proportional(14.0);
     let text_color = if selected {
         p.accent_text
     } else if enabled {
@@ -358,10 +341,30 @@ pub fn toggle_outline_button(
     } else {
         p.muted
     };
-    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font, text_color));
-    let size = egui::vec2(
-        min_size.x.max(galley.size().x + 36.0),
-        min_size.y,
+    outline_button_impl(ui, p, label, text_color, size, enabled, selected)
+}
+
+fn outline_button_impl(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    text_color: Color32,
+    size: egui::Vec2,
+    enabled: bool,
+    selected: bool,
+) -> egui::Response {
+    let text_color = if enabled || selected {
+        text_color
+    } else {
+        p.muted
+    };
+    // 文字比按钮宽就截断（`Truncate` 会补一个省略号），不让它顶出边框
+    let galley = elide_line(
+        ui,
+        label,
+        egui::FontId::proportional(14.0),
+        text_color,
+        (size.x - (BUTTON_PAD_X - 12.0)).max(16.0),
     );
     let sense = if enabled {
         egui::Sense::click()
@@ -387,6 +390,71 @@ pub fn toggle_outline_button(
     let pos = rect.center() - galley.size() / 2.0;
     ui.painter().galley(pos, galley, text_color);
     resp
+}
+
+/// 一行里几个等宽按钮该用多宽。
+///
+/// 三条约束一起生效：
+///
+/// * **等宽**：一排按钮长短不齐比多留点白更难看，等宽才像一组控件；
+/// * **跟窗口走**：宽度在 `[min_w, max_w]` 之间随可用宽度伸缩，写死 150 的话
+///   宽窗口里三个键缩在中间一小坨、两边空一大片；
+/// * **装得下最长译文**：俄/葡/西的译文比中文长一截，按最长的那条算，
+///   再配合 [`outline_button`] 的截断兜底，任何语言都不会顶出卡片。
+///
+/// `max_w` 封顶还有个好处：这排按钮的宽度基本不随语言变，切换语言时整行
+/// 不会左右跳一下。
+pub fn row_button_width(
+    ui: &egui::Ui,
+    labels: &[&str],
+    gap: f32,
+    min_w: f32,
+    max_w: f32,
+) -> f32 {
+    let widest = labels
+        .iter()
+        .fold(0.0_f32, |acc, label| acc.max(text_width(ui, label, 14.0)));
+    let n = labels.len().max(1) as f32;
+    // 先把整行按 `max_w` 铺开（中文四个字也给到 200，不然三个键缩在中间一小坨），
+    // 译文比 `max_w` 还宽就按译文来，再被可用宽度压窄，最后不低于 `min_w`。
+    let room = (ui.available_width() - gap * (n - 1.0)) / n;
+    max_w
+        .max(widest + BUTTON_PAD_X)
+        .min(room)
+        .max(min_w)
+}
+
+/// 一段文字按指定字号排出来有多宽（不换行）。
+///
+/// 用来在排布之前算宽度：译文长度随语言变，凡是“给后面的控件留位置”的
+/// 硬编码常数（比如本地文件卡里那个 `- 230.0`）都该换成现算。
+pub fn text_width(ui: &egui::Ui, text: &str, size: f32) -> f32 {
+    ui.fonts(|f| {
+        f.layout_no_wrap(
+            text.to_owned(),
+            egui::FontId::proportional(size),
+            Color32::WHITE,
+        )
+        .size()
+        .x
+    })
+}
+
+/// 单行文字，超过 `max_w` 就截断并补省略号。
+fn elide_line(
+    ui: &egui::Ui,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+    max_w: f32,
+) -> std::sync::Arc<egui::Galley> {
+    egui::WidgetText::from(egui::RichText::new(text.to_owned()).font(font).color(color))
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            max_w,
+            egui::FontSelection::Default,
+        )
 }
 
 /// 弹窗底部的一对按钮：两个等宽、整体居中（不再从左边排起）。
@@ -426,22 +494,30 @@ pub fn dialog_buttons(
 }
 
 /// 弹窗里的一行字段：小号标签在上、输入框撑满宽度。
+///
+/// `hint` 是**灰色提示文字**：输入框空着才显示，一填东西就消失。用它的地方
+/// 是有建议值但不该预填的字段（比如 MQTT 的主题 / Client ID）——预填进去等于
+/// 替用户做了决定，用户还得先删掉才能写自己的。
 pub fn dialog_field(
     ui: &mut egui::Ui,
     p: &Palette,
     label: &str,
     value: &mut String,
+    hint: &str,
     password: bool,
     revealed: bool,
-) {
+) -> egui::Response {
     ui.colored_label(p.muted, label.to_owned());
     ui.add_space(4.0);
-    let mut edit = egui::TextEdit::singleline(value).desired_width(f32::INFINITY);
+    let mut edit = egui::TextEdit::singleline(value)
+        .hint_text(hint.to_owned())
+        .desired_width(f32::INFINITY);
     if password && !revealed {
         edit = edit.password(true);
     }
-    ui.add(edit);
+    let resp = ui.add(edit);
     ui.add_space(8.0);
+    resp
 }
 
 /// 小号圆角按钮（日志抽屉的收起/清空）。
@@ -654,6 +730,8 @@ pub fn status_banner(ui: &mut egui::Ui, p: &Palette, color: Color32, text: &str)
         .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::symmetric(10, 8))
         .show(ui, |ui| {
+            // 测试失败的提示常常比容器宽（弹窗只有 340px），不强制换行就会顶出边框
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             ui.colored_label(
                 color,
                 egui::RichText::new(text.to_owned()).strong(),

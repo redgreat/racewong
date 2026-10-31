@@ -41,8 +41,8 @@ impl MqttSink {
         // 同一台机器上可能同时存在多个连接（例如设置页的探测连接还开着），
         // client_id 完全相同会被 broker 踢掉其中一个，所以每次连接都加随机后缀。
         let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
-        let client_id = format!("{}-{suffix}", cfg.client_id.trim());
-        let mut options = MqttOptions::new(client_id, cfg.broker.clone(), cfg.port);
+        let client_id = format!("{}-{suffix}", cfg.client_id_or_default());
+        let mut options = MqttOptions::new(client_id, cfg.broker.clone(), cfg.port_or_default());
         if !cfg.user.trim().is_empty() {
             options.set_credentials(cfg.user.clone(), cfg.password.clone());
         }
@@ -120,14 +120,14 @@ impl MqttSink {
                 "连接 broker {}:{} 超时",
                 "timed out connecting to broker {}:{}",
                 sink.cfg.broker,
-                sink.cfg.port
+                sink.cfg.port_or_default()
             )
         } else {
             tr!(
                 "连接 broker {}:{} 失败: {detail}",
                 "failed to connect to broker {}:{}: {detail}",
                 sink.cfg.broker,
-                sink.cfg.port
+                sink.cfg.port_or_default()
             )
         };
         Err(SinkError::Mqtt(msg))
@@ -243,7 +243,7 @@ impl DataSink for MqttSink {
             let end = (sent + CHUNK).min(batch_count);
             for frame in &frames[sent..end] {
                 self.client
-                    .publish(self.cfg.topic.clone(), QoS::AtLeastOnce, false, frame.clone())
+                    .publish(self.cfg.topic_or_default().to_string(), QoS::AtLeastOnce, false, frame.clone())
                     .await
                     .map_err(|e| {
                         if self.is_connected() {
@@ -262,7 +262,7 @@ impl DataSink for MqttSink {
             self.wait_acks(end - sent).await?;
             log::info!(
                 "MQTT 已确认批次: 主题={}, 批次 {}-{}/{}, 记录={}",
-                self.cfg.topic,
+                self.cfg.topic_or_default(),
                 sent + 1,
                 end,
                 batch_count,

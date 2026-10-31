@@ -412,7 +412,7 @@ impl CloudState {
 
     /// 同步页下方的「本地文件」卡：路径 + 扫描 + 勾选列表。
     ///
-    /// 只在主页点了「选择本地文件」之后才画（见 `ui.rs`）。卡右上角是
+    /// 只在主页点了「本地文件」之后才画（见 `ui.rs`）。卡右上角是
     /// 「取消本地上传」，点它把主页切回设备同步，这张卡就收起来。
     /// 返回 `true` 表示用户点了取消。
     ///
@@ -463,8 +463,24 @@ impl CloudState {
             // 「扫描」放最后（用户标注的要求），但不用 right_to_left 把它顶到最右——
             // 那样它和前面的按钮之间会空出一大截，看着像少画了什么。
             ui.horizontal(|ui| {
-                // 地址栏太长会把后面的按钮挤出卡片，给一个上限（用户标注：不要太长）
-                let path_w = (ui.available_width() - 230.0).clamp(140.0, 340.0);
+                // 地址栏太长会把后面的按钮挤出卡片，给一个上限（用户标注：不要太长）。
+                // 后面两个按钮的宽度跟着语言变（德语「Ordner wählen…」比「选择文件夹…」
+                // 长一截），所以预留宽度得现算，不能写死 230——写死的话长译文会把
+                // 「扫描」顶到卡片外面。
+                // 按钮宽度 = max(最小宽度, 文字 + 左右内边距)：
+                // 「选择文件夹…」是 secondary_button（最小 96），「扫描」是
+                // small_button（最小 56），短译文下是下限说了算，别漏掉。
+                let choose_w = (style::text_width(ui, t!("选择文件夹…", "Choose folder…"), 14.0)
+                    + 24.0)
+                    .max(96.0);
+                let scan_w = (style::text_width(ui, t!("扫描", "Scan"), 14.0) + 24.0).max(56.0);
+                let reserve = choose_w
+                    + scan_w
+                    + 10.0 // 路径框和「选择文件夹…」之间
+                    + 6.0 // 两个按钮之间
+                    + 8.0 * 2.0 // 路径框后、第一个按钮后各有一次 item_spacing
+                    + 4.0; // 余量：描边和取整误差
+                let path_w = (ui.available_width() - reserve).clamp(120.0, 340.0);
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut self.dir)
                         .hint_text(t!("文件夹路径", "folder path"))

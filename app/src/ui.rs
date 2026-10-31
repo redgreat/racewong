@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::config::{self, CloseAction, Config, SinkMode, Theme};
+use crate::config::{self, CloseAction, Config, MqttConfig, PgConfig, SinkMode, Theme};
 use crate::i18n::Lang;
 use crate::protocol::DeviceStatus;
 use crate::style::{self, dialog_field, Palette};
@@ -127,6 +127,41 @@ struct ConnDraft {
     keepalive: String,
 }
 
+impl ConnDraft {
+    /// 草稿 → PostgreSQL 配置。
+    ///
+    /// 端口留空或写错都记成 0，连接时由 [`PgConfig::port_or_default`] 兜成 5432；
+    /// 这样「不填端口」和「填了默认端口」是一回事，不用在弹窗里塞默认值。
+    fn pg_config(&self) -> PgConfig {
+        PgConfig {
+            host: self.host.trim().to_string(),
+            port: self.port.trim().parse::<u16>().unwrap_or(0),
+            database: self.database.trim().to_string(),
+            user: self.user.clone(),
+            password: self.password.clone(),
+        }
+    }
+
+    /// 草稿 → MQTT 配置。主题 / Client ID 留空同样是「用默认值」，见
+    /// [`MqttConfig::topic_or_default`] / [`MqttConfig::client_id_or_default`]。
+    fn mqtt_config(&self) -> MqttConfig {
+        MqttConfig {
+            broker: self.host.trim().to_string(),
+            port: self.port.trim().parse::<u16>().unwrap_or(0),
+            user: self.user.clone(),
+            password: self.password.clone(),
+            topic: self.topic.trim().to_string(),
+            client_id: self.client_id.trim().to_string(),
+            keepalive_secs: self
+                .keepalive
+                .trim()
+                .parse::<u32>()
+                .unwrap_or(30)
+                .clamp(10, 300),
+        }
+    }
+}
+
 pub struct App {
     cfg: Config,
     runtime: Arc<Runtime>,
@@ -185,10 +220,7 @@ pub struct App {
     mqtt_test: TestState,
     /// 保存 / 放弃等操作的结果：(文字, 等级)。
     action_result: Option<(String, LogLevel)>,
-    pg_port_buf: String,
-    mqtt_port_buf: String,
     scan_timeout_buf: String,
-    keepalive_buf: String,
     /// 系统托盘图标：设置成“隐藏到托盘”且创建成功时才有。
     tray: Option<crate::tray::Tray>,
     /// 托盘创建失败的原因（设置页里提示用）。
@@ -208,6 +240,9 @@ pub struct App {
     update_result: Option<(String, LogLevel)>,
     /// 当前打开的编辑弹窗（凭据 / 云登录）。
     dialog: Option<Dialog>,
+    /// 因为「连接信息还没填」被拦下来的那次任务：弹窗填完就接着跑，
+    /// 不用让用户回去再点一次开始。
+    pending_run: Option<RunMode>,
     /// 关于窗口上一次的矩形：判断点击是不是落在窗口外要靠它。
     about_rect: Option<egui::Rect>,
 }
@@ -220,14 +255,11 @@ impl App {
         rx: UnboundedReceiver<UiEvent>,
         window_handle: isize,
     ) -> Self {
-        let pg_port_buf = cfg.pg.port.to_string();
-        let mqtt_port_buf = cfg.mqtt.port.to_string();
         let (probe_tx, probe_rx) = std::sync::mpsc::channel::<crate::sink::mqtt::MqttSink>();
         let (update_tx, update_rx) = std::sync::mpsc::channel::<UpdateMsg>();
         let applied_theme = cfg.theme;
         let settings_snapshot = cfg.clone();
         let scan_timeout_buf = cfg.scan_timeout_secs.to_string();
-        let keepalive_buf = cfg.mqtt.keepalive_secs.to_string();
         let cloud = crate::cloud_ui::CloudState::new(&cfg, window_handle);
         Self {
             cfg,
@@ -272,10 +304,7 @@ impl App {
             pg_test: TestState::default(),
             mqtt_test: TestState::default(),
             action_result: None,
-            pg_port_buf,
-            mqtt_port_buf,
             scan_timeout_buf,
-            keepalive_buf,
             tray: None,
             tray_error: None,
             quit_requested: false,
@@ -286,6 +315,7 @@ impl App {
             update_busy: false,
             update_result: None,
             dialog: None,
+            pending_run: None,
             about_rect: None,
         }
     }
@@ -407,21 +437,11 @@ impl App {
     }
 
     fn commit_edits(&mut self) {
-        if let Ok(port) = self.pg_port_buf.trim().parse::<u16>() {
-            self.cfg.pg.port = port;
-        }
-        if let Ok(port) = self.mqtt_port_buf.trim().parse::<u16>() {
-            self.cfg.mqtt.port = port;
-        }
-        // 数字项：解析失败时保留原值，并把缓冲区改回原值，避免显示和实际不一致
+        // 连接参数（端口 / 保活）只在弹窗里改，这里只剩页面上那个扫描超时
         if let Ok(secs) = self.scan_timeout_buf.trim().parse::<u32>() {
             self.cfg.scan_timeout_secs = secs.clamp(10, 120);
         }
         self.scan_timeout_buf = self.cfg.scan_timeout_secs.to_string();
-        if let Ok(secs) = self.keepalive_buf.trim().parse::<u32>() {
-            self.cfg.mqtt.keepalive_secs = secs.clamp(10, 300);
-        }
-        self.keepalive_buf = self.cfg.mqtt.keepalive_secs.to_string();
     }
 
     fn push_log(&mut self, level: LogLevel, message: String) {
@@ -666,6 +686,13 @@ impl App {
         if self.running {
             return;
         }
+        // 连接信息还没填就直接把填写窗口弹出来：放它跑下去的话，要等设备数据
+        // 全下完、到写入那一步才报错，白等一场。
+        if matches!(mode, RunMode::Sync) && !self.channel_ready() {
+            self.pending_run = Some(mode);
+            self.open_conn_dialog(self.active_target());
+            return;
+        }
         self.commit_edits();
         self.cancel_flag.store(false, Ordering::SeqCst);
         self.cancel_requested = false;
@@ -705,6 +732,12 @@ impl App {
     /// 和 [`Self::start`] 基本一样，只是后台跑的是 `worker::run_import`：
     /// 不碰蓝牙，数据来源换成磁盘上的文件，上传通道、进度、结果展示全共用。
     fn start_import(&mut self) {
+        // 同上：先确认上传通道填好了，再让用户挑文件
+        if !self.channel_ready() {
+            self.pending_run = Some(RunMode::Import);
+            self.open_conn_dialog(self.active_target());
+            return;
+        }
         let mut paths = self.cloud.selected_paths();
         if paths.is_empty() {
             // 一个都没勾就点「上传文件」：先把文件夹选择框弹出来，选完继续上传。
@@ -796,10 +829,7 @@ impl App {
 
     fn discard_edits(&mut self) {
         self.cfg = config::load();
-        self.pg_port_buf = self.cfg.pg.port.to_string();
-        self.mqtt_port_buf = self.cfg.mqtt.port.to_string();
         self.scan_timeout_buf = self.cfg.scan_timeout_secs.to_string();
-        self.keepalive_buf = self.cfg.mqtt.keepalive_secs.to_string();
         // 关闭行为可能被改过，托盘图标要跟着回退
         self.sync_tray();
         self.action_result = Some((
@@ -839,12 +869,20 @@ impl App {
         }
     }
 
-    fn test_pg(&mut self) {
+    /// 弹窗里点了「测试连接」：把草稿翻成配置去测。
+    fn start_conn_test(&mut self, target: ConnTarget, draft: &ConnDraft) {
+        match target {
+            ConnTarget::Pg => self.test_pg(draft.pg_config()),
+            ConnTarget::Mqtt => self.test_mqtt(draft.mqtt_config()),
+        }
+    }
+
+    /// 起一次 PostgreSQL 自检。`cfg` 是**要测的那组参数**：弹窗里测的是正在填的
+    /// 草稿，不是已保存的配置，所以参数从外面传进来。
+    fn test_pg(&mut self, cfg: PgConfig) {
         if self.running || self.pg_test.busy {
             return;
         }
-        self.commit_edits();
-        let cfg = self.cfg.pg.clone();
         let tx = self.tx.clone();
         let runtime = self.runtime.clone();
         self.pg_test.busy = true;
@@ -877,7 +915,7 @@ impl App {
                         "PostgreSQL 连接成功: {}:{}/{}（{detail}）",
                         "PostgreSQL is ready: {}:{}/{} ({detail})",
                         cfg.host,
-                        cfg.port,
+                        cfg.port_or_default(),
                         cfg.database
                     ),
                     LogLevel::Success,
@@ -919,12 +957,11 @@ impl App {
         });
     }
 
-    fn test_mqtt(&mut self) {
+    /// 起一次 MQTT 连接自检（参数同 [`Self::test_pg`]，测的是草稿）。
+    fn test_mqtt(&mut self, cfg: MqttConfig) {
         if self.running || self.mqtt_test.busy {
             return;
         }
-        self.commit_edits();
-        let cfg = self.cfg.mqtt.clone();
         let tx = self.tx.clone();
         let runtime = self.runtime.clone();
         let probe_tx = self.probe_tx.clone();
@@ -948,8 +985,8 @@ impl App {
                             "MQTT 连接成功: {}:{} (主题 {})",
                             "MQTT is ready: {}:{} (topic {})",
                             cfg.broker,
-                            cfg.port,
-                            cfg.topic
+                            cfg.port_or_default(),
+                            cfg.topic_or_default()
                         ),
                     });
                     // 连接留着不要立刻断，否则会打一条误导性的断开错误
@@ -1223,20 +1260,33 @@ impl App {
                 ui.add_space(8.0);
             }
 
-            // 查询状态 / 清除内存 / 选择本地文件：三个描边框居中。
+            // 查询状态 / 清除内存 / 本地文件：三个等宽描边框居中。
             // 第三个是「切换开关」：点一下打开下面的本地文件卡，再点一下（或点卡里的
             // 「取消本地上传」）收起来，所以它选中时是实心红，平时是描边。
             // （不用 horizontal_centered：它会把整行撑满剩余高度）
+            //
+            // 三个键等宽、按卡片宽度分摊（150~200px 之间），整行真正居中：
+            // 宽度要按最长的那条译文算（西/葡/俄比中文长一截），并且用 item_spacing
+            // 而不是 add_space 做间距，否则每个缝里会多叠 8px、整行被顶偏。
+            let row_labels = [
+                t!("查询状态", "Device status"),
+                t!("清除内存", "Erase memory"),
+                t!("本地文件", "Local files"),
+            ];
             ui.horizontal(|ui| {
-                let bw = 150.0;
                 let gap = 12.0;
-                let total = bw * 3.0 + gap * 2.0;
+                let bw = style::row_button_width(ui, &row_labels, gap, 150.0, 200.0);
+                let total = bw * row_labels.len() as f32 + gap * (row_labels.len() - 1) as f32;
                 let pad = ((ui.available_width() - total) / 2.0).max(0.0);
+                // 按钮之间的间距交给 item_spacing：`add_space` 只是推进光标，
+                // 下一个控件前面还会再叠一次 item_spacing，两处都给会比设计的
+                // 间距多出 8px（原来那版三个键之间就是这么变成 20px 的）
+                ui.spacing_mut().item_spacing.x = gap;
                 ui.add_space(pad);
                 if style::outline_button(
                     ui,
                     p,
-                    t!("查询状态", "Device status"),
+                    row_labels[0],
                     p.text,
                     egui::vec2(bw, 34.0),
                     !self.running,
@@ -1249,11 +1299,10 @@ impl App {
                 {
                     self.start(RunMode::Status);
                 }
-                ui.add_space(gap);
                 if style::outline_button(
                     ui,
                     p,
-                    t!("清除内存", "Erase memory"),
+                    row_labels[1],
                     if self.running { p.muted } else { p.error },
                     egui::vec2(bw, 34.0),
                     !self.running,
@@ -1266,11 +1315,10 @@ impl App {
                 {
                     self.start(RunMode::Erase);
                 }
-                ui.add_space(gap);
                 if style::toggle_outline_button(
                     ui,
                     p,
-                    t!("选择本地文件", "Local files"),
+                    row_labels[2],
                     files_mode,
                     egui::vec2(bw, 34.0),
                     !self.running,
@@ -1285,7 +1333,7 @@ impl App {
                         self.source = SyncSource::Device;
                     } else {
                         self.source = SyncSource::Files;
-                        // 打开卡片的同时就弹文件夹选择框：用户点「选择本地文件」时
+                        // 打开卡片的同时就弹文件夹选择框：用户点「本地文件」时
                         // 想的就是「让我挑一个目录」，先给一张空卡片还得再点一次是多余的。
                         // 已经有文件（上次记住的目录里扫出来的）就只切模式，不再弹。
                         if self.cloud.selected_paths().is_empty() {
@@ -1577,7 +1625,7 @@ impl App {
             });
         }
 
-        // ---------- 本地文件卡：只在点了「选择本地文件」后出现 ----------
+        // ---------- 本地文件卡：只在点了「本地文件」后出现 ----------
         // 上传本身不在这张卡里（整页只有上面那一个大圆），它只回答「这次传什么」。
         // 任务跑起来时收起来：那时屏幕上该看的是进度和结果，不是文件列表。
         // 拖文件进窗口随时都能用，所以 accept_dropped 不跟着这张卡一起藏。
@@ -1591,94 +1639,94 @@ impl App {
         }
     }
 
-    /// 连接参数摘要行。
+    /// 当前上传方式对应的那一路连接参数。
+    fn active_target(&self) -> ConnTarget {
+        match self.cfg.sink_mode {
+            SinkMode::Database => ConnTarget::Pg,
+            SinkMode::Mqtt => ConnTarget::Mqtt,
+        }
+    }
+
+    /// 当前上传通道的连接信息填全了没。
+    fn channel_ready(&self) -> bool {
+        match self.active_target() {
+            ConnTarget::Pg => self.cfg.pg.ready(),
+            ConnTarget::Mqtt => self.cfg.mqtt.ready(),
+        }
+    }
+
+    /// 打开某一路上传通道的填写弹窗。
+    fn open_conn_dialog(&mut self, target: ConnTarget) {
+        let draft = self.conn_draft(target);
+        // 上次测试的结论是给旧参数看的，换一份参数就清掉
+        match target {
+            ConnTarget::Pg => self.pg_test.result.clear(),
+            ConnTarget::Mqtt => self.mqtt_test.result.clear(),
+        }
+        self.dialog = Some(Dialog::Connection {
+            target,
+            draft,
+            revealed: false,
+        });
+    }
+
+    /// 「上传方式」卡下半截：当前通道配好了没 + 唯一的填写入口。
     ///
-    /// PostgreSQL / MQTT 的主机、端口、账号密码一律不在页面上摆输入框：页面只留
-    /// 「连到哪儿 + 密码有没有设」两行和一个「修改」按钮，真正的字段在弹窗里填。
-    fn conn_summary_row(&mut self, ui: &mut egui::Ui, p: &Palette, target: ConnTarget) {
-        let (host, summary, password) = match target {
-            ConnTarget::Pg => {
-                let c = &self.cfg.pg;
-                (
-                    c.host.clone(),
-                    format!("{}@{}:{}/{}", c.user, c.host, c.port, c.database),
-                    c.password.clone(),
-                )
-            }
-            ConnTarget::Mqtt => {
-                let c = &self.cfg.mqtt;
-                (
-                    c.broker.clone(),
-                    format!("{}:{} → {}", c.broker, c.port, c.topic),
-                    c.password.clone(),
-                )
-            }
+    /// 页面上**不显示任何连接信息**（主机、账号、密码一个都不露），只留一个状态
+    /// 和一个按钮——那些东西全在弹窗里，改完才落到配置里。
+    fn channel_row(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let target = self.active_target();
+        let (name, ready) = match target {
+            ConnTarget::Pg => ("PostgreSQL", self.cfg.pg.ready()),
+            ConnTarget::Mqtt => ("MQTT", self.cfg.mqtt.ready()),
         };
         ui.horizontal(|ui| {
-            ui.colored_label(p.muted, t!("连接", "Connection"));
-            ui.add_space(12.0);
-            if host.is_empty() {
-                ui.colored_label(
-                    p.muted,
-                    t!("还没配置，点右边「修改」填写", "not configured yet — press Edit"),
-                );
+            ui.colored_label(p.text, name);
+            ui.add_space(10.0);
+            if ready {
+                ui.colored_label(p.success, t!("已填写", "configured"));
             } else {
-                ui.colored_label(p.text, summary);
+                ui.colored_label(p.warn, t!("还没填写连接信息", "not configured yet"));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .add(style::secondary_button(p, t!("修改", "Edit")))
+                    .add(style::secondary_button(p, t!("填写连接…", "Connection…")))
+                    .on_hover_text(match target {
+                        ConnTarget::Pg => t!(
+                            "同步前会先探一次连通性，连不上就直接停下，不会先把设备数据白下一遍。",
+                            "Connectivity is probed before syncing; if it fails, the run stops without downloading anything."
+                        ),
+                        ConnTarget::Mqtt => t!(
+                            "连接时会等 CONNACK，拿不到就当作通道不可用，直接停止本次同步。",
+                            "Connecting waits for CONNACK; if it never arrives the channel counts as unusable and the sync stops."
+                        ),
+                    })
                     .clicked()
                 {
-                    let draft = self.conn_draft(target);
-                    self.dialog = Some(Dialog::Connection {
-                        target,
-                        draft,
-                        revealed: false,
-                    });
+                    self.open_conn_dialog(target);
                 }
             });
-        });
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.colored_label(p.muted, t!("账号", "Account"));
-            ui.add_space(12.0);
-            let user = match target {
-                ConnTarget::Pg => &self.cfg.pg.user,
-                ConnTarget::Mqtt => &self.cfg.mqtt.user,
-            };
-            if user.is_empty() {
-                ui.colored_label(p.muted, t!("未设置", "not set"));
-            } else {
-                ui.colored_label(p.text, user.clone());
-            }
-            ui.add_space(20.0);
-            ui.colored_label(p.muted, t!("密码", "Password"));
-            ui.add_space(12.0);
-            if password.is_empty() {
-                ui.colored_label(p.muted, t!("未设置", "not set"));
-            } else {
-                // 有多少位用圆点提示一下，但不泄露内容
-                ui.colored_label(
-                    p.text,
-                    format!(
-                        "{} · {}",
-                        "•".repeat(password.chars().count().min(12)),
-                        t!("已设置", "set")
-                    ),
-                );
-            }
         });
     }
 
     /// 打开连接参数弹窗时的初始值。
+    ///
+    /// 端口为 0（= 没填）时给空串，弹窗里就不会出现一个「0」；
+    /// 主题 / Client ID 没填时也是空串，靠输入框的灰色提示给出建议值。
     fn conn_draft(&self, target: ConnTarget) -> ConnDraft {
+        fn port_text(port: u16) -> String {
+            if port == 0 {
+                String::new()
+            } else {
+                port.to_string()
+            }
+        }
         match target {
             ConnTarget::Pg => {
                 let c = &self.cfg.pg;
                 ConnDraft {
                     host: c.host.clone(),
-                    port: c.port.to_string(),
+                    port: port_text(c.port),
                     database: c.database.clone(),
                     user: c.user.clone(),
                     password: c.password.clone(),
@@ -1691,7 +1739,7 @@ impl App {
                 let c = &self.cfg.mqtt;
                 ConnDraft {
                     host: c.broker.clone(),
-                    port: c.port.to_string(),
+                    port: port_text(c.port),
                     database: String::new(),
                     user: c.user.clone(),
                     password: c.password.clone(),
@@ -1703,36 +1751,11 @@ impl App {
         }
     }
 
-    /// 弹窗里点「确定」后把草稿写回配置（端口这类数字解析失败就保留原值）。
+    /// 弹窗里点「确定」后把草稿写回配置。
     fn apply_conn_draft(&mut self, target: ConnTarget, draft: &ConnDraft) {
         match target {
-            ConnTarget::Pg => {
-                let c = &mut self.cfg.pg;
-                c.host = draft.host.trim().to_string();
-                if let Ok(port) = draft.port.trim().parse::<u16>() {
-                    c.port = port;
-                }
-                c.database = draft.database.trim().to_string();
-                c.user = draft.user.clone();
-                c.password = draft.password.clone();
-                self.pg_port_buf = c.port.to_string();
-            }
-            ConnTarget::Mqtt => {
-                let c = &mut self.cfg.mqtt;
-                c.broker = draft.host.trim().to_string();
-                if let Ok(port) = draft.port.trim().parse::<u16>() {
-                    c.port = port;
-                }
-                c.user = draft.user.clone();
-                c.password = draft.password.clone();
-                c.topic = draft.topic.trim().to_string();
-                c.client_id = draft.client_id.trim().to_string();
-                if let Ok(secs) = draft.keepalive.trim().parse::<u32>() {
-                    c.keepalive_secs = secs.clamp(10, 300);
-                }
-                self.mqtt_port_buf = c.port.to_string();
-                self.keepalive_buf = c.keepalive_secs.to_string();
-            }
+            ConnTarget::Pg => self.cfg.pg = draft.pg_config(),
+            ConnTarget::Mqtt => self.cfg.mqtt = draft.mqtt_config(),
         }
     }
 
@@ -1744,6 +1767,32 @@ impl App {
         let mut keep_open = true;
         let mut finished = false;
         let mut login_request: Option<(String, String)> = None;
+        // 弹窗里点「测试连接」时不能直接调 self 的方法（`dialog` 已经把 self 借走了），
+        // 先把草稿攒下来，等窗口画完再统一发起测试。
+        let mut test_request: Option<(ConnTarget, ConnDraft)> = None;
+        // 用户在弹窗里改过字段：上一次的测试结论不再作数
+        let mut stale_test = false;
+        let conn_target: Option<ConnTarget> = match &*dialog {
+            Dialog::Connection { target, .. } => Some(*target),
+            _ => None,
+        };
+        // 测试进度和结果同理：先把要显示的快照拷出来（pg_test / mqtt_test 是
+        // 另外两个字段，和 `dialog` 不冲突）
+        let test_state: Option<(bool, String, LogLevel)> = match &*dialog {
+            Dialog::Connection { target, .. } => Some(match target {
+                ConnTarget::Pg => (
+                    self.pg_test.busy,
+                    self.pg_test.result.clone(),
+                    self.pg_test.level,
+                ),
+                ConnTarget::Mqtt => (
+                    self.mqtt_test.busy,
+                    self.mqtt_test.result.clone(),
+                    self.mqtt_test.level,
+                ),
+            }),
+            _ => None,
+        };
         let title = match dialog {
             Dialog::CloudLogin { .. } => t!("登录 RaceBox 账号", "Sign in to RaceBox").to_string(),
             Dialog::Connection { target, .. } => {
@@ -1752,15 +1801,30 @@ impl App {
             Dialog::Notice { title, .. } => title.clone(),
         };
         // 模态：先铺一层遮罩压暗背景并吃掉背景上的点击，弹窗才真的「必须先关掉」。
-        // 遮罩要在弹窗之前创建——同层按创建顺序叠放，这样它只盖住页面不盖住弹窗。
         style::modal_shield(ctx, p);
         // 标题栏右上角带一个 ×：光靠「取消」按钮关窗不顺手
         let mut window_open = true;
+        // 首次出现时大致居中。高度只能估——egui 没法在画之前量出窗口多高，
+        // 估偏了也就偏几十像素，反正窗口能拖。
+        let half_h = match dialog {
+            Dialog::Notice { .. } => 90.0,
+            Dialog::CloudLogin { .. } => 170.0,
+            Dialog::Connection { target, .. } => match target {
+                ConnTarget::Pg => 215.0,
+                ConnTarget::Mqtt => 265.0,
+            },
+        };
+        let center = ctx.screen_rect().center();
         egui::Window::new(title)
             .open(&mut window_open)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            // 用 default_pos 而不是 anchor：anchor 会把窗口钉死在屏幕中间，想挪开
+            // 看看被挡住的内容都挪不动。第一次出现在中间，之后记住用户拖到的位置。
+            .default_pos(egui::pos2(center.x - 186.0, center.y - half_h))
+            // 必须比遮罩高一层：遮罩在 Middle，弹窗放 Foreground。
+            // 两者同层时，点一下背景遮罩就会被提到最上面，弹窗整窗变灰、点不动也关不掉。
+            .order(egui::Order::Foreground)
             .frame(style::window(p))
             .show(ctx, |ui| {
                 ui.set_width(match dialog {
@@ -1826,70 +1890,139 @@ impl App {
                         revealed,
                     } => {
                         let pg = *target == ConnTarget::Pg;
+                        // 任何字段一动，上一次的测试结论就过期了，画完统一清掉
+                        let mut dirty = false;
                         // 主机 / Broker
-                        dialog_field(
+                        dirty |= dialog_field(
                             ui,
                             p,
                             if pg { t!("主机", "Host") } else { "Broker" },
                             &mut draft.host,
+                            "",
                             false,
                             false,
-                        );
+                        )
+                        .changed();
                         // 端口 +（PG 的库名 / MQTT 的保活）
                         ui.horizontal(|ui| {
                             let half = (ui.available_width() - 12.0) / 2.0;
                             ui.vertical(|ui| {
                                 ui.colored_label(p.muted, t!("端口", "Port"));
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut draft.port)
-                                        .desired_width(half),
-                                );
+                                dirty |= ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut draft.port)
+                                            .desired_width(half),
+                                    )
+                                    .changed();
                             });
                             ui.add_space(12.0);
                             ui.vertical(|ui| {
                                 if pg {
                                     ui.colored_label(p.muted, t!("数据库", "Database"));
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut draft.database)
-                                            .desired_width(half),
-                                    );
+                                    dirty |= ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut draft.database)
+                                                .desired_width(half),
+                                        )
+                                        .changed();
                                 } else {
                                     ui.colored_label(p.muted, t!("保活间隔", "Keep-alive"));
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut draft.keepalive)
-                                            .desired_width(half),
-                                    );
+                                    dirty |= ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut draft.keepalive)
+                                                .desired_width(half),
+                                        )
+                                        .changed();
                                 }
                             });
                         });
                         ui.add_space(8.0);
                         // 账号
-                        dialog_field(
+                        dirty |= dialog_field(
                             ui,
                             p,
                             t!("用户", "User"),
                             &mut draft.user,
+                            "",
                             false,
                             false,
-                        );
+                        )
+                        .changed();
                         // 密码：默认打码，勾上「显示密码」才明文
                         ui.colored_label(p.muted, t!("密码", "Password"));
                         ui.add_space(4.0);
-                        ui.add(
-                            egui::TextEdit::singleline(&mut draft.password)
-                                .password(!*revealed)
-                                .desired_width(f32::INFINITY),
-                        );
+                        dirty |= ui
+                            .add(
+                                egui::TextEdit::singleline(&mut draft.password)
+                                    .password(!*revealed)
+                                    .desired_width(f32::INFINITY),
+                            )
+                            .changed();
                         ui.add_space(6.0);
                         ui.checkbox(revealed, t!("显示密码", "Show password"));
                         if !pg {
                             ui.add_space(8.0);
-                            dialog_field(ui, p, t!("主题", "Topic"), &mut draft.topic, false, false);
-                            dialog_field(ui, p, "Client ID", &mut draft.client_id, false, false);
+                            // 这两个留空就是「用内置默认值」，所以给灰色提示、不预填：
+                            // 预填进去等于替用户做了决定，还得先删掉才能写自己的
+                            dirty |= dialog_field(
+                                ui,
+                                p,
+                                t!("主题", "Topic"),
+                                &mut draft.topic,
+                                crate::config::DEFAULT_MQTT_TOPIC,
+                                false,
+                                false,
+                            )
+                            .changed();
+                            dirty |= dialog_field(
+                                ui,
+                                p,
+                                "Client ID",
+                                &mut draft.client_id,
+                                crate::config::DEFAULT_MQTT_CLIENT_ID,
+                                false,
+                                false,
+                            )
+                            .changed();
                         }
+                        ui.add_space(12.0);
+
+                        // 测试连接：测的是**弹窗里正在填的这组参数**，不是已保存的配置，
+                        // 所以不用先点「确定」就能验证能不能连上。
+                        let busy = test_state.as_ref().map_or(false, |(busy, _, _)| *busy);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !busy,
+                                    style::secondary_button(
+                                        p,
+                                        t!("测试连接", "Test connection"),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                test_request = Some((*target, draft.clone()));
+                            }
+                            if busy {
+                                ui.spinner();
+                            }
+                        });
+                        if let Some((_, result, level)) = &test_state {
+                            if !result.is_empty() {
+                                ui.add_space(8.0);
+                                style::status_banner(ui, p, level_color(p, *level), result);
+                            }
+                        }
+
                         ui.add_space(14.0);
-                        let ready = !draft.host.trim().is_empty()
-                            && draft.port.trim().parse::<u16>().is_ok();
+                        // 端口留空 = 用默认端口，所以只要求主机填了
+                        let ready = if pg {
+                            !draft.host.trim().is_empty()
+                                && !draft.database.trim().is_empty()
+                                && !draft.user.trim().is_empty()
+                        } else {
+                            !draft.host.trim().is_empty()
+                        };
                         let (ok, cancel) = style::dialog_buttons(
                             ui,
                             p,
@@ -1903,6 +2036,9 @@ impl App {
                         }
                         if cancel {
                             keep_open = false;
+                        }
+                        if dirty {
+                            stale_test = true;
                         }
                     }
                     Dialog::Notice { body, .. } => {
@@ -1926,10 +2062,35 @@ impl App {
         if !window_open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             keep_open = false;
         }
+        // 改过参数就把上一次的测试结论清掉：那条结论是给旧参数看的，
+        // 留着会让人以为「刚填的这组」已经验证过了
+        if stale_test {
+            match conn_target {
+                Some(ConnTarget::Pg) => self.pg_test.result.clear(),
+                Some(ConnTarget::Mqtt) => self.mqtt_test.result.clear(),
+                None => {}
+            }
+        }
         if finished {
             if let Some(Dialog::Connection { target, draft, .. }) = self.dialog.take() {
                 self.apply_conn_draft(target, &draft);
+                // 不在设置页时没有「保存」按钮可点，这里直接落盘，
+                // 否则填完的连接参数关掉程序就没了
+                if self.tab != Tab::Settings {
+                    let _ = config::save(&self.cfg);
+                    self.settings_snapshot = self.cfg.clone();
+                }
+                // 这次弹窗是被「开始同步」拦下来的：填完接着跑，别让用户再点一次
+                if let Some(mode) = self.pending_run.take() {
+                    match mode {
+                        RunMode::Import => self.start_import(),
+                        other => self.start(other),
+                    }
+                }
             }
+        }
+        if let Some((target, draft)) = test_request {
+            self.start_conn_test(target, &draft);
         }
         if let Some((email, password)) = login_request {
             self.dialog = None;
@@ -1938,6 +2099,8 @@ impl App {
         }
         if !keep_open {
             self.dialog = None;
+            // 弹窗被取消 / 关掉：那次被拦下来的任务就不该再自己跑起来
+            self.pending_run = None;
         }
         self.dialog.is_some()
     }
@@ -1992,93 +2155,10 @@ impl App {
                     }
                 }
             });
-        });
-
-        ui.add_space(10.0);
-        // ---------- PostgreSQL ----------
-        style::card(p).show(ui, |ui| {
-            style::fill_card_width(ui);
-            style::card_title_with_help(
-                ui,
-                p,
-                "PostgreSQL",
-                "settings_pg",
-                t!(
-                    "同步前会先探一次连通性，连不上就直接停下，不会先把设备数据白下一遍。",
-                    "Connectivity is probed before syncing; if it fails, the run stops without downloading anything."
-                ),
-            );
-            ui.add_space(10.0);
-            // 主机/端口/库/账号/密码都不在页面上摆输入框：一行摘要 + 「修改」，
-            // 真正填写在弹窗里做（和云账号、密码一个路子）。
-            self.conn_summary_row(ui, p, ConnTarget::Pg);
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                let busy = self.pg_test.busy;
-                if ui
-                    .add_enabled(
-                        !self.running && !busy,
-                        style::secondary_button(p, t!("测试连接", "Test connection")),
-                    )
-                    .clicked()
-                {
-                    self.test_pg();
-                }
-                if busy {
-                    ui.spinner();
-                }
-            });
-            if !self.pg_test.result.is_empty() {
-                style::status_banner(
-                    ui,
-                    p,
-                    level_color(p, self.pg_test.level),
-                    &self.pg_test.result,
-                );
-            }
-        });
-
-        ui.add_space(10.0);
-        // ---------- MQTT ----------
-        style::card(p).show(ui, |ui| {
-            style::fill_card_width(ui);
-            style::card_title_with_help(
-                ui,
-                p,
-                "MQTT",
-                "settings_mqtt",
-                t!(
-                    "连接时会等 CONNACK，拿不到就当作通道不可用，直接停止本次同步。",
-                    "Connecting waits for CONNACK; if it never arrives the channel counts as unusable and the sync stops."
-                ),
-            );
-            ui.add_space(10.0);
-            // 同 PostgreSQL：Broker / 端口 / 账号密码 / 主题等都进弹窗，页面只留摘要
-            self.conn_summary_row(ui, p, ConnTarget::Mqtt);
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                let busy = self.mqtt_test.busy;
-                if ui
-                    .add_enabled(
-                        !self.running && !busy,
-                        style::secondary_button(p, t!("测试连接", "Test connection")),
-                    )
-                    .clicked()
-                {
-                    self.test_mqtt();
-                }
-                if busy {
-                    ui.spinner();
-                }
-            });
-            if !self.mqtt_test.result.is_empty() {
-                style::status_banner(
-                    ui,
-                    p,
-                    level_color(p, self.mqtt_test.level),
-                    &self.mqtt_test.result,
-                );
-            }
+            ui.add_space(14.0);
+            // 连接参数不再是单独两张卡：页面上一个地址都不露，只有「填好了没」
+            // 和唯一的入口，真正的主机/账号/密码都在弹窗里
+            self.channel_row(ui, p);
         });
 
         ui.add_space(10.0);
@@ -2667,10 +2747,13 @@ impl eframe::App for App {
         if self.confirm_close {
             let mut keep_open = true;
             style::modal_shield(ctx, &p);
+            let center = ctx.screen_rect().center();
             egui::Window::new(t!("未保存的更改", "Unsaved changes"))
                 .collapsible(false)
                 .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                // 和连接参数弹窗同一套：可拖动，并且压在遮罩之上
+                .default_pos(egui::pos2(center.x - 160.0, center.y - 90.0))
+                .order(egui::Order::Foreground)
                 .frame(style::window(&p))
                 .show(ctx, |ui| {
                     ui.set_width(320.0);
