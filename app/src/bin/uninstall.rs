@@ -25,8 +25,9 @@
 const APP_DIR_NAME: &str = "RaceBox Sync";
 const APP_EXE: &str = "racewong-app.exe";
 const UNINSTALL_EXE: &str = "uninstall.exe";
-const REG_APP_KEY: &str = r"HKCU\Software\racewong\RaceBoxSync";
-const REG_VENDOR_KEY: &str = r"HKCU\Software\racewong";
+/// 注册表路径，相对 HKEY_CURRENT_USER。安装时 MSI 把 ProductCode 写在这里。
+const REG_APP_KEY: &str = r"Software\racewong\RaceBoxSync";
+const REG_VENDOR_KEY: &str = r"Software\racewong";
 const TITLE: &str = "RaceBox同步 卸载程序";
 /// 标记"我是被复制到临时目录的那一份"，防止无限自我复制。
 const RELOCATED_ENV: &str = "RACEWONG_UNINSTALL_RELOCATED";
@@ -232,25 +233,7 @@ fn kill_running_app() {
 /// 从注册表读回安装时写下的 ProductCode。
 #[cfg(windows)]
 fn product_code() -> Option<String> {
-    let out = hidden("reg")
-        .args(["query", REG_APP_KEY, "/v", "ProductCode"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        // 形如：    ProductCode    REG_SZ    {xxxxxxxx-....}
-        let Some(idx) = line.find("REG_SZ") else {
-            continue;
-        };
-        let value = line[idx + "REG_SZ".len()..].trim();
-        if value.starts_with('{') {
-            return Some(value.to_string());
-        }
-    }
-    None
+    winreg::read_string(REG_APP_KEY, "ProductCode").filter(|v| v.starts_with('{'))
 }
 
 /// 走 MSI 卸载，返回 msiexec 的退出码。
@@ -272,7 +255,7 @@ fn run_msi_uninstall(code: &str, silent: bool) -> Result<i32, String> {
 /// `Software\racewong` 这层由安装程序隐式创建的父键会留下来。
 #[cfg(windows)]
 fn cleanup_registry() {
-    let _ = hidden("reg").args(["delete", REG_VENDOR_KEY, "/f"]).output();
+    winreg::delete_tree(REG_VENDOR_KEY);
 }
 
 /// 兜底清理安装目录。
@@ -365,5 +348,122 @@ mod msgbox {
 
     pub fn error(text: &str) {
         show(text, MB_ICONERROR, MB_OK);
+    }
+}
+
+// ---------------------------------------------------------------- 注册表
+//
+// 直接调 advapi32，不 spawn `reg.exe`：少一个进程、不闪黑框，也不会被
+// 某些安全策略（企业白名单/沙箱）拦下来——真被拦了卸载就会退化成
+// "找不到安装记录"。
+#[cfg(windows)]
+mod winreg {
+    use std::ffi::c_void;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            hkey: *mut c_void,
+            sub_key: *const u16,
+            options: u32,
+            sam: u32,
+            result: *mut *mut c_void,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hkey: *mut c_void,
+            value_name: *const u16,
+            reserved: *mut u32,
+            ty: *mut u32,
+            data: *mut u8,
+            data_len: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(hkey: *mut c_void) -> i32;
+        fn RegDeleteTreeW(hkey: *mut c_void, sub_key: *const u16) -> i32;
+    }
+
+    /// HKEY_CURRENT_USER。预定义句柄是**符号扩展**过的常量，64 位上必须是
+    /// 0xFFFF_FFFF_8000_0001；写成 0x8000_0001 会被当成非法句柄。
+    const HKEY_CURRENT_USER: *mut c_void = 0xFFFF_FFFF_8000_0001u64 as usize as *mut c_void;
+    const KEY_READ: u32 = 0x0002_0019;
+    const KEY_WOW64_64KEY: u32 = 0x0000_0100;
+    const KEY_WOW64_32KEY: u32 = 0x0000_0200;
+    const REG_SZ: u32 = 1;
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn open(sub_key: &str, sam: u32) -> Option<*mut c_void> {
+        let sub_key = wide(sub_key);
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, sub_key.as_ptr(), 0, sam, &mut handle) };
+        (rc == 0).then_some(handle)
+    }
+
+    /// 读一个 REG_SZ 值。
+    ///
+    /// 两个视图都试一遍：MSI 装的是 x64 包，正常写在 64 位视图里，
+    /// 但万一哪天换成 32 位安装器，值会落到 Wow6432Node 下面。
+    pub fn read_string(sub_key: &str, name: &str) -> Option<String> {
+        for view in [KEY_WOW64_64KEY, KEY_WOW64_32KEY] {
+            let Some(handle) = open(sub_key, KEY_READ | view) else {
+                continue;
+            };
+            let value = query_string(handle, name);
+            unsafe { RegCloseKey(handle) };
+            if value.is_some() {
+                return value;
+            }
+        }
+        None
+    }
+
+    fn query_string(hkey: *mut c_void, name: &str) -> Option<String> {
+        let name = wide(name);
+        let mut ty: u32 = 0;
+        let mut len: u32 = 0;
+        let rc = unsafe {
+            RegQueryValueExW(
+                hkey,
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut ty,
+                std::ptr::null_mut(),
+                &mut len,
+            )
+        };
+        if rc != 0 || ty != REG_SZ || len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize + 2];
+        let mut read = len;
+        let rc = unsafe {
+            RegQueryValueExW(
+                hkey,
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut ty,
+                buf.as_mut_ptr(),
+                &mut read,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let units: Vec<u16> = buf[..read as usize]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        Some(
+            String::from_utf16_lossy(&units)
+                .trim_end_matches('\0')
+                .to_string(),
+        )
+    }
+
+    /// 连子键一起删掉。键不存在时返回 false，调用方不用管。
+    pub fn delete_tree(sub_key: &str) -> bool {
+        let sub_key = wide(sub_key);
+        unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, sub_key.as_ptr()) == 0 }
     }
 }
