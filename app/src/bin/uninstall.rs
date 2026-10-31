@@ -64,6 +64,12 @@ fn windows_main() {
 
 #[cfg(windows)]
 fn run() -> Result<(), String> {
+    // 先把自己的工作目录挪走。
+    // 双击 exe 时 Windows 会把当前目录设成 exe 所在目录，也就是安装目录；
+    // 而"正在被某个进程当作当前目录"的文件夹是删不掉的（ERROR_ACCESS_DENIED），
+    // 结果就是卸载完了安装目录还留一个空壳。MSI 的 RemoveFolders 也一样会失败。
+    let _ = std::env::set_current_dir(std::env::temp_dir());
+
     // 命令行开关（给脚本/自动化用，普通用户双击就走图形界面）：
     //   /s            静默，不弹任何窗口；默认保留个人配置
     //   /s /purge     静默，并把个人配置一起删掉
