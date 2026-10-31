@@ -80,6 +80,17 @@
           <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuDir" Name="RaceBox同步"
                     WorkingDirectory="INSTALLFOLDER" Advertise="yes" Icon="AppIcon.ico" />
         </File>
+        <!-- 安装目录本身在卸载时删掉（只在空了以后才会真删） -->
+        <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+      </Component>
+      <!-- 卸载程序：双击后自己问要不要保留个人配置，再调 msiexec /x 走正规卸载。
+           它要删掉自己所在目录里的文件，所以运行时会先把自己复制到 %TEMP% 再跑
+           （见 app/src/bin/uninstall.rs 里的 relocate）。 -->
+      <Component Id="Uninstaller" Guid="9C4E1B77-3D2A-4F58-B6C1-2E7A5D90F314" Win64="yes">
+        <File Id="UninstallExe" Source="$(var.UninstallExePath)" KeyPath="yes">
+          <Shortcut Id="UninstallShortcut" Directory="ProgramMenuDir" Name="卸载 RaceBox同步"
+                    WorkingDirectory="INSTALLFOLDER" Advertise="no" Icon="AppIcon.ico" />
+        </File>
       </Component>
       <Component Id="StartMenuCleanup" Guid="5532E157-0B8D-48C6-A58B-1DDF4D772BF4" Win64="yes">
         <RemoveFolder Id="RemoveProgramMenuDir" Directory="ProgramMenuDir" On="uninstall" />
@@ -88,6 +99,10 @@
         <!-- 记下真实安装路径，供下次静默升级还原（格式化属性在写入时展开成最终路径） -->
         <RegistryValue Root="HKCU" Key="Software\racewong\RaceBoxSync" Name="InstallDir"
                        Type="string" Value="[INSTALLFOLDER]" />
+        <!-- 卸载程序要按 ProductCode 调 msiexec /x，而 Product Id 是 "*"，
+             每个版本都是新 GUID，没法在编译期写死，只能装的时候记下来。 -->
+        <RegistryValue Root="HKCU" Key="Software\racewong\RaceBoxSync" Name="ProductCode"
+                       Type="string" Value="[ProductCode]" />
         <!-- App Paths：Win+R 里能直接敲 racewong-app，任务管理器的“打开文件位置”也能定位 -->
         <RegistryValue Root="HKCU"
                        Key="Software\Microsoft\Windows\CurrentVersion\App Paths\racewong-app.exe"
@@ -115,6 +130,7 @@
 
     <Feature Id="MainFeature" Title="RaceBox同步" Level="1">
       <ComponentRef Id="AppFiles" />
+      <ComponentRef Id="Uninstaller" />
       <ComponentRef Id="StartMenuCleanup" />
       <ComponentRef Id="DesktopShortcut" />
     </Feature>

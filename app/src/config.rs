@@ -242,18 +242,78 @@ impl Config {
     }
 }
 
-pub fn project_dirs() -> Option<directories::ProjectDirs> {
-    directories::ProjectDirs::from("cn", "wongcw", "racewong")
+/// 应用数据目录名。和安装目录（Windows 上是 `%LOCALAPPDATA%\RaceBox Sync`）同名，
+/// 用户在两处看到的是同一个名字，好找。
+/// 卸载程序 `uninstall.exe` 里有一份同名常量，改这里要同步改那边。
+pub const APP_DIR_NAME: &str = "RaceBox Sync";
+
+/// 用户数据目录：`config.json`、`cloud.json`、日志、待上传队列都放这里。
+///
+/// 按各平台的通用约定，不另起炉灶：
+///   Windows  `%APPDATA%\RaceBox Sync\`（Roaming，和安装目录分开）
+///   macOS    `~/Library/Application Support/RaceBox Sync/`
+///   Linux    `~/.config/RaceBox Sync/`
+///
+/// 以前用的是 `ProjectDirs::from("cn", "wongcw", "racewong")`，Windows 上会落到
+/// `%APPDATA%\wongcw\racewong\config\` —— 多套一层厂商目录、名字还跟安装目录对不上，
+/// 用户翻不着。第一次运行会把老目录里的东西搬过来，见 [`migrate_legacy_dir`]。
+pub fn base_dir() -> PathBuf {
+    static MIGRATE: std::sync::Once = std::sync::Once::new();
+    let dir = data_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    MIGRATE.call_once(|| migrate_legacy_dir(&dir));
+    dir
 }
 
-pub fn base_dir() -> PathBuf {
-    if let Some(pd) = project_dirs() {
-        let dir = pd.config_dir().to_path_buf();
-        let _ = std::fs::create_dir_all(&dir);
-        return dir;
+fn data_dir() -> PathBuf {
+    if let Some(base) = directories::BaseDirs::new() {
+        return base.config_dir().join(APP_DIR_NAME);
     }
-    let fallback = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    fallback
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// 把老版本（`ProjectDirs` 那套路径）的数据搬到新目录，搬完把老目录删掉。
+///
+/// 只在**新目录还没有 config.json** 时搬：新目录一旦有配置，说明用户已经在新位置
+/// 用过了，这时再覆盖会把他的改动冲掉。
+fn migrate_legacy_dir(new_dir: &std::path::Path) {
+    let Some(legacy) = directories::ProjectDirs::from("cn", "wongcw", "racewong")
+        .map(|pd| pd.config_dir().to_path_buf())
+    else {
+        return;
+    };
+    if legacy == new_dir || !legacy.is_dir() || new_dir.join("config.json").exists() {
+        return;
+    }
+    let mut ok = true;
+    for name in ["config.json", "cloud.json"] {
+        let from = legacy.join(name);
+        if from.is_file() && std::fs::copy(&from, new_dir.join(name)).is_err() {
+            ok = false;
+        }
+    }
+    // 日志不搬：新目录从零开始记，省得两份日志对不上时间线。
+    let from_spool = legacy.join("spool");
+    if from_spool.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&from_spool) {
+            let to_spool = new_dir.join("spool");
+            let _ = std::fs::create_dir_all(&to_spool);
+            for entry in entries.flatten() {
+                let target = to_spool.join(entry.file_name());
+                if std::fs::copy(entry.path(), target).is_err() {
+                    ok = false;
+                }
+            }
+        }
+    }
+    // 全搬成功才删老目录；有一项没搬动就留着，免得数据凭空消失。
+    if ok {
+        let _ = std::fs::remove_dir_all(&legacy);
+        // `%APPDATA%\wongcw\` 是我们专用的，空了就一起收拾掉
+        if let Some(parent) = legacy.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
 }
 
 pub fn config_path() -> PathBuf {

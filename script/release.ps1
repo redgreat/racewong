@@ -390,10 +390,17 @@ function New-Msi([string]$Stage, [string]$Bin, [string]$Ver, [string]$Name) {
     $wixObj  = Join-Path $Stage 'racewong.wixobj'
     $exeAbs  = (Resolve-Path $Bin).Path
     $iconAbs = (Resolve-Path (Join-Path $AppDir 'assets/icon.ico')).Path
+    # 卸载程序是和主程序同一个 crate 里的另一个 bin（app/src/bin/uninstall.rs），
+    # cargo build 会把两个都编出来，和主程序躺在同一个目录。
+    $uninstallExe = Join-Path (Split-Path -Parent $exeAbs) 'uninstall.exe'
+    if (-not (Test-Path $uninstallExe)) {
+        Die "缺少卸载程序: $uninstallExe（cargo build 应该会一起编出来）"
+    }
     $code = Invoke-Checked $candle.Source @(
         '-nologo',
         "-dVersion=$Ver",
         "-dExePath=$exeAbs",
+        "-dUninstallExePath=$uninstallExe",
         "-dIconPath=$iconAbs",
         "-dLicenseRtf=$licenseRtf",
         "-dBannerBmp=$((Resolve-Path $bannerBmp).Path)",
