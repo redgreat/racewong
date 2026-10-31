@@ -236,6 +236,25 @@ function Set-CargoVersion([string]$Ver) {
     return $true
 }
 
+# Cargo.lock 里本 crate 的版本号跟 Cargo.toml 走：
+# 构建用的是 cargo build --locked，锁文件还停在旧版本会直接报
+# "cannot update the lock file ... because --locked was passed"。
+# 只改 [[package]] name = "racewong-app" 后面的那一条 version，别动依赖。
+function Set-CargoLockVersion([string]$Ver) {
+    $path = Join-Path $AppDir 'Cargo.lock'
+    if (-not (Test-Path $path)) { return $false }
+    $text = Get-Content $path -Raw
+    $new  = [regex]::Replace(
+        $text,
+        '(?ms)(name = "racewong-app"\s*\r?\nversion = ")[^"]+(")',
+        "`${1}$Ver`${2}",
+        1
+    )
+    if ($new -eq $text) { return $false }
+    Write-Utf8File $path $new
+    return $true
+}
+
 # ---------------------------------------------------------------- Release 正文（git 备注）
 function Get-ReleaseNotes([string]$From, [string]$To) {
     $range = if ($From) { "$From..$To" } else { $To }
@@ -615,7 +634,8 @@ if ($oldVer -ne $verNoV) {
     if ($DryRun) { Say "   [dry-run] app/Cargo.toml: $oldVer -> $verNoV" }
     else {
         $null = Set-CargoVersion $verNoV
-        Invoke-Git @('add', (Join-Path $AppDir 'Cargo.toml'))
+        $null = Set-CargoLockVersion $verNoV
+        Invoke-Git @('add', (Join-Path $AppDir 'Cargo.toml'), (Join-Path $AppDir 'Cargo.lock'))
         $r = Invoke-Cmd 'git' @('commit', '-m', "chore(release): bump version to $verNoV")
         if ($r.Code -ne 0) {
             if ($r.Output -match 'nothing to commit') { Ok '没有需要提交的改动' }
