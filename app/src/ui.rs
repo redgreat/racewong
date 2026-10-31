@@ -37,6 +37,63 @@ struct ChannelRow {
     uploaded: usize,
     failed: usize,
     total: usize,
+    /// 上一次速度采样时的（条数, 时刻）。
+    ///
+    /// 各路的进度回调密度不一样（PG 每批一次、RaceBox 云一整段才回调一次），
+    /// 直接用「这次回调的增量 / 这次回调的间隔」算出来全是噪声，所以按时间窗口采样。
+    sample: Option<(usize, Instant)>,
+    /// 平滑后的实时速度（条/秒）。
+    rate: Option<f64>,
+    /// 这一路开始上传的时刻：回调太稀、攒不出采样窗口时用它算平均速度。
+    started: Instant,
+}
+
+impl ChannelRow {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            uploaded: 0,
+            failed: 0,
+            total: 0,
+            sample: None,
+            rate: None,
+            started: Instant::now(),
+        }
+    }
+
+    /// 计数变了之后重新采样一次速度。
+    ///
+    /// 窗口不到 0.4 秒就先攒着——回调可能几十毫秒一次，每次都算会把速度抖成一片。
+    /// 算出来的瞬时值再和上一次做指数平滑，界面上那串数字才不至于乱跳。
+    fn resample(&mut self, now: Instant) {
+        if let Some((last_n, last_t)) = self.sample {
+            let dt = now.duration_since(last_t).as_secs_f64();
+            if dt >= 0.4 {
+                let inst = self.uploaded.saturating_sub(last_n) as f64 / dt;
+                self.rate = Some(match self.rate {
+                    Some(prev) => prev * 0.6 + inst * 0.4,
+                    None => inst,
+                });
+                self.sample = Some((self.uploaded, now));
+            }
+        } else {
+            self.sample = Some((self.uploaded, now));
+        }
+        // 兜底：RaceBox 云是把一整段一次性 POST 出去的，服务端不报进度，
+        // 一路只有开头和结尾两次回调，采样窗口永远攒不出来。等这一路传完，
+        // 用「从开始到传完」的平均值补一个，别让速度那一格永远是空的。
+        if self.rate.is_none() && self.done() {
+            let secs = now.duration_since(self.started).as_secs_f64();
+            if secs >= 0.2 {
+                self.rate = Some(self.total as f64 / secs);
+            }
+        }
+    }
+
+    /// 这一路跑完了没（有总数且已经追平）。
+    fn done(&self) -> bool {
+        self.total > 0 && self.uploaded >= self.total
+    }
 }
 
 /// 连接测试的状态（进行中 / 结果文字 / 结果等级）。
@@ -558,15 +615,7 @@ impl App {
                 }
                 UiEvent::ChannelList(names) => {
                     // 新任务先重建：通道数量随设置变化，上一次的残留要丢掉
-                    self.channels = names
-                        .into_iter()
-                        .map(|name| ChannelRow {
-                            name,
-                            uploaded: 0,
-                            failed: 0,
-                            total: 0,
-                        })
-                        .collect();
+                    self.channels = names.into_iter().map(ChannelRow::new).collect();
                     self.phase_times.retain(|(p, _)| *p != Phase::Uploading);
                 }
                 UiEvent::ChannelProgress {
@@ -574,20 +623,26 @@ impl App {
                     uploaded,
                     failed,
                     total,
-                } => match self.channels.iter_mut().find(|c| c.name == name) {
-                    Some(row) => {
-                        // 各段并发上传时计数可能有交错，取最大值避免进度条回退
-                        row.uploaded = row.uploaded.max(uploaded);
-                        row.failed = row.failed.max(failed);
-                        row.total = row.total.max(total);
+                } => {
+                    let now = Instant::now();
+                    match self.channels.iter_mut().find(|c| c.name == name) {
+                        Some(row) => {
+                            // 各段并发上传时计数可能有交错，取最大值避免进度条回退
+                            row.uploaded = row.uploaded.max(uploaded);
+                            row.failed = row.failed.max(failed);
+                            row.total = row.total.max(total);
+                            row.resample(now);
+                        }
+                        None => {
+                            let mut row = ChannelRow::new(name);
+                            row.uploaded = uploaded;
+                            row.failed = failed;
+                            row.total = total;
+                            row.resample(now);
+                            self.channels.push(row);
+                        }
                     }
-                    None => self.channels.push(ChannelRow {
-                        name,
-                        uploaded,
-                        failed,
-                        total,
-                    }),
-                },
+                }
                 UiEvent::SessionInfo { index, name, records, ok, detail } => {
                     self.sessions.push(SessionRow {
                         index,
@@ -710,6 +765,9 @@ impl App {
         self.erase_percent = None;
         self.status = None;
         self.sessions.clear();
+        // 上一次任务的通道进度不能留着：查询状态 / 清除内存根本不走上传，
+        // 不清的话结果卡里会挂着上一轮「已完成」的通道，看着像这次也传了
+        self.channels.clear();
         self.push_log(
             LogLevel::Info,
             tr!("任务开始: {}", "task started: {}", mode_text(mode)),
@@ -776,6 +834,9 @@ impl App {
         self.erase_percent = None;
         self.status = None;
         self.sessions.clear();
+        // 上一次任务的通道进度不能留着：查询状态 / 清除内存根本不走上传，
+        // 不清的话结果卡里会挂着上一轮「已完成」的通道，看着像这次也传了
+        self.channels.clear();
         self.push_log(
             LogLevel::Info,
             tr!("任务开始: {}", "task started: {}", mode_text(RunMode::Import)),
@@ -1003,35 +1064,42 @@ impl App {
     }
 
 
-    /// 通道进度条要不要显示：有通道数据、且任务跑过（或正在跑）才展开。
+    /// 通道状态要不要显示：有通道数据、且任务跑过（或正在跑）才展开。
     fn show_channels(&self) -> bool {
         !self.channels.is_empty() && (self.running || self.phase.is_final())
     }
 
-    /// 每一路上传通道一条进度条。
+    /// 各上传通道挤成一行：`MQTT 2,071 条/秒 · RaceBox 云 1,842 条/秒`。
     ///
-    /// 计数**不能**交给 `ProgressBar::text()`：egui 把文字画在 `outer_rect` 里并用
-    /// `with_clip_rect(outer_rect)` 裁掉溢出部分，而这里为了好看把条压到了 6px 高，
-    /// 13px 的字就只剩中间一条缝，数字根本认不出来。所以数字单独放在条上面那行，
-    /// 条本身只负责「走了多少」。
-    fn channel_bars(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        ui.colored_label(p.muted, t!("上传通道", "Upload channels"));
-        ui.add_space(6.0);
-        // 实时速度对每一路都一样（数据是同时往几路送的），取一次就够
-        let rate = self.upload_rate();
-        for row in self.channels.clone() {
-            let done = row.uploaded >= row.total && row.total > 0;
-            ui.horizontal(|ui| {
+    /// 原来每路一条进度条，和大圆环的总体进度是重复的（数据是同一份、同时往几路送），
+    /// 屏幕上多出两根条只是把结果卡顶下去。这里只留文字：谁在跑、跑到多少、多快，
+    /// 圆环负责「还剩多少」，两边不重叠。
+    fn channel_line(&self, ui: &mut egui::Ui, p: &Palette) {
+        // 通道名之间用 `·` 分隔，和「各阶段耗时」那行保持同一种节奏
+        ui.horizontal_wrapped(|ui| {
+            for (i, row) in self.channels.iter().enumerate() {
+                if i > 0 {
+                    ui.add_space(6.0);
+                    ui.colored_label(p.muted, "·");
+                    ui.add_space(6.0);
+                }
                 ui.label(egui::RichText::new(row.name.clone()).strong().color(p.text));
-                ui.add_space(8.0);
-                // 计数贴着通道名放：一眼就知道这个数属于哪一路
-                let (count_text, count_color) = if row.failed > 0 {
+                ui.add_space(6.0);
+                let (text, color) = if row.failed > 0 {
                     (
-                        tr!("{} 条 · 失败 {} 条", "{} rec · {} failed", fmt_count(row.uploaded), fmt_count(row.failed)),
+                        tr!(
+                            "{} 条 · 失败 {} 条",
+                            "{} rec · {} failed",
+                            fmt_count(row.uploaded),
+                            fmt_count(row.failed)
+                        ),
                         p.error,
                     )
-                } else if done {
-                    (tr!("{} 条 · 已完成", "{} rec · done", fmt_count(row.total)), p.success)
+                } else if row.done() {
+                    (
+                        tr!("{} 条 · 已完成", "{} rec · done", fmt_count(row.total)),
+                        p.success,
+                    )
                 } else if row.total > 0 {
                     (
                         tr!(
@@ -1042,36 +1110,29 @@ impl App {
                         ),
                         p.text,
                     )
+                } else if self.running && self.phase == Phase::Uploading {
+                    // 这一路还一条都没报上来（RaceBox 云是整段一次性发出去的），
+                    // 摆个「0 条」看着像卡死，不如直说正在传
+                    (format!("{}…", t!("上传中", "Uploading")), p.muted)
                 } else {
                     (tr!("{} 条", "{} rec", fmt_count(row.uploaded)), p.text)
                 };
-                ui.label(egui::RichText::new(count_text).strong().color(count_color));
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // 速度单独放右边，不和计数挤在一起
-                    if !done && row.failed == 0 {
-                        if let Some(r) = rate {
-                            ui.colored_label(
-                                p.muted,
-                                tr!("{} 条/秒", "{}/s", fmt_count(r.round() as usize)),
-                            );
-                        }
+                ui.label(egui::RichText::new(text).strong().color(color));
+                // 速度：跑的时候是实时值，跑完是这一路最后算出来的平均值——
+                // 两边留着，正好能横向比出哪一路慢
+                if row.failed == 0 {
+                    if let Some(rate) = row.rate.filter(|r| *r >= 1.0) {
+                        ui.add_space(6.0);
+                        ui.colored_label(p.muted, "·");
+                        ui.add_space(6.0);
+                        ui.colored_label(
+                            p.muted,
+                            tr!("{} 条/秒", "{}/s", fmt_count(rate.round() as usize)),
+                        );
                     }
-                });
-            });
-            let frac = if row.total > 0 {
-                (row.uploaded as f32 / row.total as f32).min(1.0)
-            } else {
-                0.0
-            };
-            // 条里不再塞文字：只有 6px 高，塞了也看不清（见上面的注释）
-            let bar = egui::ProgressBar::new(frac)
-                .fill(if row.failed > 0 { p.error } else { p.accent })
-                .desired_height(6.0)
-                .corner_radius(3.0);
-            ui.add(bar);
-            ui.add_space(8.0);
-        }
+                }
+            }
+        });
     }
 
     fn show_sync_tab(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -1252,13 +1313,6 @@ impl App {
             });
             ui.add_space(8.0);
 
-            // 上传是分几路同时走的（自己的库 + RaceBox 云），总环看不出哪一路慢，
-            // 这里给每一路一条自己的进度条。
-            if self.show_channels() {
-                self.channel_bars(ui, p);
-                ui.add_space(8.0);
-            }
-
             // 查询状态 / 清除内存 / 本地文件：三个等宽描边框居中。
             // 第三个是「切换开关」：点一下打开下面的本地文件卡，再点一下（或点卡里的
             // 「取消本地上传」）收起来，所以它选中时是实心红，平时是描边。
@@ -1352,7 +1406,15 @@ impl App {
             Some(RunMode::Sync) | Some(RunMode::Import)
         );
         let is_erase_task = self.current_mode == Some(RunMode::Erase);
+        // 跑的过程中也要出这张卡：实时速度、各通道状态都摆在这里，
+        // 等任务结束才显示的话，「实时」两个字就没意义了。
+        let live = self.running
+            && (downloading
+                || self.uploaded > 0
+                || !self.channels.is_empty()
+                || erase_percent.is_some());
         let has_result = self.status.is_some()
+            || live
             || (is_sync_task
                 && (!self.last_summary.is_empty()
                     || !self.sessions.is_empty()
@@ -1375,13 +1437,28 @@ impl App {
                     });
                 });
 
-                // ---------- 清除内存任务：只显示清理结果 ----------
-                if is_erase_task && !self.last_summary.is_empty() {
+                // ---------- ① 结论横幅：放最上面 ----------
+                // 跑完第一眼要看的是「成没成」，条数、耗时这些明细排在它后面。
+                // 同步 / 导入 / 清除内存都有结论，查询状态没有（那是一次读数）。
+                if (is_sync_task || is_erase_task) && !self.last_summary.is_empty() {
                     ui.add_space(12.0);
                     style::status_banner(ui, p, result_color, &self.last_summary.clone());
                 }
 
-                // ---------- 本次任务汇总：下载 / 已同步 / 清理内存 / 总耗时 ----------
+                // ---------- ② 待重传告警：要用户处理的事，紧跟着结论 ----------
+                if spool_pending > 0 {
+                    ui.add_space(10.0);
+                    ui.colored_label(
+                        p.warn,
+                        tr!(
+                            "本地缓存待重传 {} 个",
+                            "{} cached segment(s) waiting to be replayed",
+                            spool_pending
+                        ),
+                    );
+                }
+
+                // ---------- ③ 本次任务汇总：下载 / 已同步 / 清理内存 / 速度 / 总耗时 ----------
                 let stats = self.run_stats;
                 let synced = stats.map(|s| s.uploaded).unwrap_or(self.uploaded);
                 let downloaded = stats.map(|s| s.downloaded).unwrap_or(parsed);
@@ -1390,7 +1467,20 @@ impl App {
                     Some(false) => (t!("失败", "failed"), p.error),
                     None => (t!("未执行", "skipped"), p.muted),
                 };
-                let total_secs: f64 = self.phase_times.iter().map(|(_, d)| d.as_secs_f64()).sum();
+                let mut total_secs: f64 =
+                    self.phase_times.iter().map(|(_, d)| d.as_secs_f64()).sum();
+                // 跑的时候把「当前这一段」也算进去，否则总耗时看着一直不涨
+                if self.running {
+                    if let Some(start) = self.phase_start {
+                        total_secs += start.elapsed().as_secs_f64();
+                    }
+                }
+                // 速度优先用实时值（上传中这一段），跑完才回落到结算后的平均值：
+                // 以前跑的过程中这里一直是「—」，要等任务结束才知道快慢。
+                let speed_text = match self.upload_rate().or_else(|| self.avg_upload_rate(synced)) {
+                    Some(r) => tr!("{} 条/秒", "{} rec/s", fmt_count(r.round() as usize)),
+                    None => "—".to_string(),
+                };
                 // 汇总统计只在完整同步时展示
                 if is_sync_task
                     && (stats.is_some() || downloading || self.uploaded > 0 || erase_percent.is_some())
@@ -1423,19 +1513,7 @@ impl App {
                         ));
                         cells.push((t!("清理内存", "Erased"), erase_text.to_string(), erase_color));
                     }
-                    // 速度按“上传中”这一段算，扫描/连接/下载的时间不算进去
-                    cells.push((
-                        t!("上传速度", "Upload speed"),
-                        match self.avg_upload_rate(synced) {
-                            Some(r) => tr!(
-                                "{} 条/秒",
-                                "{} rec/s",
-                                fmt_count(r.round() as usize)
-                            ),
-                            None => "—".to_string(),
-                        },
-                        p.text,
-                    ));
+                    cells.push((t!("上传速度", "Upload speed"), speed_text, p.text));
                     cells.push((
                         t!("总耗时", "Total time"),
                         fmt_dur(Duration::from_secs_f64(total_secs)),
@@ -1460,6 +1538,42 @@ impl App {
                                 });
                             }
                         });
+                }
+
+                // ---------- ④ 各通道状态：一行文字，不带进度条 ----------
+                // 大圆环已经表达总体进度了，再摆两根条只是重复（数据是同一份、
+                // 同时往几路送）；这里只回答「哪一路慢」，跑的时候带实时速度。
+                if self.show_channels() {
+                    ui.add_space(10.0);
+                    self.channel_line(ui, p);
+                }
+
+                // ---------- ⑤ 运行中的实时计数 ----------
+                // 跑完就不重复「已下载 x 条」了——上面汇总网格里已经有这一格
+                if self.running && downloading {
+                    ui.add_space(8.0);
+                    let mut text = if total > 0 {
+                        tr!(
+                            "已下载 {} / {} 条",
+                            "downloaded {} / {}",
+                            parsed,
+                            total
+                        )
+                    } else {
+                        tr!("已下载 {} 条", "downloaded {}", parsed)
+                    };
+                    if received > parsed {
+                        text.push_str(&tr!(
+                            "（跳过无定位 {} 条）",
+                            " ({} skipped without a fix)",
+                            received - parsed
+                        ));
+                    }
+                    ui.colored_label(p.muted, text);
+                }
+                if let Some(percent) = erase_percent {
+                    ui.add_space(8.0);
+                    ui.colored_label(p.muted, tr!("清理内存 {}%", "erasing {}%", percent));
                 }
 
                 // 各阶段耗时（只针对完整同步）
@@ -1523,50 +1637,6 @@ impl App {
                                 });
                             }
                         });
-                }
-
-                // 待重传告警
-                if spool_pending > 0 {
-                    ui.add_space(8.0);
-                    ui.colored_label(
-                        p.warn,
-                        tr!(
-                            "本地缓存待重传 {} 个",
-                            "{} cached segment(s) waiting to be replayed",
-                            spool_pending
-                        ),
-                    );
-                }
-                // 下载 / 清理的实时计数（已下载显示的是有效定位记录数）
-                if downloading {
-                    ui.add_space(8.0);
-                    let mut text = if total > 0 {
-                        tr!(
-                            "已下载 {} / {} 条",
-                            "downloaded {} / {}",
-                            parsed,
-                            total
-                        )
-                    } else {
-                        tr!("已下载 {} 条", "downloaded {}", parsed)
-                    };
-                    if received > parsed {
-                        text.push_str(&tr!(
-                            "（跳过无定位 {} 条）",
-                            " ({} skipped without a fix)",
-                            received - parsed
-                        ));
-                    }
-                    ui.colored_label(p.muted, text);
-                }
-                if let Some(percent) = erase_percent {
-                    ui.add_space(8.0);
-                    ui.colored_label(p.muted, tr!("清理内存 {}%", "erasing {}%", percent));
-                }
-                // 任务结果文字（只针对完整同步）
-                if is_sync_task && !self.last_summary.is_empty() {
-                    ui.add_space(10.0);
-                    style::status_banner(ui, p, result_color, &self.last_summary.clone());
                 }
 
                 // 本次数据段（最新的在最上面）
