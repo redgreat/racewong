@@ -173,3 +173,4 @@ routes/
 target/
 *.pdb
 .workbuddy-ai/
+.workbuddy/
