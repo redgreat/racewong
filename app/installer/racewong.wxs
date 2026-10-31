@@ -15,9 +15,27 @@
     <Property Id="ARPHELPLINK" Value="https://github.com/redgreat/racewong#readme" />
     <Property Id="ARPURLUPDATEINFO" Value="https://github.com/redgreat/racewong/releases" />
 
-    <!-- 蓝牙走 WinRT，Windows 10 以下没有对应 API -->
+    <!-- 蓝牙走 WinRT，Windows 10 以下没有对应 API，所以要先卡版本。
+         这里**不能**用 VersionNT >= 1000 判断 Win10：
+         msiexec.exe 自己的 manifest 只声明到 Windows 8.1，GetVersionEx 被
+         "版本伪装"成 6.3，于是 Windows 11 上 VersionNT 也是 603，
+         `VersionNT >= 1000` 恒为假 —— v0.1.10 及之前的安装包一启动就弹
+         “需要 Windows 10 或更高版本”，装不进去。
+         （日志里能看到 MSI 反复把 VersionNT 在 603/601/600/502/... 之间回写，
+         最后落回 603，这就是它的兼容模式探测过程。）
+         改用注册表 CurrentMajorVersionNumber：这个值 Win10 才引入，Win10/11 恒为 10，
+         且不受版本伪装影响；Win7/8 上这个值根本不存在。
+         注意 AppSearch 的 raw 取回来是带井号的 "#10"（MSI 用 # 表示整型），
+         直接和 10 做数值比较会被当成字符串比，反而不成立 —— 所以这里只判
+         “属性有没有被取到”，取到就说明是 Win10+，比比大小更稳。
+         顺带一提 WindowsBuild 也一起被伪装成了 9600，同样不能用来判版本。 -->
+    <Property Id="WINMAJORVERSION">
+      <RegistrySearch Id="WinMajorVersionSearch" Root="HKLM"
+                      Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+                      Name="CurrentMajorVersionNumber" Type="raw" Win64="yes" />
+    </Property>
     <Condition Message="RaceBox同步 需要 Windows 10 或更高版本。">
-      Installed OR VersionNT &gt;= 1000
+      Installed OR WINMAJORVERSION
     </Condition>
 
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
