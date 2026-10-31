@@ -322,14 +322,13 @@ impl App {
 
     /// 按当前设置准备 / 收起托盘图标。
     ///
-    /// 托盘图标只在“隐藏到托盘”模式下常驻——选“直接退出”时不该在通知区域多出一个图标。
+    /// **图标常驻**，不再跟着「关闭行为」开关——以前选「直接退出」就把图标销毁，
+    /// 结果用户点 × 前先看到图标没了，以为程序坏了；切回「隐藏到托盘」还要等
+    /// Windows 重新往通知区域塞一次，经常塞进折叠区里看不见。
+    /// 「关闭行为」只决定点 × 是退出还是藏起来，跟图标在不在没关系。
+    ///
     /// 创建失败会记住原因、不再重试（`tray_error`），避免每帧都去撞一次系统接口。
     fn sync_tray(&mut self) {
-        if self.cfg.close_action != CloseAction::Tray {
-            self.tray = None;
-            self.tray_error = None;
-            return;
-        }
         if self.tray.is_some() || self.tray_error.is_some() {
             return;
         }
@@ -1689,8 +1688,15 @@ impl App {
                 ui.colored_label(p.warn, t!("还没填写连接信息", "not configured yet"));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 按钮文字跟着状态走：还没填是「填写连接」，填过就是「修改连接」。
+                // 不带省略号——这不是「打开更多」的意思，就是一个直接的动作。
+                let label = if ready {
+                    t!("修改连接", "Edit connection")
+                } else {
+                    t!("填写连接", "Set up connection")
+                };
                 if ui
-                    .add(style::secondary_button(p, t!("填写连接…", "Connection…")))
+                    .add(style::secondary_button(p, label))
                     .on_hover_text(match target {
                         ConnTarget::Pg => t!(
                             "同步前会先探一次连通性，连不上就直接停下，不会先把设备数据白下一遍。",
@@ -2257,7 +2263,8 @@ impl App {
                         && self.cfg.close_action != *action
                     {
                         self.cfg.close_action = *action;
-                        // 立即生效：切到“直接退出”就把托盘图标摘掉，反之马上挂上
+                        // 图标常驻，这里不用再管它；留着调用是为了万一以后
+                        // 托盘创建失败过（tray_error），切换设置时能再试一次
                         self.sync_tray();
                     }
                 }
@@ -2344,7 +2351,10 @@ impl App {
         });
 
         ui.add_space(16.0);
-        // 保存 / 放弃靠右下角（右侧留点空隙，不贴边）
+        // 保存 / 放弃靠右下角（右侧留点空隙，不贴边）。
+        // 状态提示跟按钮**同一行**放在左边：原来它单独占一行、还靠左贴边，
+        // 点完保存视线要往下跳一大截才看得到结果。先拷一份，闭包里要改 self。
+        let action_result = self.action_result.clone();
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(56.0);
             if ui
@@ -2366,10 +2376,13 @@ impl App {
             {
                 self.save_config();
             }
+            if let Some((text, level)) = &action_result {
+                ui.add_space(12.0);
+                // 剩下的宽度全给提示，超了截断，绝不把按钮挤出去
+                let max_w = (ui.available_width() - 4.0).max(60.0);
+                style::status_pill(ui, p, level_color(p, *level), text, max_w);
+            }
         });
-        if let Some((text, level)) = &self.action_result {
-            style::status_banner(ui, p, level_color(p, *level), text);
-        }
     }
 
     /// 日志抽屉内容（底部可折叠面板，不再是独立标签页）。
@@ -2481,6 +2494,11 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.ctx.is_none() {
             self.ctx = Some(ctx.clone());
+            // 启动时 main.rs 已经 apply 过一次，但那时还没进入真正的帧循环，
+            // 「让系统标题栏跟着主题走」这条视口命令可能没被派发出去。
+            // 第一帧再补一次：apply 是幂等的，多调一次没有副作用。
+            style::apply(ctx, self.cfg.theme);
+            self.applied_theme = self.cfg.theme;
         }
         // 托盘图标要在事件循环起来之后才能建，所以放在这里（每帧检查一次，没需求就直接返回）
         self.sync_tray();

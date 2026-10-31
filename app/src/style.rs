@@ -77,13 +77,15 @@ pub fn palette(theme: Theme) -> Palette {
         },
         Theme::Light => Palette {
             theme,
-            bg: Color32::from_rgb(0xf1, 0xf1, 0xf3),
+            // 底色压到比卡片明显深一档：原来 #f1f1f3 配白卡，1px 的 #e4e4ec 描边
+            // 几乎看不见，整页像一张白纸、卡片边界全靠文字撑。
+            bg: Color32::from_rgb(0xe8, 0xe8, 0xec),
             header: Color32::WHITE,
             card: Color32::WHITE,
-            card_stroke: Color32::from_rgb(0xe4, 0xe4, 0xec),
-            edit_bg: Color32::from_rgb(0xf7, 0xf7, 0xf9),
-            track: Color32::from_rgb(0xe4, 0xe4, 0xec),
-            hover: Color32::from_rgb(0xef, 0xef, 0xf3),
+            card_stroke: Color32::from_rgb(0xd2, 0xd2, 0xdb),
+            edit_bg: Color32::from_rgb(0xf6, 0xf6, 0xf8),
+            track: Color32::from_rgb(0xdc, 0xdc, 0xe4),
+            hover: Color32::from_rgb(0xe9, 0xe9, 0xef),
             text: Color32::from_rgb(0x2c, 0x2c, 0x2c),
             muted: Color32::from_rgb(0x6e, 0x6f, 0x75),
             accent: Color32::from_rgb(0xea, 0x21, 0x27),
@@ -179,6 +181,16 @@ pub fn apply(ctx: &egui::Context, theme: Theme) {
     style.spacing.indent = 18.0;
 
     ctx.set_style(style);
+
+    // 原生标题栏 / 边框不属于 egui 画的内容，`Visuals` 改不到它：不显式告诉
+    // 系统，切到浅色主题后标题栏还是黑的，跟白色内容硬生生劈成两截。
+    // egui-winit 收到这条命令会调 `Window::set_theme`，Windows 上就是改 DWM 的
+    // 深色模式属性。
+    ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(if p.is_dark() {
+        egui::SystemTheme::Dark
+    } else {
+        egui::SystemTheme::Light
+    }));
 }
 
 /// 把卡片撑满当前可用宽度。
@@ -238,12 +250,26 @@ pub fn modal_shield(ctx: &egui::Context, p: &Palette) {
 }
 
 /// 卡片容器：统一底色、描边、圆角与内边距。
+///
+/// 浅色主题下白卡压在白底上只靠 1px 描边区分，屏幕一暗就糊成一片，
+/// 所以额外加一层几乎看不出来的投影——它不制造“浮起”的观感，只是把边界
+/// 描实；深色主题本身层次够，加阴影反而脏。
 pub fn card(p: &Palette) -> egui::Frame {
-    egui::Frame::group(&egui::Style::default())
+    let frame = egui::Frame::group(&egui::Style::default())
         .fill(p.card)
         .stroke(Stroke::new(1.0_f32, p.card_stroke))
         .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::symmetric(14, 12))
+        .inner_margin(Margin::symmetric(14, 12));
+    if p.is_dark() {
+        frame
+    } else {
+        frame.shadow(egui::epaint::Shadow {
+            offset: [0, 1],
+            blur: 4,
+            spread: 0,
+            color: Color32::from_rgba_unmultiplied(0x20, 0x20, 0x30, 26),
+        })
+    }
 }
 
 /// 主按钮（强调色填充）。
@@ -736,6 +762,26 @@ pub fn status_banner(ui: &mut egui::Ui, p: &Palette, color: Color32, text: &str)
                 color,
                 egui::RichText::new(text.to_owned()).strong(),
             );
+        });
+}
+
+/// 单行状态标签：和按钮排在同一行的轻量版横幅。
+///
+/// 和 [`status_banner`] 的区别是**不换行**：换行会把整行撑高、按钮跟着往下掉。
+/// 超宽就截断（`max_w` 由调用方按剩余宽度给），鼠标悬停能看全文。
+pub fn status_pill(ui: &mut egui::Ui, p: &Palette, color: Color32, text: &str, max_w: f32) {
+    let alpha = if p.is_dark() { 40 } else { 24 };
+    let inner = (max_w - 20.0).max(40.0);
+    egui::Frame::NONE
+        .fill(tint(color, alpha))
+        .stroke(Stroke::new(1.0_f32, tint(color, 100)))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            ui.set_max_width(inner);
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+            ui.colored_label(color, egui::RichText::new(text.to_owned()).strong())
+                .on_hover_text(text.to_owned());
         });
 }
 

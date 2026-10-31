@@ -456,6 +456,15 @@ if [ "$old_ver" != "$ver" ]; then
   else
     set_cargo_version "$ver"
     run git add "$APP_DIR/Cargo.toml" || die 'git add 失败'
+    # Cargo.lock 里也记着 workspace 成员的版本号，不同步的话下次
+    # `cargo build --locked`（CI 用的就是这个）会直接报
+    # "cannot update the lock file ... because --locked was passed"。
+    # `cargo metadata` 只重算依赖图、不编译，拿来刷锁文件最省事。
+    if [ -f "$APP_DIR/Cargo.lock" ]; then
+      ( cd "$APP_DIR" && run cargo metadata --offline --no-deps --format-version 1 >/dev/null ) \
+        || warn 'Cargo.lock 刷新失败，CI 可能因 --locked 报错'
+      run git add "$APP_DIR/Cargo.lock" || die 'git add 失败'
+    fi
     if [ "$DRY_RUN" = "1" ]; then
       printf '   [dry-run] git commit -m "chore(release): bump version to %s"\n' "$ver"
     else
