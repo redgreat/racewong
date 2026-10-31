@@ -69,6 +69,41 @@ impl MqttConfig {
     }
 }
 
+/// RaceBox 云上传（官网 racebox.pro）。
+///
+/// 和 `sink_mode` 里的 PostgreSQL / MQTT 不是互斥关系：那两条是「把数据送到
+/// 自己的库里」，这条是「同时往官网传一份」，所以单独一个开关。
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct CloudConfig {
+    /// 同步时是否顺带往官网传一份。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 上传时写进会话文件的设备序列号。0 表示不指定（官网会显示成未知设备）。
+    #[serde(default)]
+    pub device_serial: u64,
+    /// 会话头里的时区偏移（分钟）。+480 = UTC+8。
+    #[serde(default = "default_tz_offset")]
+    pub tz_offset_min: i16,
+    /// 上次导入本地文件的目录，下次打开直接用。
+    #[serde(default)]
+    pub import_dir: String,
+}
+
+fn default_tz_offset() -> i16 {
+    480
+}
+
+impl Default for CloudConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            device_serial: 0,
+            tz_offset_min: default_tz_offset(),
+            import_dir: String::new(),
+        }
+    }
+}
+
 /// 界面主题。
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -152,6 +187,9 @@ pub struct Config {
     pub pg: PgConfig,
     pub mqtt: MqttConfig,
     pub sink_mode: SinkMode,
+    /// RaceBox 云上传。老配置里没有这一项，默认关闭。
+    #[serde(default)]
+    pub cloud: CloudConfig,
     /// 点关闭按钮时的行为（老配置里没有这一项，默认直接退出）。
     #[serde(default)]
     pub close_action: CloseAction,
@@ -180,6 +218,7 @@ impl Default for Config {
             pg: PgConfig::default(),
             mqtt: MqttConfig::default(),
             sink_mode: SinkMode::default(),
+            cloud: CloudConfig::default(),
             close_action: CloseAction::default(),
             theme: Theme::default(),
             lang: Lang::default(),
@@ -234,7 +273,10 @@ pub fn log_path() -> PathBuf {
 pub fn load() -> Config {
     let path = config_path();
     let cfg = match std::fs::read_to_string(&path) {
-        Ok(text) => match serde_json::from_str::<Config>(&text) {
+        // UTF-8 BOM 会让 serde_json 直接报 "expected value at line 1 column 1"，
+        // 然后整份配置被丢掉换成默认值。Windows 上的编辑器/PowerShell 很容易写出
+        // 带 BOM 的 JSON，所以读进来先剥掉。
+        Ok(text) => match serde_json::from_str::<Config>(text.trim_start_matches('\u{feff}')) {
             Ok(cfg) => cfg,
             Err(e) => {
                 eprintln!("配置文件解析失败 {}, 使用默认配置: {e}", path.display());
@@ -255,6 +297,33 @@ pub fn save(cfg: &Config) -> std::io::Result<()> {
     std::fs::write(&path, text)
 }
 
+/// 只把云上传那一段写回 `config.json`。
+///
+/// 云页面是「改动立即生效」，直接 [`save`] 整份配置会把设置页里用户还没点
+/// 「保存设置」的改动一起落盘——那样设置页的「放弃修改」就失效了。
+/// 这里读回磁盘上的原文，只替换 `cloud` 这个键，其余原样保留。
+pub fn save_cloud(cloud: &CloudConfig) -> std::io::Result<()> {
+    let path = config_path();
+    // 原文读不回来就别写了：宁可这次云配置存不下，也不能把磁盘上那份配置清掉。
+    let text = std::fs::read_to_string(&path)?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(std::io::Error::other)?;
+    if !value.is_object() {
+        return Err(std::io::Error::other(format!(
+            "配置文件格式异常: {}",
+            path.display()
+        )));
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "cloud".to_string(),
+            serde_json::to_value(cloud).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string());
+    std::fs::write(&path, text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +334,18 @@ mod tests {
             let text = serde_json::to_string(&mode).unwrap();
             assert_eq!(serde_json::from_str::<SinkMode>(&text).unwrap(), mode);
         }
+    }
+
+    #[test]
+    fn bom_prefixed_json_still_parses() {
+        // PowerShell 的 Set-Content -Encoding utf8 会在开头写 EF BB BF，
+        // 不剥掉的话整份配置会被当成解析失败、静默退回默认值。
+        let body = serde_json::to_string(&Config::default()).unwrap();
+        let with_bom = format!("\u{feff}{body}");
+        let parsed = serde_json::from_str::<Config>(with_bom.trim_start_matches('\u{feff}')).unwrap();
+        assert_eq!(parsed.lang, Config::default().lang);
+        // 反过来确认：不剥 BOM 确实会失败，这个测试才有意义
+        assert!(serde_json::from_str::<Config>(&with_bom).is_err());
     }
 
     #[test]

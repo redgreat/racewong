@@ -62,6 +62,7 @@ fn read_session(json_path: &Path) -> Option<Session> {
         sync_total_upper: meta.sync_total_upper,
         sync_received_total: meta.sync_received_total,
         sync_final: meta.sync_final,
+        display: None,
     })
 }
 

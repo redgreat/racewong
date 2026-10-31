@@ -181,6 +181,59 @@ pub fn apply(ctx: &egui::Context, theme: Theme) {
     ctx.set_style(style);
 }
 
+/// 把卡片撑满当前可用宽度。
+///
+/// 不能写成 `ui.set_width(ui.available_width())`：`set_width` 走的是「下一个控件
+/// 占多大地方」那套逻辑，会把 `item_spacing`（默认 8px）一起算进 `min_rect`，
+/// 卡片因此比可用宽度宽 8px；更麻烦的是它还会顺手把外层 ui 的可用宽度顶宽，
+/// 一页下来越靠后的卡片越往右溢出——设置页从第 5 张卡开始右边就贴到窗口边上了。
+/// `expand_to_include_rect` 只改 `min_rect`，不加间距也不动 `max_rect`，没有这个副作用。
+pub fn fill_card_width(ui: &mut egui::Ui) {
+    let width = ui.available_width();
+    if width <= 0.0 {
+        return;
+    }
+    let min = ui.min_rect().min;
+    ui.expand_to_include_rect(egui::Rect::from_min_size(
+        min,
+        egui::vec2(width, 0.0),
+    ));
+}
+
+/// 浮动窗口（弹窗、关于）的统一外框：底色、描边、大圆角、阴影。
+///
+/// 默认 `Frame::window` 的圆角只有 2~6px，看着像系统对话框；这里统一放大到 14px，
+/// 并和内边距一起收在一处，省得每个窗口各写一遍。
+pub fn window(p: &Palette) -> egui::Frame {
+    egui::Frame::window(&egui::Style::default())
+        .fill(p.card)
+        .stroke(Stroke::new(1.0_f32, p.card_stroke))
+        .corner_radius(CornerRadius::same(14))
+        .inner_margin(Margin::same(16))
+}
+
+/// 模态遮罩：盖满整个窗口，把背景压暗并吃掉落在背景上的点击和滚轮。
+///
+/// egui 没有内置「模态窗口」，不加这层的话弹窗开着时照样能点后面的返回、
+/// 设置、输入框——看起来像弹窗，实际还在操作背后的页面。
+/// 画在 `Order::Middle`，且要在弹窗之前创建：同层按创建顺序叠放，
+/// 这样它在面板（Background）之上、弹窗之下。
+pub fn modal_shield(ctx: &egui::Context, p: &Palette) {
+    let screen = ctx.screen_rect();
+    egui::Area::new(egui::Id::new("modal_shield"))
+        .order(egui::Order::Middle)
+        .interactable(true)
+        .movable(false)
+        .anchor(egui::Align2::LEFT_TOP, [0.0, 0.0])
+        .show(ctx, |ui| {
+            let (rect, _) = ui.allocate_exact_size(screen.size(), egui::Sense::click_and_drag());
+            // 深色底下压得更狠一点才压得住，浅色稍微透一点不然太脏
+            let alpha = if p.is_dark() { 150 } else { 90 };
+            ui.painter()
+                .rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, alpha));
+        });
+}
+
 /// 卡片容器：统一底色、描边、圆角与内边距。
 pub fn card(p: &Palette) -> egui::Frame {
     egui::Frame::group(&egui::Style::default())
@@ -285,6 +338,112 @@ pub fn outline_button(
     resp
 }
 
+/// 描边按钮，但多一个「已选中」状态：选中时是强调色实心胶囊。
+///
+/// 用来做“切换开关”类的按钮（比如主页上的「选择本地文件」）：点一下打开、
+/// 再点一下关掉，光靠描边看不出来现在是开还是关，所以选中态必须有实色。
+pub fn toggle_outline_button(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    selected: bool,
+    min_size: egui::Vec2,
+    enabled: bool,
+) -> egui::Response {
+    let font = egui::FontId::proportional(14.0);
+    let text_color = if selected {
+        p.accent_text
+    } else if enabled {
+        p.text
+    } else {
+        p.muted
+    };
+    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font, text_color));
+    let size = egui::vec2(
+        min_size.x.max(galley.size().x + 36.0),
+        min_size.y,
+    );
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_at_least(size, sense);
+    let bg = if selected {
+        p.accent
+    } else if resp.hovered() && enabled {
+        p.hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    let border = if selected { p.accent } else { p.card_stroke };
+    ui.painter().rect_filled(rect, CornerRadius::same(6), bg);
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(6),
+        Stroke::new(1.0_f32, border),
+        egui::epaint::StrokeKind::Inside,
+    );
+    let pos = rect.center() - galley.size() / 2.0;
+    ui.painter().galley(pos, galley, text_color);
+    resp
+}
+
+/// 弹窗底部的一对按钮：两个等宽、整体居中（不再从左边排起）。
+///
+/// 返回 `(确定/登录, 取消)` 两个布尔，方便调用方自己决定关窗之后要做什么。
+pub fn dialog_buttons(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    ok: &str,
+    cancel: &str,
+    ok_enabled: bool,
+) -> (bool, bool) {
+    let mut ok_clicked = false;
+    let mut cancel_clicked = false;
+    ui.vertical_centered(|ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            let w = ((ui.available_width() - 12.0) / 2.0).max(96.0);
+            if ui
+                .add_enabled(
+                    ok_enabled,
+                    primary_button(p, ok).min_size(egui::vec2(w, 32.0)),
+                )
+                .clicked()
+            {
+                ok_clicked = true;
+            }
+            if ui
+                .add(secondary_button(p, cancel).min_size(egui::vec2(w, 32.0)))
+                .clicked()
+            {
+                cancel_clicked = true;
+            }
+        });
+    });
+    (ok_clicked, cancel_clicked)
+}
+
+/// 弹窗里的一行字段：小号标签在上、输入框撑满宽度。
+pub fn dialog_field(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    value: &mut String,
+    password: bool,
+    revealed: bool,
+) {
+    ui.colored_label(p.muted, label.to_owned());
+    ui.add_space(4.0);
+    let mut edit = egui::TextEdit::singleline(value).desired_width(f32::INFINITY);
+    if password && !revealed {
+        edit = edit.password(true);
+    }
+    ui.add(edit);
+    ui.add_space(8.0);
+}
+
 /// 小号圆角按钮（日志抽屉的收起/清空）。
 pub fn small_button(p: &Palette, label: &str) -> egui::Button<'static> {
     egui::Button::new(egui::RichText::new(label.to_owned()).color(p.muted))
@@ -307,40 +466,143 @@ pub fn hint(ui: &mut egui::Ui, p: &Palette, text: &str) {
     ui.label(egui::RichText::new(text.to_owned()).color(p.muted));
 }
 
+/// 卡片标题 + 右上角说明图标。
+///
+/// 说明文字以前是直接铺在卡片里的（见 [`hint`]），一屏要滚很久才看完内容区域；
+/// 现在统一收进这个按钮：点一下才出，同一张卡的说明可以有好几条而不会互相挤。
+pub fn card_title_with_help(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    title: &str,
+    id_source: impl std::hash::Hash,
+    help: &str,
+) {
+    ui.horizontal(|ui| {
+        card_title(ui, p, title);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            help_icon(ui, p, id_source, help);
+        });
+    });
+}
+
+/// 说明图标：一个小小的「?」，点一下才把说明弹出来（点击别处收起）。
+///
+/// 不用 [`egui::Response::on_hover_text`]：悬停提示在正要伸手点输入框时容易自己冒出来，
+/// 挡住下面的控件；点开再看的节奏更可控，同一行放好几个也不会互相干扰。
+pub fn help_icon(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    id_source: impl std::hash::Hash,
+    text: &str,
+) -> egui::Response {
+    let popup_id = ui.make_persistent_id(&id_source);
+    let (rect, resp) = ui.allocate_at_least(egui::vec2(16.0, 16.0), egui::Sense::click());
+    let active = resp.hovered() || ui.memory(|m| m.is_popup_open(popup_id));
+    let color = if active { p.accent } else { p.muted };
+    let c = rect.center();
+    ui.painter()
+        .circle_stroke(c, 7.0, Stroke::new(1.0_f32, color));
+    let galley = ui.fonts(|f| {
+        f.layout_no_wrap("?".to_owned(), egui::FontId::proportional(10.5), color)
+    });
+    ui.painter().galley(
+        egui::pos2(c.x - galley.size().x / 2.0, c.y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+
+    let popup_id = ui.make_persistent_id(&id_source);
+    if resp.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+    egui::popup::popup_below_widget(
+        ui,
+        popup_id,
+        &resp,
+        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_max_width(300.0);
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.add_space(2.0);
+            ui.colored_label(p.text, text.to_owned());
+            ui.add_space(2.0);
+        },
+    );
+    resp
+}
+
+/// 选项卡片：标题 + 一行说明，选中时强调色描边 + 左侧竖条。
+///
+/// 取代原来的圆点单选（[`radio_button`]）：两个圆点加一行字的排法在深色卡片里
+/// 既不显眼也不好读，换成整块可点的卡片，选项的含义（副标题）能一起说出来。
+pub fn choice_card(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    selected: bool,
+    title: &str,
+    subtitle: &str,
+    size: egui::Vec2,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_at_least(size, egui::Sense::click());
+    let radius = CornerRadius::same(9);
+    let fill = if selected {
+        tint(p.accent, if p.is_dark() { 30 } else { 20 })
+    } else if resp.hovered() {
+        p.hover
+    } else {
+        p.card
+    };
+    ui.painter().rect_filled(rect, radius, fill);
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        Stroke::new(
+            if selected { 1.6_f32 } else { 1.0_f32 },
+            if selected { p.accent } else { p.card_stroke },
+        ),
+        egui::epaint::StrokeKind::Inside,
+    );
+    // 选中标记：左侧一条强调色竖条，比圆点更容易一眼扫到
+    if selected {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.min.x + 8.0, rect.center().y - 9.0),
+                egui::vec2(3.0, 18.0),
+            ),
+            CornerRadius::same(2),
+            p.accent,
+        );
+    }
+    let left = rect.min.x + 22.0;
+    let max_text = (rect.width() - 34.0).max(30.0);
+    let title_galley = ui.fonts(|f| {
+        f.layout_no_wrap(
+            title.to_owned(),
+            egui::FontId::proportional(13.5),
+            if selected { p.text } else { p.text },
+        )
+    });
+    let sub_job = egui::text::LayoutJob::simple(
+        subtitle.to_owned(),
+        egui::FontId::proportional(11.5),
+        p.muted,
+        max_text,
+    );
+    let sub_galley = ui.fonts(|f| f.layout_job(sub_job));
+    let top = rect.center().y - (title_galley.size().y + 3.0 + sub_galley.size().y) / 2.0;
+    ui.painter()
+        .galley(egui::pos2(left, top), title_galley.clone(), p.text);
+    ui.painter().galley(
+        egui::pos2(left, top + title_galley.size().y + 3.0),
+        sub_galley,
+        p.muted,
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// 给颜色加透明度，用来做浅色底/描边。
 pub fn tint(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
-}
-
-/// 单选框：左侧圆点 + 文字，整行可点。
-///
-/// 同一组里永远只有一个被选中——分段按钮那种“看起来像按钮”的样式容易被误读成
-/// 多选/多开，单选语义用单选控件表达最直观。
-pub fn radio_button(ui: &mut egui::Ui, p: &Palette, selected: bool, label: &str) -> egui::Response {
-    let text_color = if selected { p.text } else { p.muted };
-    let galley = ui.fonts(|f| {
-        f.layout_no_wrap(
-            label.to_owned(),
-            egui::FontId::proportional(13.5),
-            text_color,
-        )
-    });
-    let size = egui::vec2(galley.size().x + 34.0, 28.0);
-    let (rect, resp) = ui.allocate_at_least(size, egui::Sense::click());
-    if resp.hovered() {
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(6), p.hover);
-    }
-    let c = egui::pos2(rect.min.x + 13.0, rect.center().y);
-    let ring = if selected { p.accent } else { p.muted };
-    ui.painter()
-        .circle_stroke(c, 6.0, Stroke::new(1.6_f32, ring));
-    if selected {
-        ui.painter().circle_filled(c, 3.2, p.accent);
-    }
-    let pos = egui::pos2(c.x + 13.0, rect.center().y - galley.size().y / 2.0);
-    ui.painter().galley(pos, galley, text_color);
-    resp
 }
 
 /// 状态小图标：对勾 / 叉，直接用线段画。
@@ -438,6 +700,7 @@ pub fn gear_button(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
     resp
 }
 
+/// 云图标按钮（RaceBox 云页面入口，无文字）。
 /// 信息图标按钮（关于入口，无文字）。
 pub fn info_button(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
     let (rect, resp) = ui.allocate_at_least(egui::vec2(32.0, 32.0), egui::Sense::click());
@@ -708,8 +971,12 @@ pub fn round_action_button(
     //
     // 只按直径定字号是不够的：中文「开始同步」4 个字，德语
     // 「Synchronisierung starten」是它的四倍宽，固定字号必然横着捅出圆外。
-    let max_w = (r_circle * 1.62).max(40.0);
-    let max_h = (r_circle * 1.5).max(40.0);
+    //
+    // 宽度按「内接矩形」算：一行文字的四个角到圆心的距离都不能超过半径，
+    // 所以可用宽度 ≈ 2·sqrt(r² - (0.62·字号)²)。取 1.95 倍半径是个偏保守的
+    // 近似值，既能放下「上传 1 个文件」，又不会让文字顶到圆边上。
+    let max_w = (r_circle * 1.95).max(44.0);
+    let max_h = (r_circle * 1.9).max(44.0);
     let make_job = |font_size: f32| {
         let mut job = egui::text::LayoutJob::simple(
             label.to_owned(),
@@ -719,11 +986,18 @@ pub fn round_action_button(
         );
         // 只在词边界换行：德语那种超长单词被拦腰截断比缩小字号更难看
         job.wrap.break_anywhere = false;
-        job.wrap.max_rows = 3;
+        job.wrap.max_rows = 2;
         job
     };
     let mut font_size = (size * 0.115).max(12.0);
     let mut galley = ui.fonts(|f| f.layout_job(make_job(font_size)));
+    // 先尽量压成**一行**：多行时 galley 的宽高是「最宽那一行」和「总行高」，
+    // 光看这两个数会误判成放得下，于是永远停在两行（「上传 1 个 / 文件」就是这么来的）。
+    while font_size > 9.0 && galley.rows.len() > 1 {
+        font_size -= 0.5;
+        galley = ui.fonts(|f| f.layout_job(make_job(font_size)));
+    }
+    // 压到一行之后（或本来就一行）再检查有没有超出圆内接矩形
     while font_size > 9.0 && (galley.size().x > max_w + 0.5 || galley.size().y > max_h) {
         font_size -= 0.5;
         galley = ui.fonts(|f| f.layout_job(make_job(font_size)));

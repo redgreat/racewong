@@ -8,7 +8,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use crate::config::{self, CloseAction, Config, SinkMode, Theme};
 use crate::i18n::Lang;
 use crate::protocol::DeviceStatus;
-use crate::style::{self, Palette};
+use crate::style::{self, dialog_field, Palette};
 use crate::worker::{LogLevel, NoticeTarget, Phase, RunMode, RunStats, UiEvent};
 use crate::{t, tr};
 
@@ -16,6 +16,27 @@ use crate::{t, tr};
 enum Tab {
     Sync,
     Settings,
+}
+
+/// 同步页的两种数据来源。
+///
+/// 设备同步（BLE 下载后上传）和本地文件导入是两件不同的事，硬挤在一屏里
+/// 又长又乱，顶栏用一条分段控件二选一：每一屏都正好放得下。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SyncSource {
+    /// 从 RaceBox 设备下载。
+    Device,
+    /// 从本地 .gpx / .fit 文件导入。
+    Files,
+}
+
+/// 一路上传通道的运行进度（下载完成后数据会同时往几路送）。
+#[derive(Clone)]
+struct ChannelRow {
+    name: String,
+    uploaded: usize,
+    failed: usize,
+    total: usize,
 }
 
 /// 连接测试的状态（进行中 / 结果文字 / 结果等级）。
@@ -43,6 +64,69 @@ enum UpdateMsg {
     Failed(String),
 }
 
+/// 弹窗里在填的东西。
+///
+/// 账号密码这类敏感字段不在页面上直接摆输入框：设置页一眼扫过去全是密文字段
+/// 既占地方又容易误改，收进弹窗按需编辑，页面只显示「已设置 · 修改」。
+enum Dialog {
+    /// RaceBox 云账号登录。
+    CloudLogin {
+        email: String,
+        password: String,
+        revealed: bool,
+    },
+    /// PostgreSQL / MQTT 的完整连接参数（主机、端口、账号密码……）。
+    Connection {
+        target: ConnTarget,
+        draft: ConnDraft,
+        revealed: bool,
+    },
+    /// 一句话提示（比如点上传时才发现没登录）。
+    ///
+    /// 这类话不常驻在页面上占一行——真走到那一步才弹一次。
+    Notice {
+        title: String,
+        body: String,
+    },
+}
+
+/// 哪一路上传通道的连接参数。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConnTarget {
+    Pg,
+    Mqtt,
+}
+
+impl ConnTarget {
+    fn title(self) -> &'static str {
+        match self {
+            ConnTarget::Pg => "PostgreSQL",
+            ConnTarget::Mqtt => "MQTT",
+        }
+    }
+}
+
+/// 连接参数弹窗里正在编辑的草稿。
+///
+/// PostgreSQL 和 MQTT 要填的字段不完全一样，这里取并集，渲染时按 target 挑着显示，
+/// 好处是开关弹窗、写入配置都只有一份代码。
+#[derive(Clone)]
+struct ConnDraft {
+    /// PostgreSQL 的主机 / MQTT 的 broker 地址。
+    host: String,
+    port: String,
+    /// PostgreSQL 库名（MQTT 不用）。
+    database: String,
+    user: String,
+    password: String,
+    /// MQTT 主题（PostgreSQL 不用）。
+    topic: String,
+    /// MQTT 客户端 ID（PostgreSQL 不用）。
+    client_id: String,
+    /// MQTT 保活间隔，字符串进弹窗、落盘时才解析（MQTT 不用时忽略）。
+    keepalive: String,
+}
+
 pub struct App {
     cfg: Config,
     runtime: Arc<Runtime>,
@@ -53,6 +137,10 @@ pub struct App {
     ctx: Option<egui::Context>,
     applied_theme: Theme,
     tab: Tab,
+    /// 同步页当前看的是设备同步还是本地文件导入。
+    source: SyncSource,
+    /// RaceBox 云页面的状态（登录、导入、云端列表）。
+    cloud: crate::cloud_ui::CloudState,
     /// 日志抽屉是否展开（日志不再是独立标签页）。
     show_logs: bool,
     about_open: bool,
@@ -77,8 +165,8 @@ pub struct App {
     /// 已上传记录数 / 计划总数（外圈环）。
     uploaded: usize,
     upload_total: usize,
-    /// 当前正在上传的那一段：(段号, 已写入, 总数)。
-    session_progress: Option<(u32, usize, usize)>,
+    /// 各上传通道各自的进度（PostgreSQL / MQTT / RaceBox 云）。
+    channels: Vec<ChannelRow>,
     erase_percent: Option<u8>,
     spool_pending: usize,
     running: bool,
@@ -118,6 +206,10 @@ pub struct App {
     update_rx: std::sync::mpsc::Receiver<UpdateMsg>,
     update_busy: bool,
     update_result: Option<(String, LogLevel)>,
+    /// 当前打开的编辑弹窗（凭据 / 云登录）。
+    dialog: Option<Dialog>,
+    /// 关于窗口上一次的矩形：判断点击是不是落在窗口外要靠它。
+    about_rect: Option<egui::Rect>,
 }
 
 impl App {
@@ -136,6 +228,7 @@ impl App {
         let settings_snapshot = cfg.clone();
         let scan_timeout_buf = cfg.scan_timeout_secs.to_string();
         let keepalive_buf = cfg.mqtt.keepalive_secs.to_string();
+        let cloud = crate::cloud_ui::CloudState::new(&cfg, window_handle);
         Self {
             cfg,
             runtime,
@@ -146,6 +239,8 @@ impl App {
             ctx: None,
             applied_theme,
             tab: Tab::Sync,
+            source: SyncSource::Device,
+            cloud,
             show_logs: false,
             about_open: false,
             settings_snapshot,
@@ -163,7 +258,7 @@ impl App {
             downloaded_parsed: 0,
             uploaded: 0,
             upload_total: 0,
-            session_progress: None,
+            channels: Vec::new(),
             erase_percent: None,
             spool_pending: 0,
             running: false,
@@ -190,6 +285,8 @@ impl App {
             update_rx,
             update_busy: false,
             update_result: None,
+            dialog: None,
+            about_rect: None,
         }
     }
 
@@ -222,8 +319,7 @@ impl App {
     }
 
     /// 处理托盘菜单与窗口关闭请求。
-    fn handle_close_and_tray(&mut self, ctx: &egui::Context) {
-        // 托盘里点了「退出」：标志位在点击时就立好了（窗口藏起来时不一定还有帧，
+    fn handle_close_and_tray(&mut self, ctx: &egui::Context) {        // 托盘里点了「退出」：标志位在点击时就立好了（窗口藏起来时不一定还有帧，
         // 队列里的命令可能来不及消费），这里必须先认下来，否则下面会把这次
         // 关闭请求当成「收进托盘」再 CancelClose 一次，窗口就再也关不掉了。
         if crate::tray::quit_requested() {
@@ -353,6 +449,36 @@ impl App {
         self.running && (self.erase_percent.is_some() || self.phase == Phase::Erasing)
     }
 
+    /// 上传中的实时速度（条/秒）。
+    ///
+    /// 只在“上传中”阶段且已经跑了一会儿才有意义：刚进阶段那几百毫秒里
+    /// 计数还是 0，算出来会是 0 条/秒，看着像卡住了。
+    fn upload_rate(&self) -> Option<f64> {
+        if self.phase != Phase::Uploading || !self.running {
+            return None;
+        }
+        let secs = self.phase_start?.elapsed().as_secs_f64();
+        if secs < 0.4 || self.uploaded == 0 {
+            return None;
+        }
+        Some(self.uploaded as f64 / secs)
+    }
+
+    /// 结算后的平均上传速度（条/秒）：用“上传中”这一段的耗时算，
+    /// 不把扫描/连接/下载的时间摊进去。
+    fn avg_upload_rate(&self, records: usize) -> Option<f64> {
+        let secs: f64 = self
+            .phase_times
+            .iter()
+            .filter(|(ph, _)| *ph == Phase::Uploading)
+            .map(|(_, d)| d.as_secs_f64())
+            .sum();
+        if secs < 0.05 || records == 0 {
+            return None;
+        }
+        Some(records as f64 / secs)
+    }
+
     fn drain_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
@@ -411,14 +537,39 @@ impl App {
                     self.uploaded = uploaded;
                     self.upload_total = total;
                 }
-                UiEvent::SessionProgress { index, done, total } => {
-                    self.session_progress = Some((index, done, total));
+                UiEvent::ChannelList(names) => {
+                    // 新任务先重建：通道数量随设置变化，上一次的残留要丢掉
+                    self.channels = names
+                        .into_iter()
+                        .map(|name| ChannelRow {
+                            name,
+                            uploaded: 0,
+                            failed: 0,
+                            total: 0,
+                        })
+                        .collect();
+                    self.phase_times.retain(|(p, _)| *p != Phase::Uploading);
                 }
-                UiEvent::SessionInfo { index, name, records, ok, detail } => {
-                    // 这一段已经有结论了，段内进度条该收起来了
-                    if matches!(self.session_progress, Some((i, _, _)) if i == index) {
-                        self.session_progress = None;
+                UiEvent::ChannelProgress {
+                    name,
+                    uploaded,
+                    failed,
+                    total,
+                } => match self.channels.iter_mut().find(|c| c.name == name) {
+                    Some(row) => {
+                        // 各段并发上传时计数可能有交错，取最大值避免进度条回退
+                        row.uploaded = row.uploaded.max(uploaded);
+                        row.failed = row.failed.max(failed);
+                        row.total = row.total.max(total);
                     }
+                    None => self.channels.push(ChannelRow {
+                        name,
+                        uploaded,
+                        failed,
+                        total,
+                    }),
+                },
+                UiEvent::SessionInfo { index, name, records, ok, detail } => {
                     self.sessions.push(SessionRow {
                         index,
                         name,
@@ -434,7 +585,6 @@ impl App {
                     self.close_phase();
                     self.running = false;
                     self.cancel_requested = false;
-                    self.session_progress = None;
                     self.phase = if cancelled {
                         Phase::Cancelled
                     } else if ok {
@@ -531,7 +681,6 @@ impl App {
         self.downloaded_parsed = 0;
         self.uploaded = 0;
         self.upload_total = 0;
-        self.session_progress = None;
         self.erase_percent = None;
         self.status = None;
         self.sessions.clear();
@@ -545,6 +694,66 @@ impl App {
         let cancel = self.cancel_flag.clone();
         runtime.spawn(async move {
             crate::worker::run_sync(cfg, mode, tx, cancel).await;
+        });
+        if let Some(ctx) = self.ctx.clone() {
+            ctx.request_repaint();
+        }
+    }
+
+    /// 上传勾选的本地文件。
+    ///
+    /// 和 [`Self::start`] 基本一样，只是后台跑的是 `worker::run_import`：
+    /// 不碰蓝牙，数据来源换成磁盘上的文件，上传通道、进度、结果展示全共用。
+    fn start_import(&mut self) {
+        let mut paths = self.cloud.selected_paths();
+        if paths.is_empty() {
+            // 一个都没勾就点「上传文件」：先把文件夹选择框弹出来，选完继续上传。
+            // 只弹一句「还没选文件」等于把用户顶回去再点一遍，白白多一步。
+            self.cloud.pick_dir(&mut self.cfg);
+            paths = self.cloud.selected_paths();
+        }
+        if paths.is_empty() {
+            self.dialog = Some(Dialog::Notice {
+                title: t!("还没选文件", "No file selected").to_string(),
+                body: t!(
+                    "先在下面的「本地文件」里勾选要上传的文件。",
+                    "Select the files to upload in the Local files card below first."
+                )
+                .to_string(),
+            });
+            return;
+        }
+        if self.running {
+            return;
+        }
+        self.commit_edits();
+        self.cancel_flag.store(false, Ordering::SeqCst);
+        self.cancel_requested = false;
+        self.current_mode = Some(RunMode::Import);
+        self.running = true;
+        self.phase = Phase::Starting;
+        self.phase_times.clear();
+        self.phase_start = Some(Instant::now());
+        self.run_stats = None;
+        self.last_summary.clear();
+        self.received = 0;
+        self.total = 0;
+        self.downloaded_parsed = 0;
+        self.uploaded = 0;
+        self.upload_total = 0;
+        self.erase_percent = None;
+        self.status = None;
+        self.sessions.clear();
+        self.push_log(
+            LogLevel::Info,
+            tr!("任务开始: {}", "task started: {}", mode_text(RunMode::Import)),
+        );
+        let cfg = Arc::new(self.cfg.clone());
+        let tx = self.tx.clone();
+        let runtime = self.runtime.clone();
+        let cancel = self.cancel_flag.clone();
+        runtime.spawn(async move {
+            crate::worker::run_import(cfg, paths, tx, cancel).await;
         });
         if let Some(ctx) = self.ctx.clone() {
             ctx.request_repaint();
@@ -623,6 +832,7 @@ impl App {
     /// 取消按钮文案：跟着当前任务类型走。
     fn cancel_label(&self) -> &'static str {
         match self.current_mode {
+            Some(RunMode::Import) => t!("取消上传", "Cancel upload"),
             Some(RunMode::Status) => t!("取消查询", "Cancel query"),
             Some(RunMode::Erase) => t!("取消清除内存", "Cancel erase"),
             _ => t!("取消同步", "Cancel sync"),
@@ -756,6 +966,78 @@ impl App {
         });
     }
 
+
+    /// 通道进度条要不要显示：有通道数据、且任务跑过（或正在跑）才展开。
+    fn show_channels(&self) -> bool {
+        !self.channels.is_empty() && (self.running || self.phase.is_final())
+    }
+
+    /// 每一路上传通道一条进度条。
+    ///
+    /// 计数**不能**交给 `ProgressBar::text()`：egui 把文字画在 `outer_rect` 里并用
+    /// `with_clip_rect(outer_rect)` 裁掉溢出部分，而这里为了好看把条压到了 6px 高，
+    /// 13px 的字就只剩中间一条缝，数字根本认不出来。所以数字单独放在条上面那行，
+    /// 条本身只负责「走了多少」。
+    fn channel_bars(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        ui.colored_label(p.muted, t!("上传通道", "Upload channels"));
+        ui.add_space(6.0);
+        // 实时速度对每一路都一样（数据是同时往几路送的），取一次就够
+        let rate = self.upload_rate();
+        for row in self.channels.clone() {
+            let done = row.uploaded >= row.total && row.total > 0;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(row.name.clone()).strong().color(p.text));
+                ui.add_space(8.0);
+                // 计数贴着通道名放：一眼就知道这个数属于哪一路
+                let (count_text, count_color) = if row.failed > 0 {
+                    (
+                        tr!("{} 条 · 失败 {} 条", "{} rec · {} failed", fmt_count(row.uploaded), fmt_count(row.failed)),
+                        p.error,
+                    )
+                } else if done {
+                    (tr!("{} 条 · 已完成", "{} rec · done", fmt_count(row.total)), p.success)
+                } else if row.total > 0 {
+                    (
+                        tr!(
+                            "{} / {} 条",
+                            "{} / {} rec",
+                            fmt_count(row.uploaded),
+                            fmt_count(row.total)
+                        ),
+                        p.text,
+                    )
+                } else {
+                    (tr!("{} 条", "{} rec", fmt_count(row.uploaded)), p.text)
+                };
+                ui.label(egui::RichText::new(count_text).strong().color(count_color));
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // 速度单独放右边，不和计数挤在一起
+                    if !done && row.failed == 0 {
+                        if let Some(r) = rate {
+                            ui.colored_label(
+                                p.muted,
+                                tr!("{} 条/秒", "{}/s", fmt_count(r.round() as usize)),
+                            );
+                        }
+                    }
+                });
+            });
+            let frac = if row.total > 0 {
+                (row.uploaded as f32 / row.total as f32).min(1.0)
+            } else {
+                0.0
+            };
+            // 条里不再塞文字：只有 6px 高，塞了也看不清（见上面的注释）
+            let bar = egui::ProgressBar::new(frac)
+                .fill(if row.failed > 0 { p.error } else { p.accent })
+                .desired_height(6.0)
+                .corner_radius(3.0);
+            ui.add(bar);
+            ui.add_space(8.0);
+        }
+    }
+
     fn show_sync_tab(&mut self, ui: &mut egui::Ui, p: &Palette) {
         // 预先取快照，避免闭包里同时借用 self
         let connected = !(self.device_name.is_empty() && self.device_address.is_empty());
@@ -764,6 +1046,10 @@ impl App {
         } else {
             t!("未连接", "not connected").to_string()
         };
+        // 数据源：设备（蓝牙）还是本地文件。开关在下面「本地文件」卡里。
+        let files_mode = self.source == SyncSource::Files;
+        let import_task = self.running && self.current_mode == Some(RunMode::Import);
+        let picked_files = self.cloud.selected_paths().len();
         let (received, total, parsed) = (self.received, self.total, self.downloaded_parsed);
         let downloading = total > 0 || parsed > 0;
         let erase_percent = self.erase_percent;
@@ -777,6 +1063,16 @@ impl App {
         // 单圈（Single）只画进度弧本身，不带占位轨道；只有同步有进度后才是带轨道的双层环
         let ring: style::RingMode = if !self.running {
             style::RingMode::Hidden
+        } else if import_task {
+            // 本地文件导入没有下载环节，只有一条上传进度
+            style::RingMode::Single {
+                progress: if self.upload_total > 0 {
+                    Some((self.uploaded as f32 / self.upload_total as f32).min(1.0))
+                } else {
+                    None
+                },
+                color: p.accent,
+            }
         } else if erasing || erase_task {
             style::RingMode::Single {
                 progress: erase_percent.map(|v| v as f32 / 100.0),
@@ -810,6 +1106,14 @@ impl App {
             }
         };
         let ring_text: Option<String> = match ring {
+            // 导入任务也只有一圈，但那是上传进度，不是清理进度
+            style::RingMode::Single { progress: Some(f), .. } if import_task => Some(tr!(
+                "上传 {}% · {}/{} 条",
+                "upload {}% · {}/{}",
+                (f * 100.0).round() as u32,
+                self.uploaded,
+                self.upload_total
+            )),
             style::RingMode::Single {
                 progress: Some(f), ..
             } => Some(tr!(
@@ -848,22 +1152,29 @@ impl App {
 
         // ---------- 主卡：大圆钮 + 两个描边按键（紧凑，一屏放得下） ----------
         style::card(p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+            style::fill_card_width(ui);
 
             // 圆形主按钮 + 进度说明（阶段状态看左下角状态栏，这里不重复）
             ui.vertical_centered(|ui| {
                 ui.add_space(2.0);
                 let circle_label = if erasing {
-                    t!("清理内存中", "Erasing")
+                    t!("清理内存中", "Erasing").to_string()
                 } else if self.running {
-                    self.cancel_label()
+                    self.cancel_label().to_string()
+                } else if files_mode {
+                    // 一个主按钮承担两种来源：文案说清楚这次按下去传的是什么
+                    if picked_files > 0 {
+                        tr!("上传 {} 个文件", "upload {} files", picked_files)
+                    } else {
+                        t!("上传文件", "Upload files").to_string()
+                    }
                 } else {
-                    t!("开始同步", "Start sync")
+                    t!("开始同步", "Start sync").to_string()
                 };
                 if style::round_action_button(
                     ui,
                     p,
-                    circle_label,
+                    &circle_label,
                     self.running,
                     !erasing,
                     ring,
@@ -877,6 +1188,11 @@ impl App {
                     )
                 } else if self.running {
                     t!("点击取消当前任务", "click to cancel the current task")
+                } else if files_mode {
+                    t!(
+                        "把勾选的本地文件上传到设置里配置的去处",
+                        "upload the selected local files to the configured destinations"
+                    )
                 } else {
                     t!(
                         "下载数据并按设置上传，成功后自动清理设备内存",
@@ -887,6 +1203,8 @@ impl App {
                 {
                     if self.running {
                         self.cancel_run();
+                    } else if files_mode {
+                        self.start_import();
                     } else {
                         self.start(RunMode::Sync);
                     }
@@ -898,17 +1216,29 @@ impl App {
             });
             ui.add_space(8.0);
 
-            // 查询状态 / 清除内存：描边样式，平铺居中
+            // 上传是分几路同时走的（自己的库 + RaceBox 云），总环看不出哪一路慢，
+            // 这里给每一路一条自己的进度条。
+            if self.show_channels() {
+                self.channel_bars(ui, p);
+                ui.add_space(8.0);
+            }
+
+            // 查询状态 / 清除内存 / 选择本地文件：三个描边框居中。
+            // 第三个是「切换开关」：点一下打开下面的本地文件卡，再点一下（或点卡里的
+            // 「取消本地上传」）收起来，所以它选中时是实心红，平时是描边。
             // （不用 horizontal_centered：它会把整行撑满剩余高度）
             ui.horizontal(|ui| {
-                let pad = ((ui.available_width() - 312.0) / 2.0).max(0.0);
+                let bw = 150.0;
+                let gap = 12.0;
+                let total = bw * 3.0 + gap * 2.0;
+                let pad = ((ui.available_width() - total) / 2.0).max(0.0);
                 ui.add_space(pad);
                 if style::outline_button(
                     ui,
                     p,
                     t!("查询状态", "Device status"),
                     p.text,
-                    egui::vec2(150.0, 34.0),
+                    egui::vec2(bw, 34.0),
                     !self.running,
                 )
                 .on_hover_text(t!(
@@ -919,13 +1249,13 @@ impl App {
                 {
                     self.start(RunMode::Status);
                 }
-                ui.add_space(12.0);
+                ui.add_space(gap);
                 if style::outline_button(
                     ui,
                     p,
                     t!("清除内存", "Erase memory"),
                     if self.running { p.muted } else { p.error },
-                    egui::vec2(150.0, 34.0),
+                    egui::vec2(bw, 34.0),
                     !self.running,
                 )
                 .on_hover_text(t!(
@@ -936,13 +1266,44 @@ impl App {
                 {
                     self.start(RunMode::Erase);
                 }
+                ui.add_space(gap);
+                if style::toggle_outline_button(
+                    ui,
+                    p,
+                    t!("选择本地文件", "Local files"),
+                    files_mode,
+                    egui::vec2(bw, 34.0),
+                    !self.running,
+                )
+                .on_hover_text(t!(
+                    "打开本地文件卡，选一个文件夹把里面的 .gpx / .fit 全传上去",
+                    "open the local file card and pick a folder whose .gpx / .fit files you want to upload"
+                ))
+                .clicked()
+                {
+                    if files_mode {
+                        self.source = SyncSource::Device;
+                    } else {
+                        self.source = SyncSource::Files;
+                        // 打开卡片的同时就弹文件夹选择框：用户点「选择本地文件」时
+                        // 想的就是「让我挑一个目录」，先给一张空卡片还得再点一次是多余的。
+                        // 已经有文件（上次记住的目录里扫出来的）就只切模式，不再弹。
+                        if self.cloud.selected_paths().is_empty() {
+                            self.cloud.pick_dir(&mut self.cfg);
+                        }
+                    }
+                }
             });
             ui.add_space(6.0);
         });
 
         // ---------- 运行结果卡：汇总 + 设备状态 + 数据段（有内容才出现） ----------
         // 汇总 / 阶段耗时只针对完整同步；清除内存显示清理结果；查询状态只看设备状态
-        let is_sync_task = self.current_mode == Some(RunMode::Sync);
+        // 导入和同步共用同一套结果展示：哪些段（文件）成功、多少条、耗时多久
+        let is_sync_task = matches!(
+            self.current_mode,
+            Some(RunMode::Sync) | Some(RunMode::Import)
+        );
         let is_erase_task = self.current_mode == Some(RunMode::Erase);
         let has_result = self.status.is_some()
             || (is_sync_task
@@ -959,7 +1320,7 @@ impl App {
         if has_result {
             ui.add_space(10.0);
             style::card(p).show(ui, |ui| {
-                ui.set_width(ui.available_width());
+                style::fill_card_width(ui);
                 ui.horizontal(|ui| {
                     style::card_title(ui, p, t!("运行结果", "Result"));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -988,34 +1349,59 @@ impl App {
                     && (stats.is_some() || downloading || self.uploaded > 0 || erase_percent.is_some())
                 {
                     ui.add_space(12.0);
-                    let grid_w = (ui.available_width() - 3.0 * 16.0) / 4.0;
+                    // 导入没有「下载」和「清理内存」这两格：数据是本地读的，设备也没动过
+                    let is_import = self.current_mode == Some(RunMode::Import);
+                    let mut cells: Vec<(&str, String, egui::Color32)> = Vec::new();
+                    if is_import {
+                        cells.push((
+                            t!("解析", "Parsed"),
+                            tr!("{} 条", "{} rec", downloaded),
+                            p.text,
+                        ));
+                        cells.push((
+                            t!("已上传", "Uploaded"),
+                            tr!("{} 条", "{} rec", synced),
+                            p.success,
+                        ));
+                    } else {
+                        cells.push((
+                            t!("下载", "Downloaded"),
+                            tr!("{} 条", "{} rec", downloaded),
+                            p.text,
+                        ));
+                        cells.push((
+                            t!("已同步", "Uploaded"),
+                            tr!("{} 条", "{} rec", synced),
+                            p.success,
+                        ));
+                        cells.push((t!("清理内存", "Erased"), erase_text.to_string(), erase_color));
+                    }
+                    // 速度按“上传中”这一段算，扫描/连接/下载的时间不算进去
+                    cells.push((
+                        t!("上传速度", "Upload speed"),
+                        match self.avg_upload_rate(synced) {
+                            Some(r) => tr!(
+                                "{} 条/秒",
+                                "{} rec/s",
+                                fmt_count(r.round() as usize)
+                            ),
+                            None => "—".to_string(),
+                        },
+                        p.text,
+                    ));
+                    cells.push((
+                        t!("总耗时", "Total time"),
+                        fmt_dur(Duration::from_secs_f64(total_secs)),
+                        p.text,
+                    ));
+                    let cols = cells.len();
+                    let grid_w = (ui.available_width() - (cols as f32 - 1.0) * 16.0) / cols as f32;
                     egui::Grid::new("run_summary_grid")
-                        .num_columns(4)
+                        .num_columns(cols)
                         .min_col_width(grid_w.max(90.0))
                         .spacing([16.0, 6.0])
                         .show(ui, |ui| {
-                            for (label, value, color) in [
-                                (
-                                    t!("下载", "Downloaded"),
-                                    tr!("{} 条", "{} rec", downloaded),
-                                    p.text,
-                                ),
-                                (
-                                    t!("已同步", "Uploaded"),
-                                    tr!("{} 条", "{} rec", synced),
-                                    p.success,
-                                ),
-                                (
-                                    t!("清理内存", "Erased"),
-                                    erase_text.to_string(),
-                                    erase_color,
-                                ),
-                                (
-                                    t!("总耗时", "Total time"),
-                                    fmt_dur(Duration::from_secs_f64(total_secs)),
-                                    p.text,
-                                ),
-                            ] {
+                            for (label, value, color) in cells {
                                 ui.vertical(|ui| {
                                     ui.colored_label(p.muted, label);
                                     ui.label(
@@ -1126,20 +1512,6 @@ impl App {
                     }
                     ui.colored_label(p.muted, text);
                 }
-                // 段内上传进度：几万条一段要传好几秒，光看整段完成会以为卡住了
-                if let Some((index, done, seg_total)) = self.session_progress {
-                    ui.add_space(8.0);
-                    ui.colored_label(
-                        p.muted,
-                        tr!(
-                            "第 {} 段上传中 {} / {} 条",
-                            "uploading segment {}: {} / {}",
-                            index,
-                            done,
-                            seg_total
-                        ),
-                    );
-                }
                 if let Some(percent) = erase_percent {
                     ui.add_space(8.0);
                     ui.colored_label(p.muted, tr!("清理内存 {}%", "erasing {}%", percent));
@@ -1204,21 +1576,420 @@ impl App {
                 }
             });
         }
+
+        // ---------- 本地文件卡：只在点了「选择本地文件」后出现 ----------
+        // 上传本身不在这张卡里（整页只有上面那一个大圆），它只回答「这次传什么」。
+        // 任务跑起来时收起来：那时屏幕上该看的是进度和结果，不是文件列表。
+        // 拖文件进窗口随时都能用，所以 accept_dropped 不跟着这张卡一起藏。
+        self.cloud.accept_dropped(ui);
+        if files_mode && !self.running {
+            ui.add_space(10.0);
+            if self.cloud.import_card(ui, p, &mut self.cfg) {
+                // 点了「取消本地上传」：主页回到设备同步，这张卡消失
+                self.source = SyncSource::Device;
+            }
+        }
     }
 
+    /// 连接参数摘要行。
+    ///
+    /// PostgreSQL / MQTT 的主机、端口、账号密码一律不在页面上摆输入框：页面只留
+    /// 「连到哪儿 + 密码有没有设」两行和一个「修改」按钮，真正的字段在弹窗里填。
+    fn conn_summary_row(&mut self, ui: &mut egui::Ui, p: &Palette, target: ConnTarget) {
+        let (host, summary, password) = match target {
+            ConnTarget::Pg => {
+                let c = &self.cfg.pg;
+                (
+                    c.host.clone(),
+                    format!("{}@{}:{}/{}", c.user, c.host, c.port, c.database),
+                    c.password.clone(),
+                )
+            }
+            ConnTarget::Mqtt => {
+                let c = &self.cfg.mqtt;
+                (
+                    c.broker.clone(),
+                    format!("{}:{} → {}", c.broker, c.port, c.topic),
+                    c.password.clone(),
+                )
+            }
+        };
+        ui.horizontal(|ui| {
+            ui.colored_label(p.muted, t!("连接", "Connection"));
+            ui.add_space(12.0);
+            if host.is_empty() {
+                ui.colored_label(
+                    p.muted,
+                    t!("还没配置，点右边「修改」填写", "not configured yet — press Edit"),
+                );
+            } else {
+                ui.colored_label(p.text, summary);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(style::secondary_button(p, t!("修改", "Edit")))
+                    .clicked()
+                {
+                    let draft = self.conn_draft(target);
+                    self.dialog = Some(Dialog::Connection {
+                        target,
+                        draft,
+                        revealed: false,
+                    });
+                }
+            });
+        });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.colored_label(p.muted, t!("账号", "Account"));
+            ui.add_space(12.0);
+            let user = match target {
+                ConnTarget::Pg => &self.cfg.pg.user,
+                ConnTarget::Mqtt => &self.cfg.mqtt.user,
+            };
+            if user.is_empty() {
+                ui.colored_label(p.muted, t!("未设置", "not set"));
+            } else {
+                ui.colored_label(p.text, user.clone());
+            }
+            ui.add_space(20.0);
+            ui.colored_label(p.muted, t!("密码", "Password"));
+            ui.add_space(12.0);
+            if password.is_empty() {
+                ui.colored_label(p.muted, t!("未设置", "not set"));
+            } else {
+                // 有多少位用圆点提示一下，但不泄露内容
+                ui.colored_label(
+                    p.text,
+                    format!(
+                        "{} · {}",
+                        "•".repeat(password.chars().count().min(12)),
+                        t!("已设置", "set")
+                    ),
+                );
+            }
+        });
+    }
+
+    /// 打开连接参数弹窗时的初始值。
+    fn conn_draft(&self, target: ConnTarget) -> ConnDraft {
+        match target {
+            ConnTarget::Pg => {
+                let c = &self.cfg.pg;
+                ConnDraft {
+                    host: c.host.clone(),
+                    port: c.port.to_string(),
+                    database: c.database.clone(),
+                    user: c.user.clone(),
+                    password: c.password.clone(),
+                    topic: String::new(),
+                    client_id: String::new(),
+                    keepalive: String::new(),
+                }
+            }
+            ConnTarget::Mqtt => {
+                let c = &self.cfg.mqtt;
+                ConnDraft {
+                    host: c.broker.clone(),
+                    port: c.port.to_string(),
+                    database: String::new(),
+                    user: c.user.clone(),
+                    password: c.password.clone(),
+                    topic: c.topic.clone(),
+                    client_id: c.client_id.clone(),
+                    keepalive: c.keepalive_secs.to_string(),
+                }
+            }
+        }
+    }
+
+    /// 弹窗里点「确定」后把草稿写回配置（端口这类数字解析失败就保留原值）。
+    fn apply_conn_draft(&mut self, target: ConnTarget, draft: &ConnDraft) {
+        match target {
+            ConnTarget::Pg => {
+                let c = &mut self.cfg.pg;
+                c.host = draft.host.trim().to_string();
+                if let Ok(port) = draft.port.trim().parse::<u16>() {
+                    c.port = port;
+                }
+                c.database = draft.database.trim().to_string();
+                c.user = draft.user.clone();
+                c.password = draft.password.clone();
+                self.pg_port_buf = c.port.to_string();
+            }
+            ConnTarget::Mqtt => {
+                let c = &mut self.cfg.mqtt;
+                c.broker = draft.host.trim().to_string();
+                if let Ok(port) = draft.port.trim().parse::<u16>() {
+                    c.port = port;
+                }
+                c.user = draft.user.clone();
+                c.password = draft.password.clone();
+                c.topic = draft.topic.trim().to_string();
+                c.client_id = draft.client_id.trim().to_string();
+                if let Ok(secs) = draft.keepalive.trim().parse::<u32>() {
+                    c.keepalive_secs = secs.clamp(10, 300);
+                }
+                self.mqtt_port_buf = c.port.to_string();
+                self.keepalive_buf = c.keepalive_secs.to_string();
+            }
+        }
+    }
+
+    /// 凭据 / 云登录 / 连接参数弹窗。返回 true 表示弹窗还开着。
+    fn show_dialog(&mut self, ctx: &egui::Context, p: &Palette) -> bool {
+        let Some(dialog) = self.dialog.as_mut() else {
+            return false;
+        };
+        let mut keep_open = true;
+        let mut finished = false;
+        let mut login_request: Option<(String, String)> = None;
+        let title = match dialog {
+            Dialog::CloudLogin { .. } => t!("登录 RaceBox 账号", "Sign in to RaceBox").to_string(),
+            Dialog::Connection { target, .. } => {
+                tr!("{} 连接参数", "{} connection", target.title())
+            }
+            Dialog::Notice { title, .. } => title.clone(),
+        };
+        // 模态：先铺一层遮罩压暗背景并吃掉背景上的点击，弹窗才真的「必须先关掉」。
+        // 遮罩要在弹窗之前创建——同层按创建顺序叠放，这样它只盖住页面不盖住弹窗。
+        style::modal_shield(ctx, p);
+        // 标题栏右上角带一个 ×：光靠「取消」按钮关窗不顺手
+        let mut window_open = true;
+        egui::Window::new(title)
+            .open(&mut window_open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(style::window(p))
+            .show(ctx, |ui| {
+                ui.set_width(match dialog {
+                    Dialog::Notice { .. } => 300.0,
+                    _ => 340.0,
+                });
+                match dialog {
+                    Dialog::CloudLogin {
+                        email,
+                        password,
+                        revealed,
+                    } => {
+                        ui.colored_label(p.muted, t!("邮箱", "E-mail"));
+                        ui.add(
+                            egui::TextEdit::singleline(email)
+                                .hint_text("you@example.com")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(8.0);
+                        ui.colored_label(p.muted, t!("密码", "Password"));
+                        ui.add(
+                            egui::TextEdit::singleline(password)
+                                .password(!*revealed)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(6.0);
+                        ui.checkbox(revealed, t!("显示密码", "Show password"));
+                        ui.add_space(8.0);
+                        // 说明不再整段铺在弹窗里，收进右上角的「?」（和设置页卡片一致）
+                        ui.horizontal(|ui| {
+                            style::help_icon(
+                                ui,
+                                p,
+                                "cloud_login_cred",
+                                t!(
+                                    "凭据只保存在本机的应用数据目录（cloud.json），不进 config.json。",
+                                    "Credentials stay in the app data folder on this machine (cloud.json); they are not written into config.json."
+                                ),
+                            );
+                            ui.add_space(6.0);
+                            style::hint(ui, p, t!("凭据只保存在本机", "credentials stay on this machine"));
+                        });
+                        ui.add_space(14.0);
+                        let ready = !email.trim().is_empty() && !password.is_empty();
+                        let (ok, cancel) = style::dialog_buttons(
+                            ui,
+                            p,
+                            t!("登录", "Sign in"),
+                            t!("取消", "Cancel"),
+                            ready,
+                        );
+                        if ok {
+                            login_request = Some((email.clone(), password.clone()));
+                            keep_open = false;
+                        }
+                        if cancel {
+                            keep_open = false;
+                        }
+                    }
+                    Dialog::Connection {
+                        target,
+                        draft,
+                        revealed,
+                    } => {
+                        let pg = *target == ConnTarget::Pg;
+                        // 主机 / Broker
+                        dialog_field(
+                            ui,
+                            p,
+                            if pg { t!("主机", "Host") } else { "Broker" },
+                            &mut draft.host,
+                            false,
+                            false,
+                        );
+                        // 端口 +（PG 的库名 / MQTT 的保活）
+                        ui.horizontal(|ui| {
+                            let half = (ui.available_width() - 12.0) / 2.0;
+                            ui.vertical(|ui| {
+                                ui.colored_label(p.muted, t!("端口", "Port"));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut draft.port)
+                                        .desired_width(half),
+                                );
+                            });
+                            ui.add_space(12.0);
+                            ui.vertical(|ui| {
+                                if pg {
+                                    ui.colored_label(p.muted, t!("数据库", "Database"));
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut draft.database)
+                                            .desired_width(half),
+                                    );
+                                } else {
+                                    ui.colored_label(p.muted, t!("保活间隔", "Keep-alive"));
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut draft.keepalive)
+                                            .desired_width(half),
+                                    );
+                                }
+                            });
+                        });
+                        ui.add_space(8.0);
+                        // 账号
+                        dialog_field(
+                            ui,
+                            p,
+                            t!("用户", "User"),
+                            &mut draft.user,
+                            false,
+                            false,
+                        );
+                        // 密码：默认打码，勾上「显示密码」才明文
+                        ui.colored_label(p.muted, t!("密码", "Password"));
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut draft.password)
+                                .password(!*revealed)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(6.0);
+                        ui.checkbox(revealed, t!("显示密码", "Show password"));
+                        if !pg {
+                            ui.add_space(8.0);
+                            dialog_field(ui, p, t!("主题", "Topic"), &mut draft.topic, false, false);
+                            dialog_field(ui, p, "Client ID", &mut draft.client_id, false, false);
+                        }
+                        ui.add_space(14.0);
+                        let ready = !draft.host.trim().is_empty()
+                            && draft.port.trim().parse::<u16>().is_ok();
+                        let (ok, cancel) = style::dialog_buttons(
+                            ui,
+                            p,
+                            t!("确定", "OK"),
+                            t!("取消", "Cancel"),
+                            ready,
+                        );
+                        if ok {
+                            keep_open = false;
+                            finished = true;
+                        }
+                        if cancel {
+                            keep_open = false;
+                        }
+                    }
+                    Dialog::Notice { body, .. } => {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        ui.colored_label(p.text, body.clone());
+                        ui.add_space(16.0);
+                        ui.vertical_centered(|ui| {
+                            if ui
+                                .add(
+                                    style::primary_button(p, t!("确定", "OK"))
+                                        .min_size(egui::vec2(120.0, 32.0)),
+                                )
+                                .clicked()
+                            {
+                                keep_open = false;
+                            }
+                        });
+                    }
+                }
+            });
+        if !window_open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            keep_open = false;
+        }
+        if finished {
+            if let Some(Dialog::Connection { target, draft, .. }) = self.dialog.take() {
+                self.apply_conn_draft(target, &draft);
+            }
+        }
+        if let Some((email, password)) = login_request {
+            self.dialog = None;
+            let rt = self.runtime.clone();
+            self.cloud.login(&rt, email, password);
+        }
+        if !keep_open {
+            self.dialog = None;
+        }
+        self.dialog.is_some()
+    }
+
+    /// ------------------------------------------------------------------
+    /// 设置页
+    /// ------------------------------------------------------------------
     fn show_settings_tab(&mut self, ui: &mut egui::Ui, p: &Palette) {
         // ---------- 上传方式 ----------
         style::card(p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            style::card_title(ui, p, t!("上传方式", "Upload channel"));
+            style::fill_card_width(ui);
+            style::card_title_with_help(
+                ui,
+                p,
+                t!("上传方式", "Upload channel"),
+                "settings_channel",
+                t!(
+                    "设备数据取回来之后往哪儿送。这一路是主通道，RaceBox 云是叠加在上面的可选通道。",
+                    "Where the downloaded data goes. This is the primary channel; the RaceBox cloud is an optional extra on top."
+                ),
+            );
             ui.add_space(10.0);
-            // 单选：两个选项互斥，点哪个就只留哪个
+            // 两个互斥选项做成整块可点的卡片：比两个圆点更好读，副标题能把区别说清。
+            let choices = [
+                (
+                    SinkMode::Database,
+                    t!("直接写自己的库", "write straight into your own database"),
+                ),
+                (
+                    SinkMode::Mqtt,
+                    t!("按 RBX2 协议发消息", "publish RBX2 messages"),
+                ),
+            ];
+            let w = ((ui.available_width() - 12.0) / 2.0).max(160.0);
             ui.horizontal(|ui| {
-                for mode in [SinkMode::Database, SinkMode::Mqtt] {
-                    if style::radio_button(ui, p, self.cfg.sink_mode == mode, mode.label()).clicked() {
-                        self.cfg.sink_mode = mode;
+                // 卡片之间的缝直接设成 item_spacing：如果再额外 add_space(12)，
+                // egui 会在它前后各插一次默认间距，整行就比可用宽度宽出一截。
+                ui.spacing_mut().item_spacing.x = 12.0;
+                for (mode, sub) in choices.iter() {
+                    if style::choice_card(
+                        ui,
+                        p,
+                        self.cfg.sink_mode == *mode,
+                        mode.label(),
+                        sub,
+                        egui::vec2(w, 58.0),
+                    )
+                    .clicked()
+                        && self.cfg.sink_mode != *mode
+                    {
+                        self.cfg.sink_mode = *mode;
                     }
-                    ui.add_space(6.0);
                 }
             });
         });
@@ -1226,34 +1997,21 @@ impl App {
         ui.add_space(10.0);
         // ---------- PostgreSQL ----------
         style::card(p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            style::card_title(ui, p, "PostgreSQL");
+            style::fill_card_width(ui);
+            style::card_title_with_help(
+                ui,
+                p,
+                "PostgreSQL",
+                "settings_pg",
+                t!(
+                    "同步前会先探一次连通性，连不上就直接停下，不会先把设备数据白下一遍。",
+                    "Connectivity is probed before syncing; if it fails, the run stops without downloading anything."
+                ),
+            );
             ui.add_space(10.0);
-            egui::Grid::new("pg_grid")
-                .num_columns(2)
-                .min_col_width(90.0)
-                .spacing([12.0, 10.0])
-                .show(ui, |ui| {
-                    ui.colored_label(p.muted, t!("主机", "Host"));
-                    ui.add(egui::TextEdit::singleline(&mut self.cfg.pg.host).desired_width(300.0));
-                    ui.end_row();
-                    ui.colored_label(p.muted, t!("端口", "Port"));
-                    ui.add(egui::TextEdit::singleline(&mut self.pg_port_buf).desired_width(120.0));
-                    ui.end_row();
-                    ui.colored_label(p.muted, t!("数据库", "Database"));
-                    ui.add(egui::TextEdit::singleline(&mut self.cfg.pg.database).desired_width(300.0));
-                    ui.end_row();
-                    ui.colored_label(p.muted, t!("用户", "User"));
-                    ui.add(egui::TextEdit::singleline(&mut self.cfg.pg.user).desired_width(300.0));
-                    ui.end_row();
-                    ui.colored_label(p.muted, t!("密码", "Password"));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.cfg.pg.password)
-                            .password(true)
-                            .desired_width(300.0),
-                    );
-                    ui.end_row();
-                });
+            // 主机/端口/库/账号/密码都不在页面上摆输入框：一行摘要 + 「修改」，
+            // 真正填写在弹窗里做（和云账号、密码一个路子）。
+            self.conn_summary_row(ui, p, ConnTarget::Pg);
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 let busy = self.pg_test.busy;
@@ -1283,47 +2041,20 @@ impl App {
         ui.add_space(10.0);
         // ---------- MQTT ----------
         style::card(p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            style::card_title(ui, p, "MQTT");
+            style::fill_card_width(ui);
+            style::card_title_with_help(
+                ui,
+                p,
+                "MQTT",
+                "settings_mqtt",
+                t!(
+                    "连接时会等 CONNACK，拿不到就当作通道不可用，直接停止本次同步。",
+                    "Connecting waits for CONNACK; if it never arrives the channel counts as unusable and the sync stops."
+                ),
+            );
             ui.add_space(10.0);
-            egui::Grid::new("mqtt_grid")
-                .num_columns(2)
-                .min_col_width(90.0)
-                .spacing([12.0, 10.0])
-                .show(ui, |ui| {
-                    ui.colored_label(p.muted, "Broker");
-                    ui.add(egui::TextEdit::singleline(&mut self.cfg.mqtt.broker).desired_width(300.0));
-                    ui.end_row();
-                    ui.colored_label(p.muted, t!("端口", "Port"));
-                    ui.add(egui::TextEdit::singleline(&mut self.mqtt_port_buf).desired_width(120.0));
-                    ui.end_row();
-                    ui.colored_label(p.muted, t!("用户名", "Username"));
-                    ui.add(egui::TextEdit::singleline(&mut self.cfg.mqtt.user).desired_width(300.0));
-                    ui.end_row();
-                    ui.colored_label(p.muted, t!("密码", "Password"));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.cfg.mqtt.password)
-                            .password(true)
-                            .desired_width(300.0),
-                    );
-                    ui.end_row();
-                    ui.colored_label(p.muted, t!("主题", "Topic"));
-                    ui.add(egui::TextEdit::singleline(&mut self.cfg.mqtt.topic).desired_width(300.0));
-                    ui.end_row();
-                    ui.colored_label(p.muted, "Client ID");
-                    ui.add(egui::TextEdit::singleline(&mut self.cfg.mqtt.client_id).desired_width(300.0));
-                    ui.end_row();
-                    ui.colored_label(p.muted, t!("保活间隔", "Keep-alive"));
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.keepalive_buf)
-                                .desired_width(80.0)
-                                .horizontal_align(egui::Align::Center),
-                        );
-                        ui.colored_label(p.muted, t!("秒", "s"));
-                    });
-                    ui.end_row();
-                });
+            // 同 PostgreSQL：Broker / 端口 / 账号密码 / 主题等都进弹窗，页面只留摘要
+            self.conn_summary_row(ui, p, ConnTarget::Mqtt);
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 let busy = self.mqtt_test.busy;
@@ -1351,10 +2082,34 @@ impl App {
         });
 
         ui.add_space(10.0);
+        // ---------- RaceBox 云（账号 + 上传配置，原「云页面」搬到这里） ----------
+        style::card(p).show(ui, |ui| {
+            style::fill_card_width(ui);
+            let rt = self.runtime.clone();
+            self.cloud.account_card(ui, p, &rt);
+            ui.add_space(12.0);
+            let dirty = self.cloud.upload_rows(ui, p, &mut self.cfg);
+            if dirty {
+                self.cloud.save_cloud(&self.cfg);
+                // 改的是云这一段，设置页其余部分是草稿，不能被覆盖写掉了
+                self.settings_snapshot.cloud = self.cfg.cloud.clone();
+            }
+        });
+
+        ui.add_space(10.0);
         // ---------- 行为 ----------
         style::card(p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            style::card_title(ui, p, t!("行为", "Behaviour"));
+            style::fill_card_width(ui);
+            style::card_title_with_help(
+                ui,
+                p,
+                t!("行为", "Behaviour"),
+                "settings_behaviour",
+                t!(
+                    "清除设备内存会擦掉设备上存的所有数据；本地缓存用来兜住上传失败的部分。",
+                    "Erasing device memory wipes everything stored on the device; the local cache catches segments that failed to upload."
+                ),
+            );
             ui.add_space(12.0);
             style::toggle_row(
                 ui,
@@ -1395,20 +2150,36 @@ impl App {
                 );
             });
             ui.add_space(16.0);
-            // 关闭窗口时的行为：二选一（和“上传方式”同一套单选控件）
+            // 关闭窗口时的行为：二选一，和「上传方式」同一套卡片控件
             ui.colored_label(p.muted, t!("点关闭按钮时", "When the window is closed"));
             ui.add_space(6.0);
+            let choices = [
+                (CloseAction::Quit, t!("点 × 直接退出", "× quits the app")),
+                (
+                    CloseAction::Tray,
+                    t!("收进托盘后台继续跑", "keep running in the tray"),
+                ),
+            ];
+            let w = ((ui.available_width() - 12.0) / 2.0).max(160.0);
             ui.horizontal(|ui| {
-                for action in [CloseAction::Quit, CloseAction::Tray] {
-                    if style::radio_button(ui, p, self.cfg.close_action == action, action.label())
-                        .clicked()
-                        && self.cfg.close_action != action
+                // 同上：间距交给 item_spacing，别再 add_space，否则整行会超出可用宽度
+                ui.spacing_mut().item_spacing.x = 12.0;
+                for (action, sub) in choices.iter() {
+                    if style::choice_card(
+                        ui,
+                        p,
+                        self.cfg.close_action == *action,
+                        action.label(),
+                        sub,
+                        egui::vec2(w, 58.0),
+                    )
+                    .clicked()
+                        && self.cfg.close_action != *action
                     {
-                        self.cfg.close_action = action;
+                        self.cfg.close_action = *action;
                         // 立即生效：切到“直接退出”就把托盘图标摘掉，反之马上挂上
                         self.sync_tray();
                     }
-                    ui.add_space(6.0);
                 }
             });
             if let Some(err) = self.tray_error.clone() {
@@ -1426,7 +2197,7 @@ impl App {
         ui.add_space(10.0);
         // ---------- 语言 ----------
         style::card(p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+            style::fill_card_width(ui);
             style::card_title(ui, p, t!("语言 / Language", "Language / 语言"));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -1450,7 +2221,7 @@ impl App {
         ui.add_space(10.0);
         // ---------- 软件更新 ----------
         style::card(p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+            style::fill_card_width(ui);
             style::card_title(ui, p, t!("软件更新", "Software update"));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -1475,7 +2246,7 @@ impl App {
         ui.add_space(10.0);
         // ---------- 外观 ----------
         style::card(p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+            style::fill_card_width(ui);
             style::card_title(ui, p, t!("外观", "Appearance"));
             ui.add_space(12.0);
             ui.horizontal(|ui| {
@@ -1592,6 +2363,19 @@ fn level_name(level: LogLevel) -> &'static str {
     }
 }
 
+/// 千分位计数：18 万条写成 180,000 才一眼看出量级。
+fn fmt_count(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// 耗时的人类可读格式：不足 1 分钟显示秒，否则显示“X 分 YY 秒”。
 fn fmt_dur(d: Duration) -> String {
     let secs = d.as_secs_f64();
@@ -1607,6 +2391,7 @@ fn fmt_dur(d: Duration) -> String {
 fn mode_text(mode: RunMode) -> &'static str {
     match mode {
         RunMode::Sync => t!("完整同步", "Full sync"),
+        RunMode::Import => t!("本地文件导入", "Local file import"),
         RunMode::Status => t!("状态查询", "Status query"),
         RunMode::Erase => t!("清除内存", "Erase memory"),
     }
@@ -1625,6 +2410,8 @@ impl eframe::App for App {
             self.applied_theme = self.cfg.theme;
         }
         self.drain_events(ctx);
+        // 云的后台任务（登录、文件导入）不管在哪个页面都要按时收结果
+        self.cloud.poll();
 
         let p = self.palette();
 
@@ -1654,7 +2441,8 @@ impl eframe::App for App {
                         if self.tab != Tab::Settings {
                             if style::gear_button(ui, &p)
                                 .on_hover_text(t!("设置", "Settings"))
-                                .clicked() {
+                                .clicked()
+                            {
                                 self.open_settings();
                             }
                         }
@@ -1767,9 +2555,9 @@ impl eframe::App for App {
                     });
             });
 
-        // 关于窗口：无标题栏、无按钮，点任意位置或按 Esc 关闭
+        // 关于窗口：带标题栏（可以用标题栏拖动），点窗口外任意处关闭，
+        // 点窗体内部不关（里面还有「检查更新」要按）。
         if self.about_open {
-            let dismiss = ctx.input(|i| i.pointer.any_pressed() || i.key_pressed(egui::Key::Escape));
             // 懒加载应用图标纹理（和 exe/窗口图标同款 icon256.png）
             if self.about_icon.is_none() {
                 let bytes = include_bytes!("../assets/icon256.png");
@@ -1782,18 +2570,19 @@ impl eframe::App for App {
                         Some(ctx.load_texture("about_icon", image, Default::default()));
                 }
             }
-            egui::Window::new(t!("关于", "About"))
-                .title_bar(false)
+            // 标题栏可拖动：拖动后 egui 会记住位置，下次打开还在那儿；
+            // 首次没记录时才用这个居中坐标兜一下。
+            let center = ctx.screen_rect().center();
+            let win = egui::Window::new(t!("关于", "About"))
+                .default_pos(egui::pos2(center.x - 170.0, center.y - 180.0))
                 .collapsible(false)
                 .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .frame(
-                    egui::Frame::NONE
-                        .fill(p.card)
-                        .stroke(egui::Stroke::new(1.0_f32, p.card_stroke))
-                        .corner_radius(egui::CornerRadius::same(12))
-                        .inner_margin(egui::Margin::symmetric(22, 20)),
-                )
+                .default_size([320.0, 360.0])
+                .default_open(true)
+                .frame(style::window(&p));
+            let mut open = true;
+            let resp = win
+                .open(&mut open)
                 .show(ctx, |ui| {
                     ui.set_width(300.0);
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
@@ -1816,13 +2605,37 @@ impl eframe::App for App {
                                 .size(18.0)
                                 .color(p.text),
                         );
-                        ui.add_space(2.0);
-                        ui.colored_label(
-                            p.muted,
-                            tr!("版本 {}", "version {}", env!("CARGO_PKG_VERSION")),
-                        );
+                        ui.add_space(4.0);
+                        // 版本号本身就是「检查更新」的入口：点一下就开始检查
+                        let busy = self.update_busy;
+                        let version_label = if busy {
+                            tr!(
+                                "版本 {} · 检查中…",
+                                "version {} · checking…",
+                                env!("CARGO_PKG_VERSION")
+                            )
+                        } else {
+                            tr!("版本 {} · 检查更新", "version {} · check", env!("CARGO_PKG_VERSION"))
+                        };
+                        let version_btn = egui::Button::new(
+                            egui::RichText::new(version_label).size(12.5).color(p.info),
+                        )
+                        .frame(false);
+                        let version_resp = ui
+                            .add_enabled(!busy, version_btn)
+                            .on_hover_text(t!(
+                                "点这里检查 GitHub Release 上的新版本",
+                                "click to check GitHub Releases for a newer version"
+                            ));
+                        if version_resp.clicked() {
+                            self.check_update();
+                        }
                     });
-                    ui.add_space(14.0);
+                    if let Some((text, level)) = &self.update_result {
+                        style::status_banner(ui, &p, level_color(&p, *level), text);
+                        ui.add_space(8.0);
+                    }
+                    ui.add_space(6.0);
                     about_row(ui, &p, t!("作者", "Author"), "wangcw");
                     about_row(ui, &p, t!("邮箱", "Email"), "rubygreat@msn.com");
                     about_row(
@@ -1833,18 +2646,32 @@ impl eframe::App for App {
                     );
                     ui.add_space(6.0);
                 });
-            if dismiss {
+            self.about_rect = resp.and_then(|r| Some(r.response.rect));
+            if !open {
                 self.about_open = false;
+            } else {
+                // 点（或 Esc）在窗体之外就关掉：窗体内部要留给按钮和文本选择
+                let outside = ctx.pointer_interact_pos().map_or(true, |pos| {
+                    self.about_rect.map_or(true, |rect| !rect.contains(pos))
+                });
+                let pressed_outside = outside && ctx.input(|i| i.pointer.any_pressed());
+                if pressed_outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.about_open = false;
+                }
             }
+        } else {
+            self.about_rect = None;
         }
 
         // 关闭设置页前的“有未保存更改”确认弹窗
         if self.confirm_close {
             let mut keep_open = true;
+            style::modal_shield(ctx, &p);
             egui::Window::new(t!("未保存的更改", "Unsaved changes"))
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .frame(style::window(&p))
                 .show(ctx, |ui| {
                     ui.set_width(320.0);
                     ui.label(t!(
@@ -1880,10 +2707,20 @@ impl eframe::App for App {
                         }
                     });
                 });
-            if !keep_open {
+            if !keep_open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.confirm_close = false;
             }
         }
+
+        // 设置页里点了云账号的「登录」：弹窗统一在这里渲染（放最后，盖在其它内容之上）
+        if self.cloud.take_login_request() && self.dialog.is_none() {
+            self.dialog = Some(Dialog::CloudLogin {
+                email: String::new(),
+                password: String::new(),
+                revealed: false,
+            });
+        }
+        self.show_dialog(ctx, &p);
     }
 }
 

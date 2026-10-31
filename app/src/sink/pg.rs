@@ -301,6 +301,7 @@ fn probe_session() -> Session {
         sync_total_upper: 0,
         sync_received_total: 0,
         sync_final: true,
+        display: None,
     }
 }
 

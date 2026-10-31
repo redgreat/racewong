@@ -1,9 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ble;
+mod cloud_ui;
 mod config;
 mod i18n;
 mod protocol;
+mod racebox;
 mod single_instance;
 mod sink;
 mod style;

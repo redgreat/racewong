@@ -1,5 +1,6 @@
 pub mod mqtt;
 pub mod pg;
+pub mod racebox;
 pub mod spool;
 
 use crate::protocol::Record;
@@ -40,6 +41,10 @@ pub struct Session {
     pub sync_total_upper: usize,
     pub sync_received_total: usize,
     pub sync_final: bool,
+    /// 界面上显示的名字：`None` 时用记录时间拼出的默认名。
+    ///
+    /// 导入本地文件时填文件名——「哪一段上传成功了」看文件名比看时间戳直观。
+    pub display: Option<String>,
 }
 
 impl Session {
@@ -56,6 +61,9 @@ impl Session {
     }
 
     pub fn display_name(&self) -> String {
+        if let Some(name) = &self.display {
+            return name.clone();
+        }
         if self.records.is_empty() {
             return t!("空数据段", "empty segment").to_string();
         }
@@ -67,6 +75,7 @@ impl Session {
 pub enum SinkError {
     Db(String),
     Mqtt(String),
+    Cloud(String),
     Config(String),
 }
 
@@ -75,6 +84,7 @@ impl std::fmt::Display for SinkError {
         match self {
             SinkError::Db(e) => write!(f, "PostgreSQL: {e}"),
             SinkError::Mqtt(e) => write!(f, "MQTT: {e}"),
+            SinkError::Cloud(e) => write!(f, "RaceBox: {e}"),
             SinkError::Config(e) => write!(f, "{}: {e}", t!("配置", "config")),
         }
     }

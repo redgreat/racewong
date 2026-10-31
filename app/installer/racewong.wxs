@@ -103,7 +103,7 @@
 
     <!-- 安装向导序列。
          这里没有 <UIRef Id="WixUI_InstallDir" />，而是把 WiX 那套序列原样搬进来
-         自己写一遍，原因只有一个：要多一个“创建桌面快捷方式”勾选框。
+         自己写一遍，原因只有一个：要多一个"创建桌面快捷方式"勾选框。
          WiX 的对话框全打在一个 ui.wixlib 里，只要引了 WixUI_InstallDir，
          InstallDirDlg 就必然被拉进来，于是：
            1. 自己再定义一份同名对话框 -> LGHT0091 Duplicate symbol；
@@ -115,9 +115,9 @@
          下面的 Publish 与 WiX 3.14 的 WixUI_InstallDir.wxs 逐条一致，只是把
          InstallDirDlg 换成了 RaceBoxInstallDirDlg；改了会直接影响页面跳转。 -->
     <UI Id="RaceBoxUI">
-      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
-      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
-      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+      <TextStyle Id="WixUI_Font_Normal" FaceName="微软雅黑" Size="9" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="微软雅黑" Size="10" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="微软雅黑" Size="9" Bold="yes" />
 
       <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
       <Property Id="WixUI_Mode" Value="InstallDir" />
@@ -189,7 +189,7 @@
         <Control Id="Folder" Type="PathEdit" X="20" Y="100" Width="320" Height="18" Property="WIXUI_INSTALLDIR" Indirect="yes" />
         <Control Id="ChangeFolder" Type="PushButton" X="20" Y="120" Width="56" Height="17" Text="!(loc.InstallDirDlgChange)" />
 
-        <!-- 新增：桌面快捷方式。CheckBoxValue 是“勾上时写进属性的值”，
+        <!-- 新增：桌面快捷方式。CheckBoxValue 是"勾上时写进属性的值"，
              取消勾选时 MSI 会把 DESKTOPSHORTCUT 清空（不是置 0），
              所以组件条件写的是 DESKTOPSHORTCUT = 1。 -->
         <Control Id="DesktopShortcutCheckBox" Type="CheckBox" X="20" Y="150" Width="330" Height="17"

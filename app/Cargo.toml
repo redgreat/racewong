@@ -22,6 +22,10 @@ async-trait = "0.1"
 futures-util = "0.3"
 flexi_logger = "0.29"
 log = "0.4"
+# 系统原生文件选择框（Windows 的 IFileOpenDialog、macOS 的 NSOpenPanel、
+# Linux 的 xdg-desktop-portal）。用户点「选择本地文件」时得真的弹出资源管理器，
+# 不能只靠「填目录 + 扫描」——那是给批处理用的，不是给鼠标用的。
+rfd = "0.17"
 
 # 托盘图标（Windows 通知区域 / macOS 菜单栏）。
 # 只在这两个平台引入：Linux 的托盘实现依赖 GTK/AppIndicator 系统库，
