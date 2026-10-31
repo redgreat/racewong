@@ -70,6 +70,16 @@ function Write-Utf8File([string]$Path, [string]$Text) {
     [System.IO.File]::WriteAllText($Path, $Text, $enc)
 }
 
+# 读写必须成对用 UTF-8。
+# Windows PowerShell 5.1 的 Get-Content 在不写 -Encoding 时按系统 ANSI 解码
+# （中文机器上就是 GBK），遇到无 BOM 的 UTF-8 文件会把中文读成乱码，
+# 再用 Write-Utf8File 写回去，Cargo.toml 里的中文注释连同行尾的
+# `rfd = "0.17"` 会被并成一行注释，编译时直接 "cannot find crate `rfd`"。
+# v0.1.11 第一次发布就是被这个坑掉的，所以这里统一走 .NET 的 UTF-8 读。
+function Read-Utf8File([string]$Path) {
+    return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+}
+
 function Get-Tool([string]$Name) {
     return (Get-Command $Name -ErrorAction SilentlyContinue)
 }
@@ -205,7 +215,7 @@ function Get-ArchLabel([string]$Target) {
 
 # ---------------------------------------------------------------- 版本
 function Get-CargoVersion {
-    $cargo = Get-Content (Join-Path $AppDir 'Cargo.toml') -Raw
+    $cargo = Read-Utf8File (Join-Path $AppDir 'Cargo.toml')
     if ($cargo -match '(?m)^version\s*=\s*"([^"]+)"') { return $Matches[1] }
     Die '无法从 app/Cargo.toml 读取版本号'
 }
@@ -229,7 +239,7 @@ function Get-NextVersion([string]$Latest) {
 
 function Set-CargoVersion([string]$Ver) {
     $path = Join-Path $AppDir 'Cargo.toml'
-    $text = Get-Content $path -Raw
+    $text = Read-Utf8File $path
     $new  = [regex]::Replace($text, '(?m)^version\s*=\s*"[^"]+"', "version = `"$Ver`"", 1)
     if ($new -eq $text) { return $false }
     Write-Utf8File $path $new
@@ -243,7 +253,7 @@ function Set-CargoVersion([string]$Ver) {
 function Set-CargoLockVersion([string]$Ver) {
     $path = Join-Path $AppDir 'Cargo.lock'
     if (-not (Test-Path $path)) { return $false }
-    $text = Get-Content $path -Raw
+    $text = Read-Utf8File $path
     $new  = [regex]::Replace(
         $text,
         '(?ms)(name = "racewong-app"\s*\r?\nversion = ")[^"]+(")',
