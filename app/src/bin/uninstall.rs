@@ -30,6 +30,8 @@ const REG_VENDOR_KEY: &str = r"HKCU\Software\racewong";
 const TITLE: &str = "RaceBox同步 卸载程序";
 /// 标记"我是被复制到临时目录的那一份"，防止无限自我复制。
 const RELOCATED_ENV: &str = "RACEWONG_UNINSTALL_RELOCATED";
+/// 安装目录由第一份进程通过环境变量传下来（命令行参数留给用户开关）。
+const INSTALL_DIR_ENV: &str = "RACEWONG_UNINSTALL_DIR";
 
 fn main() {
     #[cfg(windows)]
@@ -46,13 +48,13 @@ fn windows_main() {
             // 已经拉起临时目录里那份，本进程可以退出了
             Ok(()) => return,
             Err(e) => {
-                error_dialog(&format!("无法启动卸载程序：\n{e}"));
+                msgbox::error(&format!("无法启动卸载程序：\n{e}"));
                 std::process::exit(1);
             }
         }
     }
     if let Err(e) = run() {
-        error_dialog(&e);
+        msgbox::error(&e);
         std::process::exit(1);
     }
 }
@@ -61,46 +63,62 @@ fn windows_main() {
 
 #[cfg(windows)]
 fn run() -> Result<(), String> {
-    // 第 0 个参数是安装目录（由 `relocate` 传进来），卸载完用来兜底清残留
-    let install_dir = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    // 命令行开关（给脚本/自动化用，普通用户双击就走图形界面）：
+    //   /s            静默，不弹任何窗口；默认保留个人配置
+    //   /s /purge     静默，并把个人配置一起删掉
+    let flags: Vec<String> = std::env::args()
+        .skip(1)
+        .map(|a| a.to_ascii_lowercase())
+        .collect();
+    let silent = flags.iter().any(|f| f == "/s" || f == "-s" || f == "--silent");
+    let purge = flags.iter().any(|f| f == "/purge" || f == "--purge");
+    // 安装目录由 relocate 通过环境变量带过来（卸载完用来兜底清残留）
+    let install_dir = std::env::var_os(INSTALL_DIR_ENV).map(std::path::PathBuf::from);
 
-    if !ask_ok_cancel(
-        "确定要卸载 RaceBox同步 吗？",
-        "卸载后需要重新安装才能使用。\n\n点「确定」继续，点「取消」退出。",
-    ) {
+    if !silent
+        && !msgbox::confirm(
+            "确定要卸载 RaceBox同步 吗？\n\n卸载后需要重新安装才能使用。\n\n点「确定」继续，点「取消」退出。",
+        )
+    {
         return Ok(());
     }
 
     // 「是」保留、「否」删除。默认理解为保留更安全：删错了配置找不回来，
     // 留错了用户下次还能自己删。
-    let keep_data = ask_yes_no(
-        "是否保留个人配置？",
-        &format!(
-            "配置包括服务器 / MQTT 设置、语言选择、RaceBox 云账号登录信息，\
+    let keep_data = if silent {
+        !purge
+    } else {
+        msgbox::yes_no(&format!(
+            "是否保留个人配置？\n\n\
+             配置包括服务器 / MQTT 设置、语言选择、RaceBox 云账号登录信息，\
              都存放在：\n{}\n\n\
              点「是」保留——以后重新安装不用重新填。\n\
              点「否」一并删除，卸载后不留任何痕迹。",
             data_dir().display()
-        ),
-    );
+        ))
+    };
 
     kill_running_app();
 
     match product_code() {
         Some(code) => {
-            let rc = run_msi_uninstall(&code)?;
+            let rc = run_msi_uninstall(&code, silent)?;
             if rc == 1602 {
                 // 用户在 MSI 的进度条上点了取消，这时候别再往下删东西
-                info_dialog("卸载已取消，没有做任何改动。");
+                if !silent {
+                    msgbox::info("卸载已取消，没有做任何改动。");
+                }
                 return Ok(());
             }
         }
         None => {
             // 找不到安装记录（绿色版、或者注册表被清理过）：只能自己删文件
-            warn_dialog(
-                "没有找到安装记录，将直接从安装目录删除程序文件。\n\n\
-                 如果「设置 → 应用」里还留着 RaceBox同步，请在那里再卸载一次。",
-            );
+            if !silent {
+                msgbox::warn(
+                    "没有找到安装记录，将直接从安装目录删除程序文件。\n\n\
+                     如果「设置 → 应用」里还留着 RaceBox同步，请在那里再卸载一次。",
+                );
+            }
         }
     }
 
@@ -115,30 +133,32 @@ fn run() -> Result<(), String> {
         std::fs::remove_dir_all(&data).is_ok() || !data.exists()
     };
 
-    let message = if keep_data {
-        format!(
-            "卸载完成。\n\n\
-             安装目录、开始菜单 / 桌面快捷方式、托盘图标都已清理。\n\n\
-             个人配置保留在：\n{}\n\n\
-             以后重新安装会继续沿用这份配置。",
-            data.display()
-        )
-    } else if data_gone {
-        format!(
-            "卸载完成。\n\n\
-             安装目录、开始菜单 / 桌面快捷方式、托盘图标都已清理，\n\
-             个人配置也已删除：\n{}",
-            data.display()
-        )
-    } else {
-        format!(
-            "卸载完成。\n\n\
-             安装目录、快捷方式和托盘图标都已清理，\n\
-             但个人配置没能删掉（可能有文件正被占用），可以手动删除：\n{}",
-            data.display()
-        )
-    };
-    info_dialog(&message);
+    if !silent {
+        let message = if keep_data {
+            format!(
+                "卸载完成。\n\n\
+                 安装目录、开始菜单 / 桌面快捷方式、托盘图标都已清理。\n\n\
+                 个人配置保留在：\n{}\n\n\
+                 以后重新安装会继续沿用这份配置。",
+                data.display()
+            )
+        } else if data_gone {
+            format!(
+                "卸载完成。\n\n\
+                 安装目录、开始菜单 / 桌面快捷方式、托盘图标都已清理，\n\
+                 个人配置也已删除：\n{}",
+                data.display()
+            )
+        } else {
+            format!(
+                "卸载完成。\n\n\
+                 安装目录、快捷方式和托盘图标都已清理，\n\
+                 但个人配置没能删掉（可能有文件正被占用），可以手动删除：\n{}",
+                data.display()
+            )
+        };
+        msgbox::info(&message);
+    }
     schedule_self_delete();
     Ok(())
 }
@@ -160,7 +180,11 @@ fn relocate() -> Result<(), String> {
     let mut child = std::process::Command::new(&temp_exe);
     child.env(RELOCATED_ENV, "1");
     if let Some(dir) = install_dir {
-        child.arg(dir);
+        child.env(INSTALL_DIR_ENV, dir);
+    }
+    // 用户传的开关（/s 之类）原样转给临时目录那一份
+    for arg in std::env::args_os().skip(1) {
+        child.arg(arg);
     }
     child
         .spawn()
@@ -232,11 +256,11 @@ fn product_code() -> Option<String> {
 /// 走 MSI 卸载，返回 msiexec 的退出码。
 ///
 /// `/qb` 是"基础界面"：一个进度条加一个完成提示，比 `/qn` 全静默友好，
-/// 又不像完整向导那样要用户一路点下去。
+/// 又不像完整向导那样要用户一路点下去。静默模式下换成 `/qn`。
 #[cfg(windows)]
-fn run_msi_uninstall(code: &str) -> Result<i32, String> {
+fn run_msi_uninstall(code: &str, silent: bool) -> Result<i32, String> {
     let status = hidden("msiexec")
-        .args(["/x", code, "/qb"])
+        .args(["/x", code, if silent { "/qn" } else { "/qb" }])
         .status()
         .map_err(|e| format!("调用 Windows Installer 失败：{e}"))?;
     Ok(status.code().unwrap_or(-1))
@@ -275,63 +299,71 @@ fn data_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(APP_DIR_NAME)
 }
 
+// ---------------------------------------------------------------- 弹窗
+//
+// 直接用 Win32 的 MessageBoxW，不走 rfd。
+// 一是卸载程序是个独立小 exe，为了两个提示框把整条 GUI 依赖链拖进来不划算；
+// 二是 rfd 的 MessageDialog 在 Windows 上走 comctl32 v6 的 TaskDialog，没有
+// manifest 的 exe 上会直接失败——实测弹不出来，流程静默退出，等于卸载点了没反应。
+// MessageBoxW 没有这些前提，双击就弹。
 #[cfg(windows)]
-fn ask_ok_cancel(title: &str, text: &str) -> bool {
-    use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
-    matches!(
-        MessageDialog::new()
-            .set_level(MessageLevel::Warning)
-            .set_title(TITLE)
-            .set_description(format!("{title}\n\n{text}"))
-            .set_buttons(MessageButtons::OkCancel)
-            .show(),
-        MessageDialogResult::Ok
-    )
-}
+mod msgbox {
+    use std::ffi::c_void;
 
-#[cfg(windows)]
-fn ask_yes_no(title: &str, text: &str) -> bool {
-    use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
-    matches!(
-        MessageDialog::new()
-            .set_level(MessageLevel::Warning)
-            .set_title(TITLE)
-            .set_description(format!("{title}\n\n{text}"))
-            .set_buttons(MessageButtons::YesNo)
-            .show(),
-        MessageDialogResult::Yes
-    )
-}
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(hwnd: *mut c_void, text: *const u16, caption: *const u16, u_type: u32) -> i32;
+    }
 
-#[cfg(windows)]
-fn info_dialog(text: &str) {
-    use rfd::{MessageButtons, MessageDialog, MessageLevel};
-    let _ = MessageDialog::new()
-        .set_level(MessageLevel::Info)
-        .set_title(TITLE)
-        .set_description(text)
-        .set_buttons(MessageButtons::Ok)
-        .show();
-}
+    const MB_OK: u32 = 0x0000_0000;
+    const MB_OKCANCEL: u32 = 0x0000_0001;
+    const MB_YESNO: u32 = 0x0000_0004;
+    const MB_ICONERROR: u32 = 0x0000_0010;
+    const MB_ICONWARNING: u32 = 0x0000_0030;
+    const MB_ICONINFORMATION: u32 = 0x0000_0040;
+    const MB_SETFOREGROUND: u32 = 0x0001_0000;
+    const MB_TOPMOST: u32 = 0x0004_0000;
+    const IDOK: i32 = 1;
+    const IDYES: i32 = 6;
 
-#[cfg(windows)]
-fn warn_dialog(text: &str) {
-    use rfd::{MessageButtons, MessageDialog, MessageLevel};
-    let _ = MessageDialog::new()
-        .set_level(MessageLevel::Warning)
-        .set_title(TITLE)
-        .set_description(text)
-        .set_buttons(MessageButtons::Ok)
-        .show();
-}
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
 
-#[cfg(windows)]
-fn error_dialog(text: &str) {
-    use rfd::{MessageButtons, MessageDialog, MessageLevel};
-    let _ = MessageDialog::new()
-        .set_level(MessageLevel::Error)
-        .set_title(TITLE)
-        .set_description(text)
-        .set_buttons(MessageButtons::Ok)
-        .show();
+    fn show(text: &str, icon: u32, buttons: u32) -> i32 {
+        let body = wide(text);
+        let title = wide(super::TITLE);
+        // 置顶 + 抢焦点：卸载程序经常是被资源管理器/快捷方式拉起来的，
+        // 不加这两个标志，提示框可能开在主窗口后面，用户以为没反应。
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                body.as_ptr(),
+                title.as_ptr(),
+                buttons | icon | MB_SETFOREGROUND | MB_TOPMOST,
+            )
+        }
+    }
+
+    /// 确定 / 取消，点「确定」返回 true
+    pub fn confirm(text: &str) -> bool {
+        show(text, MB_ICONWARNING, MB_OKCANCEL) == IDOK
+    }
+
+    /// 是 / 否，点「是」返回 true
+    pub fn yes_no(text: &str) -> bool {
+        show(text, MB_ICONWARNING, MB_YESNO) == IDYES
+    }
+
+    pub fn info(text: &str) {
+        show(text, MB_ICONINFORMATION, MB_OK);
+    }
+
+    pub fn warn(text: &str) {
+        show(text, MB_ICONWARNING, MB_OK);
+    }
+
+    pub fn error(text: &str) {
+        show(text, MB_ICONERROR, MB_OK);
+    }
 }
