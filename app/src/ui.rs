@@ -231,6 +231,12 @@ pub struct App {
     tab: Tab,
     /// 同步页当前看的是设备同步还是本地文件导入。
     source: SyncSource,
+    /// 「本地文件」卡是否要排在「运行结果」卡前面。
+    ///
+    /// 用户主动点开「本地文件」时置真——那一刻他在挑文件，这张卡得在眼前；
+    /// 一旦开始上传就置假——那时该看的是进度和结果，传完也保持假，
+    /// 直到他再点一次「本地文件」。
+    files_card_first: bool,
     /// RaceBox 云页面的状态（登录、导入、云端列表）。
     cloud: crate::cloud_ui::CloudState,
     /// 日志抽屉是否展开（日志不再是独立标签页）。
@@ -329,6 +335,7 @@ impl App {
             applied_theme,
             tab: Tab::Sync,
             source: SyncSource::Device,
+            files_card_first: false,
             cloud,
             show_logs: false,
             about_open: false,
@@ -821,6 +828,8 @@ impl App {
         self.cancel_requested = false;
         self.current_mode = Some(RunMode::Import);
         self.running = true;
+        // 开始传了：结果卡回到第一位，本地文件卡收起来
+        self.files_card_first = false;
         self.phase = Phase::Starting;
         self.phase_times.clear();
         self.phase_start = Some(Instant::now());
@@ -1384,8 +1393,11 @@ impl App {
                 {
                     if files_mode {
                         self.source = SyncSource::Device;
+                        self.files_card_first = false;
                     } else {
                         self.source = SyncSource::Files;
+                        // 刚点开：这张卡是用户此刻的操作对象，排到结果卡前面去
+                        self.files_card_first = true;
                         // 打开卡片的同时就弹文件夹选择框：用户点「本地文件」时
                         // 想的就是「让我挑一个目录」，先给一张空卡片还得再点一次是多余的。
                         // 已经有文件（上次记住的目录里扫出来的）就只切模式，不再弹。
@@ -1397,6 +1409,20 @@ impl App {
             });
             ui.add_space(6.0);
         });
+
+        // ---------- 本地文件卡 ----------
+        // 上传本身不在这张卡里（整页只有上面那一个大圆），它只回答「这次传什么」。
+        // 位置按状态走：
+        //   · 刚点开「本地文件」→ 排在运行结果卡**上面**（此刻在挑文件，
+        //     上一次的结果再长也不能把选文件的地方顶到屏幕外）；
+        //   · 点了上传 / 传完之后 → 排到结果卡下面（这时该看的是进度和结论）。
+        // 任务跑起来时整张卡收起，结果卡自然回到第一位。
+        // 拖文件进窗口随时都能用，所以 accept_dropped 不跟着这张卡一起藏。
+        self.cloud.accept_dropped(ui);
+        let files_card_on_top = files_mode && !self.running && self.files_card_first;
+        if files_card_on_top {
+            self.local_files_card(ui, p);
+        }
 
         // ---------- 运行结果卡：汇总 + 设备状态 + 数据段（有内容才出现） ----------
         // 汇总 / 阶段耗时只针对完整同步；清除内存显示清理结果；查询状态只看设备状态
@@ -1694,17 +1720,19 @@ impl App {
             });
         }
 
-        // ---------- 本地文件卡：只在点了「本地文件」后出现 ----------
-        // 上传本身不在这张卡里（整页只有上面那一个大圆），它只回答「这次传什么」。
-        // 任务跑起来时收起来：那时屏幕上该看的是进度和结果，不是文件列表。
-        // 拖文件进窗口随时都能用，所以 accept_dropped 不跟着这张卡一起藏。
-        self.cloud.accept_dropped(ui);
-        if files_mode && !self.running {
-            ui.add_space(10.0);
-            if self.cloud.import_card(ui, p, &mut self.cfg) {
-                // 点了「取消本地上传」：主页回到设备同步，这张卡消失
-                self.source = SyncSource::Device;
-            }
+        // 传过一轮之后（或刚关掉又打开）这张卡排到结果卡下面
+        if files_mode && !self.running && !files_card_on_top {
+            self.local_files_card(ui, p);
+        }
+    }
+
+    /// 画「本地文件」卡。
+    fn local_files_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        ui.add_space(10.0);
+        if self.cloud.import_card(ui, p, &mut self.cfg) {
+            // 点了「取消本地上传」：主页回到设备同步，这张卡消失
+            self.source = SyncSource::Device;
+            self.files_card_first = false;
         }
     }
 
