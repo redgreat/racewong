@@ -146,6 +146,7 @@ pub async fn download(info: &UpdateInfo) -> Result<PathBuf, String> {
 ///   落在上次的目录里，不会因为静默安装没人能改路径而被搬回默认位置；
 /// * 不能直接 spawn msiexec —— 它要覆盖的就是正在运行的 exe。先写一个短命
 ///   `cmd` 脚本，等 2 秒（够本进程退出、文件锁释放）再装，装完把程序重新拉起来；
+///   这个 `cmd` 用 `CREATE_NO_WINDOW` 起，不会在屏幕上闪一个命令行窗口；
 /// * 留一份安装日志在 `%TEMP%\racewong-update\install.log`，静默安装失败时能查。
 pub fn launch_installer(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
@@ -171,9 +172,16 @@ pub fn launch_installer(path: &std::path::Path) -> Result<(), String> {
             exe = exe.display(),
         );
         std::fs::write(&script, body).map_err(|e| format!("写入升级脚本失败: {e}"))?;
-        return std::process::Command::new("cmd.exe")
-            .arg("/c")
+        // 本程序是 GUI 子系统，spawn cmd.exe 时系统会给它新建一个控制台，
+        // 屏幕上就会闪一个黑框——「静默更新」看着一点也不静默。
+        // CREATE_NO_WINDOW 让子进程用隐藏的控制台跑，从头到尾看不见窗口。
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.arg("/c")
             .arg(&script)
+            .creation_flags(CREATE_NO_WINDOW);
+        return cmd
             .spawn()
             .map(|_| ())
             .map_err(|e| format!("无法启动安装器: {e}"));
