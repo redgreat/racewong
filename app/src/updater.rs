@@ -36,9 +36,41 @@ fn wanted_asset(name: &str) -> bool {
     false
 }
 
-pub async fn check() -> Result<Option<UpdateInfo>, String> {
+/// 上一次「已经尝试装过哪个版本」的记号文件。
+///
+/// 静默安装失败时升级脚本会把旧版本重新拉起来，而旧版本一启动又会自动更新，
+/// 于是 `下载 → 退出 → 装失败 → 重启 → 再下载` 转圈。装之前记一笔，
+/// 下次自动检查看到「这一版已经试过了、现在还是旧版」就直接当没有更新。
+fn attempted_marker() -> PathBuf {
+    std::env::temp_dir()
+        .join("racewong-update")
+        .join("attempted.txt")
+}
+
+fn already_attempted(version: &Version) -> bool {
+    std::fs::read_to_string(attempted_marker())
+        .map(|s| s.trim() == version.to_string())
+        .unwrap_or(false)
+}
+
+pub fn mark_attempted(version: &Version) {
+    let path = attempted_marker();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, version.to_string());
+}
+
+/// 查最新 Release。
+///
+/// `skip_failed` 是自动检查用的：上一次已经尝试装过同一版、装完回来还是旧版，
+/// 说明那一次没装成，别再自动重试（手动点「检查并更新」不受这个限制）。
+pub async fn check(skip_failed: bool) -> Result<Option<UpdateInfo>, String> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("racewong-app/", env!("CARGO_PKG_VERSION")))
+        // 连不上时别让请求挂在那儿：内网 / 被墙的机器上 TCP 可能两分钟才超时，
+        // 期间「检查更新」一直转圈，还会把用户手动点的那次挡住
+        .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?;
     let release: Release = client
@@ -56,6 +88,10 @@ pub async fn check() -> Result<Option<UpdateInfo>, String> {
     let current =
         Version::parse(env!("CARGO_PKG_VERSION")).map_err(|e| format!("当前版本号无效: {e}"))?;
     if latest <= current {
+        return Ok(None);
+    }
+    if skip_failed && already_attempted(&latest) {
+        log::info!("v{latest} 上次已经尝试安装过但没成功，本次自动更新跳过");
         return Ok(None);
     }
     let asset = release
@@ -78,6 +114,8 @@ pub async fn download(info: &UpdateInfo) -> Result<PathBuf, String> {
     let target = dir.join(&info.asset_name);
     let response = reqwest::Client::builder()
         .user_agent(concat!("racewong-app/", env!("CARGO_PKG_VERSION")))
+        // 只限连接阶段：安装包几个 MB，整体超时卡太紧会在慢网上下不完
+        .connect_timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?
         .get(&info.download_url)

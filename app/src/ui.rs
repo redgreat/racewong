@@ -301,6 +301,17 @@ pub struct App {
     update_rx: std::sync::mpsc::Receiver<UpdateMsg>,
     update_busy: bool,
     update_result: Option<(String, LogLevel)>,
+    /// 本次检查是不是启动时自动发起的。
+    ///
+    /// 自动检查是「顺手做的」：连不上 GitHub（内网、离线、墙）就当没这回事，
+    /// 一个字都不弹；手动点「检查并更新」才把失败原因摊开给用户看。
+    update_silent: bool,
+    /// 启动时的自动检查跑过了没（只跑一次，别每帧都发请求）。
+    auto_update_checked: bool,
+    /// 下载好但还没装的更新：等当前任务跑完再装。
+    ///
+    /// 静默升级会结束本进程，任务跑一半被它掐掉就是丢数据，所以先攒着。
+    pending_update: Option<(crate::updater::UpdateInfo, std::path::PathBuf)>,
     /// 当前打开的编辑弹窗（凭据 / 云登录）。
     dialog: Option<Dialog>,
     /// 因为「连接信息还没填」被拦下来的那次任务：弹窗填完就接着跑，
@@ -378,6 +389,9 @@ impl App {
             update_rx,
             update_busy: false,
             update_result: None,
+            update_silent: false,
+            auto_update_checked: false,
+            pending_update: None,
             dialog: None,
             pending_run: None,
             about_rect: None,
@@ -686,30 +700,40 @@ impl App {
         }
         while let Ok(message) = self.update_rx.try_recv() {
             self.update_busy = false;
+            let silent = self.update_silent;
             match message {
                 UpdateMsg::Current => {
-                    self.update_result = Some((
-                        tr!("当前已是最新版（{}）", "Already up to date ({})", env!("CARGO_PKG_VERSION")),
-                        LogLevel::Success,
-                    ));
-                }
-                UpdateMsg::Downloaded(info, path) => match crate::updater::launch_installer(&path) {
-                    Ok(()) => {
+                    // 自动检查：已经是最新版就别吭声，用户没问这件事
+                    if !silent {
                         self.update_result = Some((
-                            tr!("v{} 已下载，正在后台静默安装…", "v{} downloaded; installing silently…", info.version),
+                            tr!("当前已是最新版（{}）", "Already up to date ({})", env!("CARGO_PKG_VERSION")),
                             LogLevel::Success,
                         ));
-                        #[cfg(target_os = "windows")]
-                        {
-                            // 更新安装器需要替换当前 exe；即使用户配置了“关闭到托盘”，
-                            // 此处也必须真正退出，不能让旧进程继续占用文件。
-                            self.quit_requested = true;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
                     }
-                    Err(e) => self.update_result = Some((e, LogLevel::Error)),
-                },
-                UpdateMsg::Failed(e) => self.update_result = Some((e, LogLevel::Error)),
+                }
+                UpdateMsg::Downloaded(info, path) => {
+                    // 任务正在跑就先攒着，等它结束再装（见 drain_events 末尾）
+                    if self.running {
+                        self.pending_update = Some((info, path));
+                    } else {
+                        self.install_update(ctx, info, path);
+                    }
+                }
+                UpdateMsg::Failed(e) => {
+                    if silent {
+                        // 连不上 GitHub 是常事（内网 / 离线 / DNS 抽风），
+                        // 自动检查失败不值得打断用户，日志里留一句就够
+                        log::info!("自动检查更新失败，已忽略: {e}");
+                    } else {
+                        self.update_result = Some((e, LogLevel::Error));
+                    }
+                }
+            }
+        }
+        // 有下载好的更新在等：任务一结束就装（跑任务时静默重启等于丢数据）
+        if !self.running {
+            if let Some((info, path)) = self.pending_update.take() {
+                self.install_update(ctx, info, path);
             }
         }
         if self.running {
@@ -720,18 +744,65 @@ impl App {
         }
     }
 
-    fn check_update(&mut self) {
+    /// 装已经下载好的更新：先起安装器，再让本进程退出。
+    fn install_update(
+        &mut self,
+        ctx: &egui::Context,
+        info: crate::updater::UpdateInfo,
+        path: std::path::PathBuf,
+    ) {
+        // 先记一笔「这一版尝试装过」：万一装失败、旧版本被重新拉起来，
+        // 下次自动检查不会又下又装，陷入重启循环
+        crate::updater::mark_attempted(&info.version);
+        match crate::updater::launch_installer(&path) {
+            Ok(()) => {
+                self.update_result = Some((
+                    tr!(
+                        "v{} 已下载，正在后台静默安装…",
+                        "v{} downloaded; installing silently…",
+                        info.version
+                    ),
+                    LogLevel::Success,
+                ));
+                #[cfg(target_os = "windows")]
+                {
+                    // 更新安装器需要替换当前 exe；即使用户配置了“关闭到托盘”，
+                    // 此处也必须真正退出，不能让旧进程继续占用文件。
+                    self.quit_requested = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            Err(e) => {
+                if self.update_silent {
+                    log::info!("自动更新：启动安装器失败，已忽略: {e}");
+                } else {
+                    self.update_result = Some((e, LogLevel::Error));
+                }
+            }
+        }
+    }
+
+    /// 查一次 GitHub Release，有新版本就下载并装。
+    ///
+    /// `silent` 是「启动时自动跑的那一次」：不写状态文字、失败也不弹，
+    /// 因为用户并没有要求这件事，联网失败只是常态。
+    fn check_update(&mut self, silent: bool) {
         if self.update_busy {
             return;
         }
         self.update_busy = true;
-        self.update_result = Some((
-            t!("正在检查 GitHub Release…", "Checking GitHub Release…").to_string(),
-            LogLevel::Info,
-        ));
+        self.update_silent = silent;
+        if silent {
+            self.update_result = None;
+        } else {
+            self.update_result = Some((
+                t!("正在检查 GitHub Release…", "Checking GitHub Release…").to_string(),
+                LogLevel::Info,
+            ));
+        }
         let tx = self.update_tx.clone();
         self.runtime.spawn(async move {
-            let message = match crate::updater::check().await {
+            let message = match crate::updater::check(silent).await {
                 Ok(None) => UpdateMsg::Current,
                 Ok(Some(info)) => match crate::updater::download(&info).await {
                     Ok(path) => UpdateMsg::Downloaded(info, path),
@@ -2404,31 +2475,6 @@ impl App {
         });
 
         ui.add_space(10.0);
-        // ---------- 软件更新 ----------
-        style::card(p).show(ui, |ui| {
-            style::fill_card_width(ui);
-            style::card_title(ui, p, t!("软件更新", "Software update"));
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    p.muted,
-                    tr!("当前版本 {}", "Current version {}", env!("CARGO_PKG_VERSION")),
-                );
-                ui.add_space(12.0);
-                if ui.add_enabled(
-                    !self.update_busy,
-                    style::secondary_button(p, t!("检查并更新", "Check and update")),
-                ).clicked() {
-                    self.check_update();
-                }
-                if self.update_busy { ui.spinner(); }
-            });
-            if let Some((text, level)) = &self.update_result {
-                style::status_banner(ui, p, level_color(p, *level), text);
-            }
-        });
-
-        ui.add_space(10.0);
         // ---------- 外观 ----------
         style::card(p).show(ui, |ui| {
             style::fill_card_width(ui);
@@ -2597,6 +2643,12 @@ impl eframe::App for App {
             // 第一帧再补一次：apply 是幂等的，多调一次没有副作用。
             style::apply(ctx, self.cfg.theme);
             self.applied_theme = self.cfg.theme;
+        }
+        // 每次进程序都静默查一次更新：有新版就下载、静默安装并重启；
+        // 连不上 GitHub 当作没有更新，一个字都不弹。
+        if !self.auto_update_checked {
+            self.auto_update_checked = true;
+            self.check_update(true);
         }
         // 托盘图标要在事件循环起来之后才能建，所以放在这里（每帧检查一次，没需求就直接返回）
         self.sync_tray();
@@ -2802,29 +2854,35 @@ impl eframe::App for App {
                                 .color(p.text),
                         );
                         ui.add_space(4.0);
-                        // 版本号本身就是「检查更新」的入口：点一下就开始检查
-                        let busy = self.update_busy;
-                        let version_label = if busy {
-                            tr!(
-                                "版本 {} · 检查中…",
-                                "version {} · checking…",
+                        // 版本号 + 「检查并更新」：更新入口只留在这里，
+                        // 设置页那张卡已经去掉（每次启动都会自动查一次，不用摆个按钮占地方）
+                        ui.label(
+                            egui::RichText::new(tr!(
+                                "版本 {}",
+                                "version {}",
                                 env!("CARGO_PKG_VERSION")
-                            )
-                        } else {
-                            tr!("版本 {} · 检查更新", "version {} · check", env!("CARGO_PKG_VERSION"))
-                        };
-                        let version_btn = egui::Button::new(
-                            egui::RichText::new(version_label).size(12.5).color(p.info),
-                        )
-                        .frame(false);
-                        let version_resp = ui
-                            .add_enabled(!busy, version_btn)
+                            ))
+                            .size(12.5)
+                            .color(p.muted),
+                        );
+                        ui.add_space(8.0);
+                        let busy = self.update_busy;
+                        let check_btn = ui.add_enabled(
+                            !busy,
+                            style::secondary_button(&p, t!("检查并更新", "Check and update")),
+                        );
+                        if check_btn
                             .on_hover_text(t!(
                                 "点这里检查 GitHub Release 上的新版本",
                                 "click to check GitHub Releases for a newer version"
-                            ));
-                        if version_resp.clicked() {
-                            self.check_update();
+                            ))
+                            .clicked()
+                        {
+                            self.check_update(false);
+                        }
+                        if busy {
+                            ui.add_space(6.0);
+                            ui.spinner();
                         }
                     });
                     if let Some((text, level)) = &self.update_result {
@@ -2845,6 +2903,8 @@ impl eframe::App for App {
             self.about_rect = resp.and_then(|r| Some(r.response.rect));
             if !open {
                 self.about_open = false;
+                // 关窗就把上次的检查结果丢掉，下次打开不会看到一条陈年旧话
+                self.update_result = None;
             } else {
                 // 点（或 Esc）在窗体之外就关掉：窗体内部要留给按钮和文本选择
                 let outside = ctx.pointer_interact_pos().map_or(true, |pos| {
@@ -2853,6 +2913,7 @@ impl eframe::App for App {
                 let pressed_outside = outside && ctx.input(|i| i.pointer.any_pressed());
                 if pressed_outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                     self.about_open = false;
+                    self.update_result = None;
                 }
             }
         } else {
