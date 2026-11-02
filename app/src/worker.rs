@@ -136,6 +136,8 @@ pub enum UiEvent {
     },
     /// 一次任务的量化结果，用于界面上的“运行结果汇总”。
     RunStats(RunStats),
+    /// 手动补传本地缓存跑完了（结果卡里那个「立即重传」按钮用它收起转圈）。
+    ReplayDone,
     Finished {
         ok: bool,
         summary: String,
@@ -253,6 +255,7 @@ fn spawn_flush(
     sinks: Vec<Arc<dyn DataSink>>,
     tx: UnboundedSender<UiEvent>,
     counters: FlushCounters,
+    cancel: Arc<AtomicBool>,
     flush: SessionFlush,
 ) -> Option<tokio::task::JoinHandle<bool>> {
     if flush.records.is_empty() {
@@ -278,6 +281,7 @@ fn spawn_flush(
             let ch = ch.clone();
             let tx_progress = tx.clone();
             let silent = silent.clone();
+            let cancel_ch = cancel.clone();
             let ch_name = ch.name.clone();
             let base = ch.uploaded.load(Ordering::SeqCst);
             tasks.push(tokio::spawn(async move {
@@ -297,7 +301,34 @@ fn spawn_flush(
                         total: total_hint.max(base + done),
                     });
                 };
-                let result = sink.upload_session(&session, &progress).await;
+                // 失败先自己重试：520 / 网关抖动这类错误第二次往往就过了，
+                // 直接转本地缓存等于让用户多等一轮启动才补上。
+                let result = crate::sink::upload_with_retry(
+                    sink.as_ref(),
+                    &session,
+                    &progress,
+                    &cancel_ch,
+                    crate::sink::UPLOAD_ATTEMPTS,
+                    |attempt, err, delay| {
+                        if silent.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let _ = tx_progress.send(UiEvent::Log(
+                            LogLevel::Warn,
+                            tr!(
+                                "第{}段 {} 上传失败，{} 秒后重试（第 {}/{} 次）: {}",
+                                "segment {} -> {} failed, retrying in {}s ({}/{}): {}",
+                                index,
+                                sink.name(),
+                                delay.as_secs(),
+                                attempt,
+                                crate::sink::UPLOAD_ATTEMPTS - 1,
+                                err
+                            ),
+                        ));
+                    },
+                )
+                .await;
                 match &result {
                     Ok(()) => {
                         ch.uploaded.fetch_add(total, Ordering::SeqCst);
@@ -307,10 +338,11 @@ fn spawn_flush(
                         let _ = tx_progress.send(UiEvent::Log(
                             LogLevel::Error,
                             tr!(
-                                "第{}段 {} 上传失败: {e}",
-                                "segment {} -> {} failed: {e}",
+                                "第{}段 {} 上传失败: {}",
+                                "segment {} -> {} failed: {}",
                                 index,
-                                sink.name()
+                                sink.name(),
+                                e
                             ),
                         ));
                     }
@@ -696,7 +728,7 @@ async fn download_and_upload(
     rx_char: &Characteristic,
     tx_char: &Characteristic,
     tx: &UnboundedSender<UiEvent>,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<DownloadResult, String> {
     ble::subscribe(peripheral, tx_char).await?;
     let mut stream = ble::notification_stream(peripheral).await?;
@@ -818,6 +850,7 @@ async fn download_and_upload(
                         sinks.to_vec(),
                         tx.clone(),
                         counters.clone(),
+                        cancel.clone(),
                         flush,
                     ) {
                         upload_handles.push(h);
@@ -859,6 +892,7 @@ async fn download_and_upload(
         sinks.to_vec(),
         tx.clone(),
         counters.clone(),
+        cancel.clone(),
         flush,
     ) {
         upload_handles.push(h);
@@ -1025,7 +1059,7 @@ async fn run_inner(
             }
             RunMode::Sync => {
                 let result = download_and_upload(
-                    cfg, &sinks, &device_name, &peripheral, &rx_char, &tx_char, tx, cancel,
+                    cfg, &sinks, &device_name, &peripheral, &rx_char, &tx_char, tx, &cancel_arc,
                 )
                 .await?;
                 let summary = tr!(
@@ -1129,7 +1163,7 @@ async fn import_inner(
     cfg: &Arc<Config>,
     paths: Vec<PathBuf>,
     tx: &UnboundedSender<UiEvent>,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<String, String> {
     if paths.is_empty() {
         return Err(t!("还没有勾选任何文件", "no file selected").to_string());
@@ -1233,8 +1267,14 @@ async fn import_inner(
             sync_final: true,
             display: Some(name),
         };
-        if let Some(h) = spawn_flush(cfg.clone(), sinks.clone(), tx.clone(), counters.clone(), flush)
-        {
+        if let Some(h) = spawn_flush(
+            cfg.clone(),
+            sinks.clone(),
+            tx.clone(),
+            counters.clone(),
+            cancel.clone(),
+            flush,
+        ) {
             handles.push(h);
         }
     }
@@ -1275,6 +1315,25 @@ fn unix_ms_of(utc: (i32, u32, u32, u32, u32, u32)) -> i64 {
         .single()
         .map(|dt| dt.timestamp_millis())
         .unwrap_or(0)
+}
+
+/// 手动补传本地缓存（结果卡里那个「立即重传」按钮）。
+///
+/// 和同步开始时自动跑的那次补传是同一套逻辑，区别只在于它不碰设备、
+/// 不改任务状态：跑完只把结果写进日志，然后回报一句 [`UiEvent::ReplayDone`]。
+pub async fn run_replay(cfg: Arc<Config>, tx: UnboundedSender<UiEvent>, cancel: Arc<AtomicBool>) {
+    let sinks = match build_sinks(&cfg, &tx, &cancel).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = tx.send(UiEvent::Log(LogLevel::Error, e));
+            let _ = tx.send(UiEvent::ReplayDone);
+            return;
+        }
+    };
+    let refs: Vec<&dyn DataSink> = sinks.iter().map(|a| a.as_ref()).collect();
+    spool::replay(&refs, &tx, &cancel).await;
+    let _ = tx.send(UiEvent::SpoolPending(spool::pending_count()));
+    let _ = tx.send(UiEvent::ReplayDone);
 }
 
 pub async fn run_sync(

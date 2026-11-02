@@ -122,6 +122,11 @@ pub async fn replay(
             ));
             return;
         }
+        // 另一轮补传（手动「立即重传」/ 同步开始时的自动补传）可能刚把它传完删掉了
+        if !json_path.exists() {
+            done += 1;
+            continue;
+        }
         let Some(session) = read_session(&json_path) else {
             let _ = tx.send(UiEvent::Log(
                 LogLevel::Error,
@@ -137,7 +142,31 @@ pub async fn replay(
         let bin_path = json_path.with_extension("bin");
         let mut failure: Option<String> = None;
         for sink in sinks {
-            if let Err(e) = sink.upload_session(&session, &|_: usize| {}).await {
+            // 补传也重试：这里是「最后一次机会」，一次性失败就等于这段数据
+            // 又要在磁盘上躺一整天，等下次启动再说。
+            let result = super::upload_with_retry(
+                *sink,
+                &session,
+                &|_: usize| {},
+                cancel,
+                super::REPLAY_ATTEMPTS,
+                |attempt, e, delay| {
+                    let _ = tx.send(UiEvent::Log(
+                        LogLevel::Warn,
+                        tr!(
+                            "补传 {} 失败，{} 秒后重试（第 {}/{} 次）: {}",
+                            "replaying {} failed, retrying in {}s ({}/{}): {}",
+                            session.display_name(),
+                            delay.as_secs(),
+                            attempt,
+                            super::REPLAY_ATTEMPTS - 1,
+                            e
+                        ),
+                    ));
+                },
+            )
+            .await;
+            if let Err(e) = result {
                 failure = Some(format!("{e}"));
                 break;
             }

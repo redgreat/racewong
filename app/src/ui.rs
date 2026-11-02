@@ -267,6 +267,8 @@ pub struct App {
     channels: Vec<ChannelRow>,
     erase_percent: Option<u8>,
     spool_pending: usize,
+    /// 正在手动补传本地缓存（结果卡里的「立即重传」按钮转圈用）。
+    replay_busy: bool,
     running: bool,
     /// 当前任务类型（取消按钮的文案随它变化）。
     current_mode: Option<RunMode>,
@@ -368,6 +370,7 @@ impl App {
             channels: Vec::new(),
             erase_percent: None,
             spool_pending: 0,
+            replay_busy: false,
             running: false,
             current_mode: None,
             run_stats: None,
@@ -675,6 +678,10 @@ impl App {
                 }
                 UiEvent::EraseProgress(p) => self.erase_percent = Some(p),
                 UiEvent::SpoolPending(n) => self.spool_pending = n,
+                UiEvent::ReplayDone => {
+                    self.replay_busy = false;
+                    self.spool_pending = crate::sink::spool::pending_count();
+                }
                 UiEvent::RunStats(stats) => self.run_stats = Some(stats),
                 UiEvent::Finished { ok, summary, cancelled } => {
                     self.close_phase();
@@ -1525,6 +1532,8 @@ impl App {
         };
         if has_result {
             ui.add_space(10.0);
+            // 卡片是闭包，里面不能直接改 self：先记下「点了重传」，画完再处理
+            let mut want_retry = false;
             style::card(p).show(ui, |ui| {
                 style::fill_card_width(ui);
                 ui.horizontal(|ui| {
@@ -1543,16 +1552,34 @@ impl App {
                 }
 
                 // ---------- ② 待重传告警：要用户处理的事，紧跟着结论 ----------
+                // 带上「立即重传」：每次同步开始都会自动补传一轮，但用户如果
+                // 刚看到这句话又不想再走一遍蓝牙，这个按钮让他当场补上。
                 if spool_pending > 0 {
                     ui.add_space(10.0);
-                    ui.colored_label(
-                        p.warn,
-                        tr!(
-                            "本地缓存待重传 {} 个",
-                            "{} cached segment(s) waiting to be replayed",
-                            spool_pending
-                        ),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            p.warn,
+                            tr!(
+                                "本地缓存待重传 {} 个",
+                                "{} cached segment(s) waiting to be replayed",
+                                spool_pending
+                            ),
+                        );
+                        ui.add_space(10.0);
+                        let can_retry = !self.running && !self.replay_busy;
+                        if ui
+                            .add_enabled(
+                                can_retry,
+                                style::secondary_button(p, t!("立即重传", "Retry now")),
+                            )
+                            .clicked()
+                        {
+                            want_retry = true;
+                        }
+                        if self.replay_busy {
+                            ui.spinner();
+                        }
+                    });
                 }
 
                 // ---------- ③ 本次任务汇总：下载 / 已同步 / 清理内存 / 速度 / 总耗时 ----------
@@ -1789,6 +1816,9 @@ impl App {
                         });
                 }
             });
+            if want_retry {
+                self.retry_spool();
+            }
         }
 
         // 传过一轮之后（或刚关掉又打开）这张卡排到结果卡下面
@@ -1804,6 +1834,31 @@ impl App {
             // 点了「取消本地上传」：主页回到设备同步，这张卡消失
             self.source = SyncSource::Device;
             self.files_card_first = false;
+        }
+    }
+
+    /// 手动补传本地缓存里的数据。
+    ///
+    /// 每次同步开始都会自动补传一轮，但如果用户刚看到「待重传」又不想再走
+    /// 一遍蓝牙，这个入口让他当场把这段补上去——后台跑，不占任务状态。
+    fn retry_spool(&mut self) {
+        if self.replay_busy || self.running || self.spool_pending == 0 {
+            return;
+        }
+        self.replay_busy = true;
+        self.push_log(
+            LogLevel::Info,
+            t!("开始重传本地缓存…", "replaying cached segments…").to_string(),
+        );
+        let cfg = Arc::new(self.cfg.clone());
+        let tx = self.tx.clone();
+        let cancel = self.cancel_flag.clone();
+        cancel.store(false, Ordering::SeqCst);
+        self.runtime.spawn(async move {
+            crate::worker::run_replay(cfg, tx, cancel).await;
+        });
+        if let Some(ctx) = self.ctx.clone() {
+            ctx.request_repaint();
         }
     }
 
@@ -2760,15 +2815,36 @@ impl eframe::App for App {
                             }
                             ui.add_space(12.0);
                         }
-                        ui.colored_label(
-                            p.muted,
-                            egui::RichText::new(tr!(
-                                "待重传 {}",
-                                "{} pending",
-                                self.spool_pending
-                            ))
-                            .size(12.0),
+                        // 有积压时这一格变成可点的「重传」：结果卡还没出现
+                        // （刚启动、没跑过任务）也能在这里把缓存补上去。
+                        let pending_text = if self.replay_busy {
+                            t!("重传中…", "replaying…").to_string()
+                        } else {
+                            tr!("待重传 {}", "{} pending", self.spool_pending)
+                        };
+                        let pending = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(pending_text)
+                                    .size(12.0)
+                                    .color(if self.spool_pending > 0 {
+                                        p.warn
+                                    } else {
+                                        p.muted
+                                    }),
+                            )
+                            .sense(egui::Sense::click()),
                         );
+                        if self.spool_pending > 0 {
+                            if pending
+                                .on_hover_text(t!(
+                                    "点击重传本地缓存",
+                                    "click to replay the cached segments"
+                                ))
+                                .clicked()
+                            {
+                                self.retry_spool();
+                            }
+                        }
                     },
                 );
             });

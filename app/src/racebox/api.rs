@@ -63,6 +63,51 @@ struct UploadEnvelope {
     error_text: String,
 }
 
+/// 云接口的错误。
+///
+/// `retry` 标明「再试一次有没有意义」：Cloudflare 502/520/524、429 限流、
+/// 连接超时都是过几秒就好了；401 掉登录、400 参数不对，重试只是白等。
+#[derive(Debug, Clone)]
+pub struct CloudError {
+    pub msg: String,
+    pub retry: bool,
+}
+
+impl CloudError {
+    /// 请求没走完（DNS 失败、连接被拒、超时）：换一次可能就好了。
+    fn transient(msg: impl Into<String>) -> Self {
+        Self {
+            msg: msg.into(),
+            retry: true,
+        }
+    }
+
+    /// 请求本身有问题（没登录、响应缺字段）：重试也是一样的结果。
+    fn permanent(msg: impl Into<String>) -> Self {
+        Self {
+            msg: msg.into(),
+            retry: false,
+        }
+    }
+
+    /// 按 HTTP 状态码判断：408 / 425 / 429 和 5xx 是服务端「现在不行」，
+    /// 其余的 4xx 是我们请求本身有问题。
+    fn from_status(status: u16, msg: impl Into<String>) -> Self {
+        Self {
+            msg: msg.into(),
+            retry: matches!(status, 408 | 425 | 429) || status >= 500,
+        }
+    }
+}
+
+impl std::fmt::Display for CloudError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+impl std::error::Error for CloudError {}
+
 pub struct CloudClient {
     http: reqwest::Client,
     auth: Option<String>,
@@ -144,8 +189,10 @@ impl CloudClient {
         &self,
         bytes: &[u8],
         if_unmodified_since: &str,
-    ) -> Result<UploadedSession, String> {
-        let cookie = self.cookie_header().ok_or("尚未登录")?;
+    ) -> Result<UploadedSession, CloudError> {
+        let cookie = self
+            .cookie_header()
+            .ok_or_else(|| CloudError::permanent("尚未登录"))?;
         let resp = self
             .http
             .post(format!("{BASE}session"))
@@ -155,20 +202,28 @@ impl CloudClient {
             .body(bytes.to_vec())
             .send()
             .await
-            .map_err(|e| format!("网络错误: {e}"))?;
+            .map_err(|e| CloudError::transient(format!("网络错误: {e}")))?;
 
-        let status = resp.status();
-        let text = resp.text().await.map_err(|e| format!("读取响应失败: {e}"))?;
-        let env: UploadEnvelope = serde_json::from_str(&text)
-            .map_err(|_| format!("HTTP {status}，响应: {}", truncate(&text, 200)))?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| CloudError::transient(format!("读取响应失败: {e}")))?;
+        let env: UploadEnvelope = serde_json::from_str(&text).map_err(|_| {
+            CloudError::from_status(status, format!("HTTP {status}，响应: {}", truncate(&text, 200)))
+        })?;
         if env.error_code != 0 {
-            return Err(if env.error_text.is_empty() {
-                format!("上传被拒绝（HTTP {status}）")
-            } else {
-                env.error_text
-            });
+            return Err(CloudError::from_status(
+                status,
+                if env.error_text.is_empty() {
+                    format!("上传被拒绝（HTTP {status}）")
+                } else {
+                    env.error_text
+                },
+            ));
         }
-        env.session.ok_or_else(|| "响应里没有 session".to_string())
+        env.session
+            .ok_or_else(|| CloudError::permanent("响应里没有 session"))
     }
 
     }
