@@ -139,7 +139,7 @@ Cookie: racebox-api-auth=<token>
 | 0x08 | 2 | OtherBytesLength（本实现 0） |
 | 0x0a | 2 | FileSuffixLength（本实现 0，不写圈事件） |
 | 0x0c | 4 | SensorsDataLength |
-| 0x10 | 1 | Type：**0=直线加速（Drag），1=赛道（Track）** |
+| 0x10 | 1 | Type：**0=直线加速（Drag），1=赛道（Track）**。本实现固定 0（见下） |
 | 0x11 | 1 | IndexInTheDay |
 | 0x12 | 1 | SensorRecordsTimeDelta |
 | 0x13 | 1 | 保留 0 |
@@ -236,14 +236,24 @@ GPS 时比 UTC 快 18 秒（2017 年起的闰跳）。实测样本与该公式�
 
 ### 4.5 尾部（赛道圈 / 分段事件）
 
-每条 8 字节。本实现 `NumberOfEventRecords = 0`、`FileSuffixLength = 0`，
-上传后官网显示「整段一圈」。要支持拆圈，需要用官方赛道库的起终点线做判圈，
-把结果按这个格式写进尾部，并更新头部计数和 CRC——**这是当前唯一没做的增强**。
+每条 8 字节。本实现 `NumberOfEventRecords = 0`、`FileSuffixLength = 0`。
+
+**类型固定写 Drag（`0x10 = 0`）**，不写圈事件：
+
+- 我们传的是摩托车 / 汽车的加速数据，本来就没有起终点线，圈速无从谈起；
+- 写成 Track 时云端会拿 `"No Track"` 去匹配赛道，匹配不上就归进「未关联赛道」，
+  webapp 的 `sessions?type=track` 列表里看不到，等于白传；
+- Drag 不要求赛道，服务端直接从速度 / G 力算 0-100、0-200、分段加速，
+  正是需要的分析，且 `sessions?type=drag` 能正常列出。
+
+要改成赛道会话（带圈速）得用官方赛道库的起终点线做判圈，把结果按 8 字节事件
+写进尾部并更新头部计数和 CRC——本应用不做这件事。
 
 ## 5. 已验证的事实
 
 - 用 GPX 生成会话上传后，服务端完整解析：`records / duration / maxSpeed / minSpeed / maxG` 全部回填正确
 - 上传的会话立刻出现在 `syncmeta` 列表里
-- 用 `"No Track"` / `"Default"` 上传的会话在云端显示为未关联赛道的普通会话，圈数为 1
+- 写成 Track（`0x10 = 1`）+ `"No Track"` 时，云端视为「未关联赛道」，webapp 的
+  赛道列表里不显示；写成 Drag（`0x10 = 0`）才出现在 `sessions?type=drag` 里
 - BLE 下发的每条 80 字节记录（见 `app/src/protocol.rs` 的 `Record`）与该格式的
   采样点几乎一一对应：iTOW、经纬度、海拔、速度、航向、G 力、角速度全都有

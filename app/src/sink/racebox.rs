@@ -59,8 +59,10 @@ impl DataSink for RaceBoxSink {
             .map_err(|e| SinkError::cloud(e.msg, e.retry))?;
 
         progress(session.records.len());
+        // 明确写出类型：云端按类型分列表，Track 匹配不上赛道就不展示，
+        // 日志里带上 Drag 才好排查「传了但看不到」这类问题。
         log::info!(
-            "RaceBox 云: 会话 {} 已上传，{} 条记录，{} 秒",
+            "RaceBox 云: Drag 会话 {} 已上传，{} 条记录，{} 秒",
             uploaded.id,
             uploaded.records,
             uploaded.duration

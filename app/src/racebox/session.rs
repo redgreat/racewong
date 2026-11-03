@@ -5,8 +5,11 @@
 //! 极速、最大 G。GPX / FIT 这些通用格式它不认识，必须先转成这个容器。
 //!
 //! 格式来自对 Android 版 2.3.0 的反编译（`RaceBox.Core.SessionData.V2`），
-//! 完整字段表见 `racebox-re/README-cloud-api.md`。这里只实现「赛道会话 +
-//! 无赛道关联」这一条路径——够用，且服务端实测接受。
+//! 完整字段表见 `docs/racebox-cloud-api.md`。
+//!
+//! 类型固定写 **Drag（直线加速）**：我们传的是摩托车 / 汽车的加速数据，
+//! 本来就没有起终点线、没有圈速可言。写成 Track 会让云端去匹配赛道，
+//! 匹配不上（`"No Track"`）的会话在 app 里干脆不显示——等于白传。
 //!
 //! 布局：
 //! ```text
@@ -23,8 +26,12 @@ use crc32fast::hash as crc32;
 pub const HEADER_LEN: usize = 316;
 
 /// 会话类型：0 是直线加速（Drag），1 是赛道（Track）。
-/// 这里一律按赛道写，服务端会算出「整段一圈」。
-const SESSION_TYPE_TRACK: u8 = 1;
+///
+/// 一律写 Drag。云端对 Track 会话会去找起终点线匹配赛道，我们传的会话
+/// 关联的是 `"No Track"`，匹配不上就被归进「未关联赛道」，webapp 的
+/// 赛道列表里看不到。Drag 不要求赛道、也不算圈速，服务端直接出
+/// 0-100 / 0-200 / 分段加速这些分析，正是我们要的。
+const SESSION_TYPE_DRAG: u8 = 0;
 
 const KEY_RECORD_LEN: usize = 35;
 const DELTA_RECORD_LEN: usize = 25;
@@ -320,7 +327,7 @@ fn write_i16(buf: &mut [u8], at: usize, v: i16) {
     buf[at..at + 2].copy_from_slice(&v.to_le_bytes());
 }
 
-/// 编码一个完整的赛道会话文件。
+/// 编码一个完整的 Drag（直线加速）会话文件。
 ///
 /// 返回的字节流可以直接 `POST /v1/session`。采样点为空时返回 None
 /// （空会话服务端会拒，没必要发）。
@@ -363,7 +370,7 @@ pub fn encode_session(points: &[TrackPoint], meta: &SessionMeta) -> Option<Vec<u
     write_u16(&mut h, 8, 0); // OtherBytesLength
     write_u16(&mut h, 10, 0); // FileSuffixLength（本实现不写圈事件）
     write_u32(&mut h, 12, body.len() as u32);
-    h[16] = SESSION_TYPE_TRACK;
+    h[16] = SESSION_TYPE_DRAG;
     h[17] = 1; // IndexInTheDay
     h[18] = 0; // SensorRecordsTimeDelta
     h[19] = 0;
@@ -532,6 +539,19 @@ mod tests {
         // 类型表
         assert_eq!(blob[304], 3);
         assert_eq!(&blob[305..308], &[1, 2, 3]);
+    }
+
+    /// 类型字节必须是 Drag(0)：写成 Track(1) 云端会去匹配赛道，
+    /// 匹配不上就不在 app 里展示。
+    #[test]
+    fn session_type_is_drag() {
+        let pts: Vec<TrackPoint> = (0..10).map(sample).collect();
+        let blob = encode_session(&pts, &meta()).expect("非空");
+        assert_eq!(blob[16], 0, "会话类型应为 Drag");
+        // Drag 会话不该带圈信息，否则云端可能当成赛道会话处理
+        assert_eq!(blob[289], 0, "NumberOfLaps 应为 0");
+        assert_eq!(blob[288], 0, "NumberOfLapEvents 应为 0");
+        assert_eq!(u16::from_le_bytes([blob[10], blob[11]]), 0, "不应有尾部事件");
     }
 
     /// 记录流必须能被逐条走完，且条数与头部声明一致。
