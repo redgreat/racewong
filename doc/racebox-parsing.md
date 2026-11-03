@@ -59,9 +59,11 @@ DELTA_RECORD_LEN       = 25      // 会话文件增量记录
 
 | 现象         | 先查                               |
 | ---------- | -------------------------------- |
-| 云端传上去了但不显示 | 会话类型字节（第 6.2 节），是不是写成了 Track     |
+| 云端传上去了但不显示 | 先看 `NumberOfRuns`/尾部是不是 0（第 6.6 节），再查会话类型字节（第 6.2 节） |
 | 记录数比设备显示少  | `fix_status == 0` 的点被丢了（第 3.2 节） |
-| 上传报 `Failed to parse session` | 头部结构跟会话类型对不上（第 6.2 节），Drag 却写了 Track 的头 |
+| 上传报 `Failed to parse session` | 头部结构跟会话类型对不上（第 6.2 节）；或 `NumberOfRuns` 与尾部/243 标记不一致（6.6） |
+| 加速成绩时间离谱（40 秒的 0-60） | 跑次切得太粗，起点没落在真起步处（6.6） |
+| 成绩曲线窗口整体后移 | `StartRecordIndexInRun` 写成了终点下标（6.6） |
 | 速度明显对不上    | 速度单位当成了 0.6 km/h（第 3.2 节）      |
 | 服务端算出的时长错乱 | 增量记录超限没重发键记录（第 6.3 节）            |
 | 文件被拒「损坏」   | 头部 CRC 覆盖范围写错（第 6.3 节）           |
@@ -323,9 +325,11 @@ Drag（我们用）  HeaderLength = 96 + 12N，默认 N=4 → 144
 Track（不用）   HeaderLength = 316
 
 [0 .. header_len)             头部（自带 CRC32）
-[header_len .. +data_len)     记录流：键记录 35 字节 / 增量记录 25 字节
-[.. + suffix_len)             尾部事件（本实现长度 0）
+[header_len .. +data_len)     记录流：键记录 35 字节 / 增量记录 25 字节 / 跑次标记 3 字节
+[.. + suffix_len)             尾部：每跑 20 + 12N 字节的跑次成绩
 ```
+
+尾部**不能是 0 字节**，见 6.6：服务端不会自己分跑，尾部空着云端就是「0 runs」。
 
 ### 6.2 类型字节：Drag 还是 Track（重要）
 
@@ -356,7 +360,7 @@ Track（不用）   HeaderLength = 316
 | 72  | 4  | 首点纬度 i32 ×1e7     | 记录流第一个点                                |
 | 76  | 4  | 首点经度 i32 ×1e7     | 记录流第一个点                                |
 | 80  | 2  | TopSpeed i16 ×100 | 极速 km/h × 100，i16 上限 327.67 km/h       |
-| 82  | 2  | NumberOfRuns u16  | `0`，交给服务端算                            |
+| 82  | 2  | NumberOfRuns u16  | **分出来的跑次数**，必须和记录流里的跑次标记、尾部条数三者一致 |
 | 84  | 12N | 目标点数组            | 见下                                     |
 
 每个目标点 12 字节 = 定义 6 字节 + 成绩 4 字节 + 跑次 2 字节：
@@ -372,7 +376,8 @@ i16 BestResultsRuns   成绩所在跑次；-1 = 没有
 ```
 
 默认 4 个目标点 `0→60 / 0→100 / 0→150 / 0→200 km/h`，flags 全填 `0xF1`  
-（已配置 + km/h），成绩填 `0` / `-1` 让服务端自己算。
+（已配置 + km/h）。成绩填 `0` / `-1` 服务端也能接受（它从尾部重算），  
+但填上真实值才能对上——我们两边都填。
 
 紧跟其后是传感器类型表和两个 CRC：
 
@@ -427,6 +432,96 @@ Track 会话就是 `312` / `316` 那组数；Drag 是 `140` / `144`。**别写�
 
 采样点为空时 `encode_session` 返回 `None`，`sink/racebox.rs` 直接报  
 「这一段没有有效记录」。服务端对空会话会返回错误，发了也没用。
+
+### 6.6 跑次（run）：服务端**不会**自己分跑
+
+这是 0.1.21 之后「上传没报错、webapp 两个列表全空」的根因，务必记住：
+
+> 服务端 `DragSession.Load` → `LoadSuffix` 按 `Meta.NumberOfRuns` 逐条读尾部的
+> `DragSessionRunResults`，末尾还要求流已经到底。`NumberOfRuns = 0` 时尾部为空、
+> 跑次数组为空，webapp 的 Drag 列表判定这个会话「没有跑次」，**干脆不显示**
+> （类型是 Drag，Track 列表里也不会有）。
+
+所以整条链路是「设备/我们负责分跑，服务端只负责读」：
+
+| 位置                     | 内容                                    |
+| ---------------------- | ------------------------------------- |
+| 头部 `82` NumberOfRuns   | 跑次数                                   |
+| 记录流里                   | 每跑起点前插一条 `243 + u16 跑次序号`（3 字节），不计入 `NumberOfSensorRecords` |
+| 尾部                     | 每跑 `20 + 12N` 字节                       |
+
+三者**必须一致**：只改 `NumberOfRuns` 不给尾部 → `Failed to parse session`；  
+给了尾部但没插 243 标记 → 同样失败。0.1.21 是三者全空，所以能传上去但看不见。
+
+#### 跑次标记记录（记录流内）
+
+```
+u8  243            记录类型（0xF3）
+u16 跑次序号        从 0 开始
+```
+
+`BaseSession.LoadSensorsData` 的 switch 里 `case 243` 单独处理，  
+**不算进 `NumberOfSensorRecords`**——所以插它不会让记录条数对不上。
+
+#### 尾部每跑的结构（`DragSessionRunResults`）
+
+固定 20 字节 + N × 12 字节：
+
+| 偏移 | 长度 | 字段                     | 说明                          |
+| -- | -- | ---------------------- | --------------------------- |
+| 0  | 4  | StartRecordIndex u32   | 本跑第一条记录在记录流里的下标（跳过 243 记录后的序号） |
+| 4  | 4  | NumberOfRecords u32    | 本跑记录条数                      |
+| 8  | 2  | TopSpeed i16 ×100      | 本跑极速 km/h                    |
+| 10 | 2  | MaxGForce i16 ×1000    | 本跑最大 G（不参与成绩，填 0 也行）        |
+| 12 | 2  | ReactionTime i16 ×1000 | `-32768` = 无效                |
+| 14 | 2  | FtRolloutRecordIndex u16 | 未启用一英尺起步，填 0                |
+| 16 | 2  | FtRolloutTime u16 ×1000  | `65535` = 无效                |
+| 18 | 2  | 保留                     | 0                           |
+| 20 | 12N | 每个目标点的成绩               | 见下                          |
+
+每个目标点 12 字节（`DragSessionRunSetpointResult`）：
+
+```
+u32 Time                       成绩毫秒
+i16 Slope ×10                  坡度（百分比 ×10）
+u16 StartRecordIndexInRun      成绩区间起点，**相对本跑起点**
+u16 NumberOfRecords            区间记录条数
+u16 BrakingOrAccelerationDistance  加速距离（米）
+```
+
+`StartRecordIndexInRun` 容易写错：它是**起点**，不是终点。  
+服务端 `IDragSession.GetRecordsRange` 直接这么用：
+
+```
+起始 = 本跑的 StartRecordIndex + StartRecordIndexInRun
+条数 = NumberOfRecords
+```
+
+写成终点下标，画出来的曲线窗口就整体后移到成绩之后了。  
+从静止起步时它等于 0（起点就是跑次第一条）。
+
+#### 怎么分跑（照抄固件 `DragRealTimeProcessor.CheckSessionState`）
+
+| 规则                | 值                                              |
+| ----------------- | ---------------------------------------------- |
+| 静止阈值              | `277.778 mm/s`（= 1 km/h），低于它按 0 算              |
+| 开始一跑              | 速度 ≥ 阈值（不要求真从 0 起步）                            |
+| 结束一跑              | 连续 **11** 条以上静止记录（判断是 `> 10`）                  |
+| 结束后再超阈值           | 新的一跑                                          |
+| 无定位（no fix）        | 连续 125 条结束整段会话                                 |
+
+市区骑行每个红绿灯都会算一跑，和官方 App 行为一致。  
+实测 19 分钟、极速 73 km/h 的一段骑行分出 **8 跑**，其中 3 跑跑进了 60 km/h。
+
+> 官方 `EndSession` 里还有一条：这一跑没跑进任何目标点就退回 `WaitingStart`。
+> 我们**不丢**这种跑——保留能让 webapp 里每个跑次都有极速和速度曲线可看，
+> 丢掉只会让列表更空。
+
+#### 分跑的两个边界坑
+
+- 起点穿越发生在第 `i-1` 与 `i` 条之间，起点按 `i-1` 算；`i-1` 落在跑次起点之前时
+  退到跑次起点（固件 `StartRecordIndex = recordIndex - 1` 同理）。
+- 第 0 条没有「上一条」，所以扫描从 `max(跑次起点, 1)` 开始。
 
 ---
 
@@ -570,6 +665,10 @@ SEMICIRCLE     = 180 / 2^31       // 经纬度单位
 | 12 | 空会话上传报错 | 采样点为空 | `encode_session` 返回 None 时提前返回 |
 | 13 | 单帧超过 10KB 被 broker 拒 | 一次塞了太多记录 | 上限 120 条 |
 | 14 | 航向 328°-360° 的点方向全错 | 会话文件里航向写成 i16 ×100，上限 327.67° | 改成 u16 ×100（6.3） |
+| 15 | 上传全成功，webapp 的 Track / Drag 列表**都是空的** | 文件里 `NumberOfRuns = 0`、尾部 0 字节、没有 243 标记，服务端不自己分跑 | 自己分跑 + 写尾部（6.6） |
+| 16 | 只改 `NumberOfRuns` 不给尾部 → `Failed to parse session` | 服务端按这个数逐条读尾部，读到 EOF | 三者一起写：头部数、243 标记、尾部（6.6） |
+| 17 | 成绩曲线画到了成绩之后 | `StartRecordIndexInRun` 用了终点下标 | 用起点下标，条数 = 终点-起点+1（6.6） |
+| 18 | 用脚本解码会话文件，速度越算越大（飙到 256 km/h） | 增量记录是相对**上一条键记录**，不是上一条记录 | 每遇到键记录就重置基准（6.3） |
 
 ---
 
@@ -581,11 +680,12 @@ Windows 上在 `%APPDATA%\RaceBox Sync\racewong.log`，按级别滚动。
 云上传会打印：
 
 ```text
-RaceBox 云: Drag 会话 <id> 已上传，<n> 条记录，<秒> 秒
+RaceBox 云: Drag 会话 <id> 已上传，<n> 条记录，<秒> 秒，<k> 跑
 第4段 RaceBox 云 上传失败，2 秒后重试（第 1/2 次）: ...
 ```
 
-「传了但看不到」先看这行，确认类型是 Drag、条数不是 0。
+「传了但看不到」先看这行：类型必须是 Drag、条数不是 0、**跑次数不是 0**。
+跑次是 0 就说明这段骑行全程没动过（或者分跑逻辑坏了），云端不会展示。
 
 ### 11.2 单测
 
@@ -601,9 +701,11 @@ cd app && cargo test
 | --- | --- |
 | `record_decodes_all_fields` | 80 字节记录的每个偏移 |
 | `record_without_fix_is_dropped` | fix_status=0 必须丢 |
-| `session_type_is_drag` | 类型字节 + 三个圈字段为 0 |
+| `session_header_is_drag` | 类型字节、Drag 段字段、跑次 1、尾部长度 |
 | `header_is_consistent` | 会话头长度 / CRC / 类型表 |
-| `records_walk_to_the_end` | 记录流能被逐条走完 |
+| `records_walk_to_the_end` | 记录流能被逐条走完，243 标记数 = `NumberOfRuns` |
+| `detects_run_and_scores_setpoints` | 0-60/0-100 成绩、成绩区间落在跑内 |
+| `stationary_session_has_no_runs` | 全程静止时跑次 0、尾部 0 |
 | `long_gap_forces_key_record` | 间隔 2 秒必须重发键记录 |
 | `itow_matches_real_device_sample` | iTOW 公式对得上真机样本 |
 | `fit_minimal_roundtrip` | FIT 手工拼的最小文件能解出来 |
@@ -640,6 +742,22 @@ curl -s -X POST https://api.racebox.pro/v1/session/syncmeta \
 
 网页端按类型筛：`https://www.racebox.pro/webapp/sessions?type=drag`。
 
+**判断「到底传没传进去」看 `runsCount` 和 `bestResults`，别看网页列表**——
+网页列表受筛选条件影响，而 `syncmeta` 返回的是服务端真正存下的东西：
+
+```bash
+curl -s -X POST https://api.racebox.pro/v1/session/syncmeta \
+  -H 'Cookie: racebox-api-auth=<auth>' \
+  -H 'Content-Type: application/json' -d '{"lastSynced":0,"sessions":[]}' \
+| python -c "import json,sys; ss=json.load(sys.stdin)['sessions']; \
+print([(s['id'],s.get('runsCount'),s.get('bestResults')) for s in ss if s['sessionType']==0][:5])"
+```
+
+`runsCount > 0` 且 `bestResults` 有值，就说明文件写对了，剩下的问题在展示侧。
+
+另外注意：`syncmeta` 只认会话头里的 **UTC 时间**，  
+`dateTimeStartedUTC` 不对（比如差 8 小时）不会导致不显示，但会让「今天」筛选错位。
+
 ---
 
 ## 12. 代码地图
@@ -650,7 +768,7 @@ curl -s -X POST https://api.racebox.pro/v1/session/syncmeta \
 | `app/src/ble.rs` | 蓝牙连接、订阅、写命令 | 2.1 |
 | `app/src/worker.rs` | 下载循环、会话切段、上传调度 | 4 |
 | `app/src/racebox/mod.rs` | `Record` ↔ `TrackPoint` 换算 | 0.1 单位表 |
-| `app/src/racebox/session.rs` | RB V2 容器编码 | 6、7 |
+| `app/src/racebox/session.rs` | RB V2 容器编码 + 分跑/成绩（`detect_runs` / `track_setpoint` / `encode_run_suffix`） | 6、7 |
 | `app/src/racebox/import.rs` | GPX / FIT 解析 | 8、9 |
 | `app/src/racebox/api.rs` | 云接口、错误分类 | `racebox-cloud-api.md` |
 | `app/src/racebox/store.rs` | 云端账号凭据（单独文件，不进 config.json） | — |

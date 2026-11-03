@@ -12,7 +12,7 @@ pub mod session;
 pub mod store;
 
 pub use api::CloudClient;
-pub use session::{encode_session, records_from_points, SessionMeta, TrackPoint};
+pub use session::{detect_runs, encode_session, records_from_points, SessionMeta, TrackPoint};
 
 use crate::protocol::Record;
 
@@ -55,7 +55,15 @@ pub fn new_session_id() -> [u8; 12] {
 }
 
 /// 一组记录 → 会话文件字节流。
-pub fn session_bytes(records: &[Record], device_serial: u64, tz_offset_min: i16) -> Option<Vec<u8>> {
+/// 把一段设备记录编码成 Drag 会话文件，同时返回分出来的跑次数。
+///
+/// 跑次数要打日志：云端 Drag 列表只展示「有跑次」的会话，传上去却看不到时
+/// 第一个要确认的就是这个数——0 跑等于没传。
+pub fn session_bytes(
+    records: &[Record],
+    device_serial: u64,
+    tz_offset_min: i16,
+) -> Option<(Vec<u8>, usize)> {
     let first = records.first()?;
     let points: Vec<TrackPoint> = records.iter().map(record_to_point).collect();
     let meta = SessionMeta {
@@ -72,7 +80,8 @@ pub fn session_bytes(records: &[Record], device_serial: u64, tz_offset_min: i16)
         device_serial,
         recorder: (1, 11),
     };
-    encode_session(&points, &meta)
+    let runs = detect_runs(&points).len();
+    encode_session(&points, &meta).map(|bytes| (bytes, runs))
 }
 
 #[cfg(test)]

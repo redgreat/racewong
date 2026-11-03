@@ -38,7 +38,7 @@ impl DataSink for RaceBoxSink {
         session: &Session,
         progress: &(dyn Fn(usize) + Send + Sync),
     ) -> SinkResult {
-        let bytes = crate::racebox::session_bytes(
+        let (bytes, runs) = crate::racebox::session_bytes(
             &session.records,
             self.device_serial,
             self.tz_offset_min,
@@ -59,13 +59,14 @@ impl DataSink for RaceBoxSink {
             .map_err(|e| SinkError::cloud(e.msg, e.retry))?;
 
         progress(session.records.len());
-        // 明确写出类型：云端按类型分列表，Track 匹配不上赛道就不展示，
-        // 日志里带上 Drag 才好排查「传了但看不到」这类问题。
+        // 明确写出类型和跑次：云端按类型分列表，Drag 列表只展示「有跑次」的会话，
+        // 日志里带上这两个数才好排查「传了但看不到」这类问题。
         log::info!(
-            "RaceBox 云: Drag 会话 {} 已上传，{} 条记录，{} 秒",
+            "RaceBox 云: Drag 会话 {} 已上传，{} 条记录，{} 秒，{} 跑",
             uploaded.id,
             uploaded.records,
-            uploaded.duration
+            uploaded.duration,
+            runs
         );
         Ok(())
     }
