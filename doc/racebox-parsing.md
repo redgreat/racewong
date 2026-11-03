@@ -63,6 +63,10 @@ DELTA_RECORD_LEN       = 25      // 会话文件增量记录
 | 记录数比设备显示少  | `fix_status == 0` 的点被丢了（第 3.2 节） |
 | 上传报 `Failed to parse session` | 头部结构跟会话类型对不上（第 6.2 节）；或 `NumberOfRuns` 与尾部/243 标记不一致（6.6） |
 | 加速成绩时间离谱（40 秒的 0-60） | 跑次切得太粗，起点没落在真起步处（6.6） |
+| 详情页跑次没有成绩行 | 没写 242 事件记录，或 `NumberOfEventRecords` 为 0（6.7） |
+| 最大 G 一直 0.00 | 尾部 MaxGForce 没算（6.6） |
+| GPS Accuracy 空着 | 没写 240 系统记录（6.8） |
+| 天气 / 密度高度空着 | 文件里没有，服务端另取（6.9） |
 | 成绩曲线窗口整体后移 | `StartRecordIndexInRun` 写成了终点下标（6.6） |
 | 速度明显对不上    | 速度单位当成了 0.6 km/h（第 3.2 节）      |
 | 服务端算出的时长错乱 | 增量记录超限没重发键记录（第 6.3 节）            |
@@ -325,9 +329,17 @@ Drag（我们用）  HeaderLength = 96 + 12N，默认 N=4 → 144
 Track（不用）   HeaderLength = 316
 
 [0 .. header_len)             头部（自带 CRC32）
-[header_len .. +data_len)     记录流：键记录 35 字节 / 增量记录 25 字节 / 跑次标记 3 字节
+[header_len .. +data_len)     记录流：采样 35/25 字节，外加 240/242/243 三种旁挂记录
 [.. + suffix_len)             尾部：每跑 20 + 12N 字节的跑次成绩
 ```
+
+旁挂记录都不计入 `NumberOfSensorRecords`，各自有独立的头部计数字段：
+
+| 前缀 | 长度 | 内容 | 头部计数（偏移） |
+| --- | --- | --- | --- |
+| 240 | 8 | 电量 / 卫星数 / 定位精度 | `24` NumberOfSystemDataRecords |
+| 242 | 14 | 目标点成绩（详情页的跑次明细） | `28` NumberOfEventRecords |
+| 243 | 3 | 跑次开始标记 | `82` NumberOfRuns（在 Drag 段里） |
 
 尾部**不能是 0 字节**，见 6.6：服务端不会自己分跑，尾部空着云端就是「0 runs」。
 
@@ -501,7 +513,6 @@ u16 BrakingOrAccelerationDistance  加速距离（米）
 从静止起步时它等于 0（起点就是跑次第一条）。
 
 #### 怎么分跑（照抄固件 `DragRealTimeProcessor.CheckSessionState`）
-
 | 规则                | 值                                              |
 | ----------------- | ---------------------------------------------- |
 | 静止阈值              | `277.778 mm/s`（= 1 km/h），低于它按 0 算              |
@@ -522,6 +533,68 @@ u16 BrakingOrAccelerationDistance  加速距离（米）
 - 起点穿越发生在第 `i-1` 与 `i` 条之间，起点按 `i-1` 算；`i-1` 落在跑次起点之前时
   退到跑次起点（固件 `StartRecordIndex = recordIndex - 1` 同理）。
 - 第 0 条没有「上一条」，所以扫描从 `max(跑次起点, 1)` 开始。
+
+#### 每跑的「最大 G」= 水平合成，不是三轴合成
+
+`DragSessionRunResults.MaxGForce`（`i16 ×1000`）取的是本跑内
+`max(sqrt(gx² + gy²))`。**别把 gz 算进去**：z 轴压着 1 g 重力，算进去每条记录都 ≥ 1 g。
+真机样本验证：尾部写的 0.538 / 0.547 与按水平合成算出来的完全一致。
+
+### 6.7 成绩事件记录（242）：详情页的「0-60 kph 19.55」只认它
+
+尾部里每个跑次都带一份目标点成绩，但**手机 App 的跑次明细不读尾部，读记录流里的
+242 记录**（`DragSession.ParseEventRecord` → `eventRecords`）。只写尾部不写 242，
+详情页每个跑次就只剩一行「max: 51.2 kph」，看不到任何成绩行。
+
+```
+u8  242                   记录类型（0xF2）
+u8  目标点序号             对应头部 setpoints 数组下标
+u32 Time                  成绩毫秒
+i16 Slope ×10             坡度（百分比 ×10）
+u16 StartRecordIndexInRun 区间起点，相对本跑起点
+u16 NumberOfRecords       区间记录条数
+u16 距离或末速              速度模式：加速距离（米）
+                          距离模式：末速 km/h ×100（i16）
+```
+
+共 14 字节。**位置有讲究**：它必须写在第 `起点 + 条数 - 1` 条采样**之后**——
+服务端把「读这条记录时已经读过多少条采样」当作 `SessionSensorRecordIndex`，
+再用它判断这条成绩属于哪一跑（`跑起点 ≤ 下标 < 跑起点 + 条数`）。位置放错，
+成绩会挂到别的跑次上，或者干脆被丢掉。
+
+头部 `28` 的 `NumberOfEventRecords` 必须等于 242 记录条数。
+
+### 6.8 系统记录（240）：GPS 精度和卫星数只能从这里带
+
+记录流里的采样记录**不存**定位精度和卫星数（只有 iTOW/坐标/海拔/速度/航向/G/角速度）。
+详情页的「GPS Accuracy 0.51 m / 15 sat」来自旁挂的 240 记录，真机约每 2 秒写一条：
+
+```
+u8  240
+u8  电量与充电标志         bit0=充电中 bit1-7=电量百分比
+u8  存储占用
+u8  外接天线与卫星数       bit0=用外接天线 bit1-7=卫星数
+u32 水平精度（毫米）
+```
+
+共 8 字节。头部 `24` 的 `NumberOfSystemDataRecords` 要精确报数——
+服务端解析循环拿它当边界，报少了会提前收尾。
+
+我们从 BLE 的 80 字节记录里本来就有 `horizontal_accuracy` 和 `satellites`，
+直接带上去即可。GPX / FIT 导入没有这两个量，就**不写**系统记录（写 0 会被当成
+「精度 0 米」，比不写更误导）。
+
+### 6.9 文件里根本没有、也补不了的字段
+
+| 详情页字段 | 从哪来 | 我们能做什么 |
+| --- | --- | --- |
+| Weather（天气、气温） | 服务端按会话坐标 + 时间查 openweathermap，存在会话 meta 里 | 不用管，webapp 已经有；手机 App 显示「no data」是因为它只认自己录制时缓存的那份 |
+| Density Altitude（密度高度） | App 用天气的气温/气压 + 海拔现算 | 文件里没有这个字段，改不了 |
+| GPS Accuracy | 记录流里的 240 记录 | 写 240（见 6.8） |
+| max: xx kph / xx g | 尾部每跑的 TopSpeed / MaxGForce | 写尾部（见 6.6） |
+| 0-30 kph / 100 m | 记录流里的 242 记录 | 写 242（见 6.7） |
+| No vehicle / Notes / Videos | 云端账号侧的东西 | 与文件无关 |
+
 
 ---
 
@@ -669,6 +742,10 @@ SEMICIRCLE     = 180 / 2^31       // 经纬度单位
 | 16 | 只改 `NumberOfRuns` 不给尾部 → `Failed to parse session` | 服务端按这个数逐条读尾部，读到 EOF | 三者一起写：头部数、243 标记、尾部（6.6） |
 | 17 | 成绩曲线画到了成绩之后 | `StartRecordIndexInRun` 用了终点下标 | 用起点下标，条数 = 终点-起点+1（6.6） |
 | 18 | 用脚本解码会话文件，速度越算越大（飙到 256 km/h） | 增量记录是相对**上一条键记录**，不是上一条记录 | 每遇到键记录就重置基准（6.3） |
+| 19 | 详情页每个跑次只有「max: xx kph」，没有成绩行 | 成绩只写了尾部，没写记录流里的 242 记录 | 242 写在区间最后一条之后（6.7） |
+| 20 | 「max: xx g」永远是 0.00 | 尾部 MaxGForce 填 0 | 算 `max(sqrt(gx²+gy²))`，不含 gz（6.6） |
+| 21 | GPS Accuracy 空着 | 记录流不存精度/卫星数 | 每 2 秒写一条 240（6.8） |
+| 22 | 天气 / 密度高度空着 | 文件里没有这些字段，天气由服务端按坐标+时间取 | 改不了，见 6.9 |
 
 ---
 
@@ -703,8 +780,9 @@ cd app && cargo test
 | `record_without_fix_is_dropped` | fix_status=0 必须丢 |
 | `session_header_is_drag` | 类型字节、Drag 段字段、跑次 1、尾部长度 |
 | `header_is_consistent` | 会话头长度 / CRC / 类型表 |
-| `records_walk_to_the_end` | 记录流能被逐条走完，243 标记数 = `NumberOfRuns` |
-| `detects_run_and_scores_setpoints` | 0-60/0-100 成绩、成绩区间落在跑内 |
+| `records_walk_to_the_end` | 记录流能被逐条走完，243/242/240 条数都等于头部声明 |
+| `detects_run_and_scores_setpoints` | 0-30/0-60/0-100 成绩、成绩区间落在跑内 |
+| `system_and_event_records_are_written` | 240 里的卫星数/精度、242 的目标点序号和成绩 |
 | `stationary_session_has_no_runs` | 全程静止时跑次 0、尾部 0 |
 | `long_gap_forces_key_record` | 间隔 2 秒必须重发键记录 |
 | `itow_matches_real_device_sample` | iTOW 公式对得上真机样本 |

@@ -118,6 +118,9 @@ fn finalize(raw: Vec<RawPoint>) -> Result<ImportedTrack, String> {
             rx: 0.0,
             ry: 0.0,
             rz: 0.0,
+            // GPX / FIT 没有定位精度和卫星数：0 表示未知，编码时不写系统记录
+            hacc_m: 0.0,
+            sats: 0,
         });
         prev = Some((p, speed_mps));
     }

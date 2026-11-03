@@ -42,6 +42,9 @@ pub fn record_to_point(r: &Record) -> TrackPoint {
         rx: r.rotation_rate_x,
         ry: r.rotation_rate_y,
         rz: r.rotation_rate_z,
+        // 精度和卫星数记录流里没有，只能靠 240 系统记录带上去（详情页的 GPS Accuracy）
+        hacc_m: r.horizontal_accuracy,
+        sats: r.satellites,
     }
 }
 

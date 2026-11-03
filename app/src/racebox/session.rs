@@ -57,9 +57,12 @@ const SENSOR_TYPE_COUNT: usize = 3;
 
 /// 默认加速目标点：(起始速度, 目标速度)，单位 km/h。
 ///
-/// 只声明「想算什么」，成绩由服务端按记录流自己算（头部里那两个字段填 0 / -1）。
+/// 只声明「想算什么」，成绩由我们自己按记录流算好写进尾部/事件（头部那两个字段也要填）。
 /// 一次加速跑同时命中多个目标就记多条。
-const DEFAULT_SETPOINTS_KPH: [(u16, u16); 4] = [(0, 60), (0, 100), (0, 150), (0, 200)];
+///
+/// 选 0-30 / 0-60 / 0-100 / 0-150：市区骑行极速常在 60-80 km/h，只有 0-60 的话
+/// 大部分跑次点进去是空的；0-30 几乎每跑都能命中，详情页才有内容可看。
+const DEFAULT_SETPOINTS_KPH: [(u16, u16); 4] = [(0, 30), (0, 60), (0, 100), (0, 150)];
 
 /// Drag 会话的头部长度：68 基础 + Drag 段 + 类型表(1+3) + 两个 CRC。
 ///
@@ -97,6 +100,11 @@ pub struct TrackPoint {
     pub rx: f64,
     pub ry: f64,
     pub rz: f64,
+    /// 水平定位精度，米。写进记录流里的系统记录（240），云端详情页显示「GPS Accuracy」。
+    /// 0 表示未知——GPX / FIT 导入没有这个量，就不写系统记录了。
+    pub hacc_m: f64,
+    /// 参与定位的卫星数。同上。
+    pub sats: u8,
 }
 
 /// 会话头部的元信息。
@@ -330,17 +338,44 @@ fn put_i16(buf: &mut [u8], at: usize, v: i16) {
     buf[at..at + 2].copy_from_slice(&v.to_le_bytes());
 }
 
-/// 编码记录流，返回 (字节流, 键记录数 + 增量记录数)。
+/// 记录流里的「系统数据」记录：`240 + 电量 + 存储 + 天线/卫星 + 水平精度`，共 8 字节。
 ///
-/// `runs` 里每一趟的开始处会插一条 `243 + u16 序号` 记录——服务端靠它划分跑次，
-/// 没有它 `NumberOfRuns` 就没法对上，会直接回 `Failed to parse session`。
-pub fn encode_records(points: &[TrackPoint], runs: &[Run]) -> (Vec<u8>, u32) {
+/// 会话详情页的「GPS Accuracy 0.51 m / 15 sat」就来自这里——记录流本身不存
+/// 精度和卫星数，只能靠这种旁挂记录带上去。手机 App 每 2 秒左右写一条。
+const RECORD_PREFIX_SYSTEM: u8 = 240;
+const SYSTEM_RECORD_LEN: usize = 8;
+/// 每隔多少条采样写一条系统记录（25 Hz 下约 2 秒，和真机一致）。
+const SYSTEM_RECORD_EVERY: usize = 50;
+
+/// 记录流里的「目标点成绩」记录：`242 + 目标点 + 成绩 + 坡度 + 区间`，共 14 字节。
+///
+/// 详情页每个跑次下面的「0-60 kph 19.55」「100 m 15.59」这些行只认这条记录，
+/// 尾部里的同名字段是给服务端汇总用的，不写 242 页面上就只有极速。
+const RECORD_PREFIX_EVENT: u8 = 242;
+const EVENT_RECORD_LEN: usize = 14;
+
+/// 编码记录流，返回 (字节流, 采样条数, 系统记录条数)。
+///
+/// 三种「旁挂记录」按位置插进流里，它们都**不计入** `NumberOfSensorRecords`：
+/// - `243 + u16 序号`：跑次开始，服务端靠它和 `NumberOfRuns` 对齐；
+/// - `242 ...`：目标点成绩，详情页的跑次明细；
+/// - `240 ...`：电量 / 卫星数 / 定位精度。
+pub fn encode_records(
+    points: &[TrackPoint],
+    runs: &[Run],
+    events: &[RunEvent],
+) -> (Vec<u8>, u32, u32) {
     let mut out = Vec::with_capacity(
-        points.len() * DELTA_RECORD_LEN + KEY_RECORD_LEN + runs.len() * RUN_START_RECORD_LEN,
+        points.len() * DELTA_RECORD_LEN
+            + KEY_RECORD_LEN
+            + runs.len() * RUN_START_RECORD_LEN
+            + events.len() * EVENT_RECORD_LEN,
     );
     let mut last: Option<TrackPoint> = None;
     let mut idx: u8 = 0;
     let mut next_run = 0usize;
+    let mut next_event = 0usize;
+    let mut n_sys = 0u32;
     for (i, p) in points.iter().enumerate() {
         // 跑次开始：先写一条 243 记录，再写这一条采样记录
         while next_run < runs.len() && runs[next_run].start == i {
@@ -357,8 +392,29 @@ pub fn encode_records(points: &[TrackPoint], runs: &[Run]) -> (Vec<u8>, u32) {
             let l = last.expect("增量记录一定有上一个键记录");
             write_delta(&mut out, p, &l, idx);
         }
+        // 成绩事件写在「区间最后一条记录」之后：服务端读到的
+        // SessionSensorRecordIndex 就是这个位置，靠它把事件归到跑次上
+        while next_event < events.len() && events[next_event].after == i {
+            let e = &events[next_event];
+            out.push(RECORD_PREFIX_EVENT);
+            out.push(e.setpoint);
+            out.extend_from_slice(&e.time_ms.to_le_bytes());
+            out.extend_from_slice(&e.slope_x10.to_le_bytes());
+            out.extend_from_slice(&e.start_idx_in_run.to_le_bytes());
+            out.extend_from_slice(&e.n_records.to_le_bytes());
+            out.extend_from_slice(&e.distance_m.to_le_bytes());
+            next_event += 1;
+        }
+        if i % SYSTEM_RECORD_EVERY == 0 && p.sats > 0 && p.hacc_m > 0.0 {
+            out.push(RECORD_PREFIX_SYSTEM);
+            out.push(0); // 电量未知：0 表示没数据，别编一个好看的数
+            out.push(0); // 存储占用未知
+            out.push((p.sats & 0x7F) << 1); // bit0 = 外接天线（未知，写 0）
+            out.extend_from_slice(&((p.hacc_m * 1000.0).round().max(0.0) as u32).to_le_bytes());
+            n_sys += 1;
+        }
     }
-    (out, points.len() as u32)
+    (out, points.len() as u32, n_sys)
 }
 
 fn write_u16(buf: &mut [u8], at: usize, v: u16) {
@@ -467,6 +523,22 @@ struct SetpointResult {
     start_idx_in_run: u16,
     n_records: u16,
     distance_m: u16,
+    /// 区间最后一条采样在整段里的绝对下标，用来决定 242 记录插在哪。
+    end_idx: usize,
+}
+
+/// 一条「目标点成绩」事件（记录流里的 242 记录）。
+#[derive(Debug, Clone, Copy)]
+pub struct RunEvent {
+    /// 写在第几条采样之后。服务端读到的 `SessionSensorRecordIndex` 是 `after + 1`，
+    /// 它据此判断这条成绩属于哪一跑。
+    after: usize,
+    setpoint: u8,
+    time_ms: u32,
+    slope_x10: i16,
+    start_idx_in_run: u16,
+    n_records: u16,
+    distance_m: u16,
 }
 
 /// 在一趟里找「从 start_kph 加到 end_kph」的那次穿越。
@@ -524,35 +596,45 @@ fn track_setpoint(
                 start_idx_in_run: (start_at - run.start).min(u16::MAX as usize) as u16,
                 n_records: (i - start_at + 1).min(u16::MAX as usize) as u16,
                 distance_m: dist.round().clamp(0.0, u16::MAX as f64) as u16,
+                end_idx: i,
             });
         }
     }
     None
 }
 
-/// 编码尾部：每趟 `20 + 12×目标点数` 字节，同时算出头部要填的最好成绩。
+/// 编码尾部：每趟 `20 + 12×目标点数` 字节，同时算出头部要填的最好成绩，
+/// 以及要插进记录流的目标点成绩事件（242）。
 ///
-/// 返回 (尾部字节, 每个目标点的最好成绩 ms, 成绩所在的跑次)。
+/// 返回 (尾部字节, 每个目标点的最好成绩 ms, 成绩所在的跑次, 事件列表)。
 fn encode_run_suffix(
     points: &[TrackPoint],
     runs: &[Run],
-) -> (Vec<u8>, Vec<i32>, Vec<i16>) {
+) -> (Vec<u8>, Vec<i32>, Vec<i16>, Vec<RunEvent>) {
     let n = DEFAULT_SETPOINTS_KPH.len();
     let mut out =
         Vec::with_capacity(runs.len() * (RUN_SUFFIX_FIXED + n * RUN_SUFFIX_PER_SETPOINT));
     let mut best = vec![0i32; n];
     let mut best_run = vec![-1i16; n];
+    let mut events = Vec::new();
 
     for (ri, run) in runs.iter().enumerate() {
         let n_records = (run.end - run.start + 1) as u32;
-        let top = points[run.start..=run.end]
+        let seg = &points[run.start..=run.end];
+        let top = seg
             .iter()
             .map(|p| filtered_mmps(p) / 1000.0 * 3.6)
+            .fold(0.0f64, f64::max);
+        // 最大 G 只算水平分量：z 轴压着 1 g 的重力，算进去就永远 ≥1 g。
+        // 真机样本对得上：0.538 / 0.547 与 sqrt(gx²+gy²) 的最大值完全一致。
+        let max_g = seg
+            .iter()
+            .map(|p| (p.gx * p.gx + p.gy * p.gy).sqrt())
             .fold(0.0f64, f64::max);
         out.extend_from_slice(&(run.start as u32).to_le_bytes());
         out.extend_from_slice(&n_records.to_le_bytes());
         out.extend_from_slice(&i16_of(top * 100.0).to_le_bytes());
-        out.extend_from_slice(&0i16.to_le_bytes()); // MaxGForce：不参与成绩，留 0
+        out.extend_from_slice(&i16_of(max_g * 1000.0).to_le_bytes()); // MaxGForce
         out.extend_from_slice(&i16::MIN.to_le_bytes()); // ReactionTime 无效
         out.extend_from_slice(&0u16.to_le_bytes()); // FtRolloutRecordIndex
         out.extend_from_slice(&u16::MAX.to_le_bytes()); // FtRolloutTime 无效
@@ -566,6 +648,15 @@ fn encode_run_suffix(
                     out.extend_from_slice(&r.start_idx_in_run.to_le_bytes());
                     out.extend_from_slice(&r.n_records.to_le_bytes());
                     out.extend_from_slice(&r.distance_m.to_le_bytes());
+                    events.push(RunEvent {
+                        after: r.end_idx,
+                        setpoint: si as u8,
+                        time_ms: r.time_ms,
+                        slope_x10: r.slope_x10,
+                        start_idx_in_run: r.start_idx_in_run,
+                        n_records: r.n_records,
+                        distance_m: r.distance_m,
+                    });
                     let ms = r.time_ms as i32;
                     if best_run[si] < 0 || ms < best[si] {
                         best[si] = ms;
@@ -577,7 +668,9 @@ fn encode_run_suffix(
             }
         }
     }
-    (out, best, best_run)
+    // 记录流要求按位置递增；同一位置的多条（一跑同时命中几个目标）保持目标点顺序
+    events.sort_by_key(|e| e.after);
+    (out, best, best_run, events)
 }
 
 fn write_u32(buf: &mut [u8], at: usize, v: u32) {
@@ -604,8 +697,8 @@ pub fn encode_session(points: &[TrackPoint], meta: &SessionMeta) -> Option<Vec<u
     // 不写这两样，云端就是 0 runs，webapp 的 Drag 列表里干脆看不到。
     let mut runs = detect_runs(points);
     runs.truncate(MAX_RUNS_PER_SESSION);
-    let (body, n_sensor) = encode_records(points, &runs);
-    let (suffix, best, best_run) = encode_run_suffix(points, &runs);
+    let (suffix, best, best_run, events) = encode_run_suffix(points, &runs);
+    let (body, n_sensor, n_sys) = encode_records(points, &runs, &events);
 
     // Drag 头部只有「极速」这一个统计字段，其余交给尾部。
     let max_speed = points
@@ -627,8 +720,10 @@ pub fn encode_session(points: &[TrackPoint], meta: &SessionMeta) -> Option<Vec<u
     h[18] = 0; // SensorRecordsTimeDelta
     h[19] = 0;
     write_u32(&mut h, 20, n_sensor);
-    write_u32(&mut h, 24, 0); // NumberOfSystemDataRecords
-    write_u32(&mut h, 28, 0); // NumberOfEventRecords
+    // 240 系统记录 / 242 成绩记录都要精确报数：服务端解析循环拿它们当边界，
+    // 报少了会提前收尾，报多了会读到记录流末尾之外。
+    write_u32(&mut h, 24, n_sys);
+    write_u32(&mut h, 28, events.len() as u32);
     write_i16(&mut h, 32, meta.tz_offset_min);
 
     let (y, mo, d, hh, mi, ss) = meta.utc;
@@ -878,11 +973,23 @@ mod tests {
         let mut p = 0usize;
         let mut n = 0u32;
         let mut runs = 0u32;
+        let mut events = 0u32;
+        let mut systems = 0u32;
         while p < body.len() {
             let prefix = body[p];
             if prefix == RECORD_PREFIX_RUN_START {
                 p += RUN_START_RECORD_LEN;
                 runs += 1;
+                continue;
+            }
+            if prefix == RECORD_PREFIX_EVENT {
+                p += EVENT_RECORD_LEN;
+                events += 1;
+                continue;
+            }
+            if prefix == RECORD_PREFIX_SYSTEM {
+                p += SYSTEM_RECORD_LEN;
+                systems += 1;
                 continue;
             }
             p += if prefix == RECORD_PREFIX_KEY {
@@ -898,6 +1005,61 @@ mod tests {
         assert_eq!(declared, 500);
         // 记录流里的 243 记录数必须和头部 NumberOfRuns 一致
         assert_eq!(runs, u16::from_le_bytes([blob[82], blob[83]]) as u32);
+        // 旁挂记录也要和头部报数一致，否则服务端解析循环会提前收尾
+        assert_eq!(events, u32::from_le_bytes([blob[28], blob[29], blob[30], blob[31]]));
+        assert_eq!(
+            systems,
+            u32::from_le_bytes([blob[24], blob[25], blob[26], blob[27]])
+        );
+    }
+
+    /// 240 系统记录（卫星数 / 定位精度）和 242 成绩记录都要写对，
+    /// 详情页的「GPS Accuracy」「0-30 kph」这些行只认它们。
+    #[test]
+    fn system_and_event_records_are_written() {
+        let mut pts = acceleration_points();
+        for p in pts.iter_mut() {
+            p.hacc_m = 0.51;
+            p.sats = 15;
+        }
+        let blob = encode_session(&pts, &meta()).expect("非空");
+        let n_sys = u32::from_le_bytes([blob[24], blob[25], blob[26], blob[27]]);
+        let n_event = u32::from_le_bytes([blob[28], blob[29], blob[30], blob[31]]);
+        // 每 50 条一条系统记录：下标 0、50、100（共 150 条采样）
+        assert_eq!(n_sys, 3, "系统记录条数");
+        // 这段数据跑到 100 km/h，0-30 / 0-60 / 0-100 各命中一次
+        assert_eq!(n_event, 3, "成绩记录条数");
+
+        // 按记录边界走一遍，找第一条 240 / 242（不能直接搜字节值：
+        // 采样数据里也可能出现 240，会搜到假的位置）
+        let hl = header_len();
+        let data_len = u32::from_le_bytes([blob[12], blob[13], blob[14], blob[15]]) as usize;
+        let body = &blob[hl..hl + data_len];
+        let (mut p, mut sys, mut ev) = (0usize, None, None);
+        while p < body.len() {
+            match body[p] {
+                RECORD_PREFIX_RUN_START => p += RUN_START_RECORD_LEN,
+                RECORD_PREFIX_EVENT => {
+                    ev.get_or_insert(p);
+                    p += EVENT_RECORD_LEN;
+                }
+                RECORD_PREFIX_SYSTEM => {
+                    sys.get_or_insert(p);
+                    p += SYSTEM_RECORD_LEN;
+                }
+                RECORD_PREFIX_KEY => p += KEY_RECORD_LEN,
+                _ => p += DELTA_RECORD_LEN,
+            }
+        }
+        let at = sys.expect("应当有系统记录");
+        assert_eq!((body[at + 3] >> 1) & 0x7F, 15, "卫星数");
+        let hacc = u32::from_le_bytes([body[at + 4], body[at + 5], body[at + 6], body[at + 7]]);
+        assert_eq!(hacc, 510, "水平精度 0.51 m");
+
+        let at = ev.expect("应当有成绩记录");
+        assert_eq!(body[at + 1], 0, "0-30 是第 0 个目标点");
+        let ms = u32::from_le_bytes([body[at + 2], body[at + 3], body[at + 4], body[at + 5]]);
+        assert!((ms as i32 - 1_160).abs() < 120, "0-30 约 1.16 秒，实际 {ms} ms");
     }
 
     /// 航向写 u16 ×100：328°-360° 用 i16 会被截成 327.67°（方向全错）。
@@ -905,13 +1067,13 @@ mod tests {
     fn heading_is_u16_not_i16() {
         let mut p = sample(0);
         p.heading = 350.0;
-        let (body, _) = encode_records(&[p], &[]);
+        let (body, _, _) = encode_records(&[p], &[], &[]);
         // 键记录：前缀(1) + iTOW(4) + lat(4) + lng(4) + alt(4) + speed(4) 之后是航向
         assert_eq!(u16::from_le_bytes([body[21], body[22]]), 35_000);
 
         let mut q = sample(0);
         q.heading = 360.0;
-        let (body, _) = encode_records(&[q], &[]);
+        let (body, _, _) = encode_records(&[q], &[], &[]);
         assert_eq!(u16::from_le_bytes([body[21], body[22]]), 0, "360° 应归零");
     }
 
@@ -923,7 +1085,7 @@ mod tests {
         b.itow = a.itow + 5_000;
         a.speed_mmps = 0;
         b.speed_mmps = 0;
-        let (body, _) = encode_records(&[a, b], &[]);
+        let (body, _, _) = encode_records(&[a, b], &[], &[]);
         assert_eq!(body.len(), KEY_RECORD_LEN * 2);
     }
 
@@ -959,7 +1121,7 @@ mod tests {
         pts
     }
 
-    /// 一趟 0-100：要分出 1 跑，0-60 约 2.4 秒、0-100 约 4 秒。
+    /// 一趟 0-100：要分出 1 跑，0-30 / 0-60 / 0-100 三档都要算出来。
     ///
     /// 服务端不自己分跑，全靠这些数据，所以这里必须算准。
     #[test]
@@ -969,23 +1131,21 @@ mod tests {
         assert_eq!(runs.len(), 1, "应当只有一趟");
         assert_eq!(runs[0].start, 25, "第 25 条开始动");
 
-        let (suffix, best, best_run) = encode_run_suffix(&pts, &runs);
+        let (suffix, best, best_run, events) = encode_run_suffix(&pts, &runs);
         assert_eq!(
             suffix.len(),
             RUN_SUFFIX_FIXED + DEFAULT_SETPOINTS_KPH.len() * RUN_SUFFIX_PER_SETPOINT
         );
-        assert!(
-            (best[0] - 2_400).abs() < 80,
-            "0-60 应约 2.4 秒，实际 {} ms",
-            best[0]
-        );
-        assert!(
-            (best[1] - 4_000).abs() < 80,
-            "0-100 应约 4 秒，实际 {} ms",
-            best[1]
-        );
-        assert_eq!(best[2], 0, "没到 150 km/h");
-        assert_eq!(best_run[0], 0);
+        // 目标点是 0-30 / 0-60 / 0-100 / 0-150，容差 3 个采样（120ms）
+        for (i, want) in [(0, 1_160), (1, 2_359), (2, 3_959)] {
+            assert!(
+                (best[i] - want).abs() < 120,
+                "目标点 {i} 应约 {want} ms，实际 {} ms",
+                best[i]
+            );
+            assert_eq!(best_run[i], 0, "目标点 {i} 应在第 0 跑");
+        }
+        assert_eq!(best[3], 0, "没到 150 km/h");
         assert_eq!(best_run[3], -1);
 
         // 成绩区间必须落在本跑内：服务端按
@@ -994,11 +1154,17 @@ mod tests {
         let start_idx = u16::from_le_bytes([suffix[at + 6], suffix[at + 7]]) as usize;
         let n_records = u16::from_le_bytes([suffix[at + 8], suffix[at + 9]]) as usize;
         assert_eq!(start_idx, 0, "从静止起步，区间就是跑次起点");
-        assert_eq!(n_records, 60, "2.4 秒 / 40ms = 60 条");
+        assert_eq!(n_records, 31, "1.16 秒 / 40ms ≈ 31 条");
         assert!(
             runs[0].start + start_idx + n_records <= runs[0].end + 1,
             "区间超出跑次范围"
         );
+
+        // 每个命中都要有一条 242 事件，且位置落在本跑内
+        assert_eq!(events.len(), 3);
+        for e in &events {
+            assert!(e.after >= runs[0].start && e.after <= runs[0].end);
+        }
     }
 
     /// 全程静止不能分出一趟，也不能写出非法的跑次。
