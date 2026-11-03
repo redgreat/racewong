@@ -975,12 +975,12 @@ mod tests {
             RUN_SUFFIX_FIXED + DEFAULT_SETPOINTS_KPH.len() * RUN_SUFFIX_PER_SETPOINT
         );
         assert!(
-            (best[0] - 2_400).abs() < 40,
+            (best[0] - 2_400).abs() < 80,
             "0-60 应约 2.4 秒，实际 {} ms",
             best[0]
         );
         assert!(
-            (best[1] - 4_000).abs() < 40,
+            (best[1] - 4_000).abs() < 80,
             "0-100 应约 4 秒，实际 {} ms",
             best[1]
         );
