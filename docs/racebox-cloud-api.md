@@ -136,7 +136,7 @@ Cookie: racebox-api-auth=<token>
 | 偏移 | 长度 | 字段 |
 | --- | --- | --- |
 | 0x00 | 4 | `"RB"` + FileVersionMajor(2) + FileVersionMinor(1) |
-| 0x04 | 2 | HeaderLength（本实现固定 316） |
+| 0x04 | 2 | HeaderLength（**随类型变**：Drag = 96 + 12×目标点数，默认 144；Track 固定 316） |
 | 0x06 | 1 | RecorderVersionMajor（固件主版本，真实样本 1） |
 | 0x07 | 1 | RecorderVersionMinor（真实样本 11） |
 | 0x08 | 2 | OtherBytesLength（本实现 0） |
@@ -155,12 +155,43 @@ Cookie: racebox-api-auth=<token>
 | 0x2e | 12 | SessionID（云端的 id 就是这 12 字节的 hex） |
 | 0x3a | 2 | 保留 |
 | 0x3c | 8 | DeviceSerialNumber（i64，0 表示不指定） |
-| 0x44 | 88 | Track（无关联时 `"No Track"`） |
-| 0x44+88 | 128 | TrackConfiguration（`"Default"`） |
-| 之后 | 20 | 赛道统计（DurationMs / 圈数 / 最速 / 最大 G 等） |
+| 0x44 | 88 | **仅 Track**：Track（无关联时 `"No Track"`） |
+| 0x44+88 | 128 | **仅 Track**：TrackConfiguration（`"Default"`） |
+| 之后 | 20 | **仅 Track**：赛道统计（DurationMs / 圈数 / 最速 / 最大 G 等） |
 | 之后 | 1+n | 传感器类型表：数量 + 每项 1 字节（GPS=1, GForce=2, Gyro=3） |
 | 之后 | 4 | DataChecksum = CRC32(记录流 + 尾部) |
-| 之后 | 4 | HeaderChecksum = CRC32(头部除自身外，即前 312 字节) |
+| 之后 | 4 | HeaderChecksum = CRC32(头部除自身外，即前 `HeaderLength - 4` 字节) |
+
+**Drag 会话从 0x44 开始是另一套结构**，不是 Track 那三段：
+
+```
+0x44 (68)  u8   SessionMode         1 = SpeedMetric
+0x45 (69)  u8   FtRolloutEnabled    0
+0x46 (70)  u8   SetpointCount       N
+0x47 (71)  u8   ChristmasTree       (倒计时 << 4) | 模式
+0x48 (72)  i32  首点纬度 ×1e7
+0x4c (76)  i32  首点经度 ×1e7
+0x50 (80)  i16  TopSpeed ×100（km/h，上限 327.67）
+0x52 (82)  u16  NumberOfRuns
+0x54 (84)  N × 12 字节：目标点
+```
+
+每个目标点 12 字节：
+
+```
+u16 StartSpeed        起始速度（km/h）
+u16 EndSpeed|Distance 目标速度（km/h）；距离模式下是距离（米）
+u8  flags             bit0=已配置 bit1=距离模式 bit2=起始速度用英里
+                      bit4-7=单位（15=km/h，14=mph）
+u8  保留
+i32 BestResults       最好成绩（毫秒）；0 = 还没成绩，交给服务端算
+i16 BestResultsRuns   成绩所在跑次；-1 = 没有
+```
+
+`HeaderLengthCompute = 68 + 会话专属段 + OtherBytesLength + 1 + SensorTypes.Count + 8`，  
+默认 4 个目标点就是 `68 + 64 + 0 + 1 + 3 + 8 = 144`。
+
+**只改 0x10 的类型字节、头部还按 Track 排，服务端会回 `Failed to parse session`。**
 
 CRC32 用标准多项式（等同 `zlib.crc32` / Rust `crc32fast`）。
 
@@ -182,9 +213,9 @@ AutoEnd u8（bit0 = 0 表示自动结束）
 赛道统计由服务端在上传时**重新计算**，头部这些字段填个说得过去的值即可
 （我们把采样数据算一遍写进去，保持一致）。
 
-### 4.2 Track / TrackConfiguration 固定模板
+### 4.2 Track / TrackConfiguration 固定模板（仅 Track 会话）
 
-不关联赛道时整段照抄，服务端实测接受：
+Drag 会话没有这两段。要写 Track 会话时：不关联赛道就整段照抄，服务端实测接受：
 
 - **Track（88 字节）**：12 字节 id（全 0） + 偏移 12 起的 32 字节名称 `"No Track"`，其余 0。
 - **TrackConfiguration（128 字节）**：12 字节 id（全 0） + 偏移 12 起的 32 字节名称 `"Default"`，
