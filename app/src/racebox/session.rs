@@ -11,27 +11,63 @@
 //! 本来就没有起终点线、没有圈速可言。写成 Track 会让云端去匹配赛道，
 //! 匹配不上（`"No Track"`）的会话在 app 里干脆不显示——等于白传。
 //!
-//! 布局：
+//! **两种类型的头部结构完全不同，不是只改一个类型字节**：
+//! - Track：`Track(88) + TrackConfiguration(128) + 统计(20)`，头长固定 316；
+//! - Drag：`SessionMode / FT rollout / 目标点数量 / 圣诞树 / 首点坐标 / 极速 / 跑次`
+//!   共 16 字节，后面跟 N 个加速目标点（每个占 12 字节），头长 `96 + 12N`。
+//!
+//! 把 Track 的头塞进 Drag 会话，服务端读完 `HeaderLength` 就发现位置对不上，
+//! 直接回 `Failed to parse session`——这就是改成 Drag 后一条都传不上去的原因。
+//!
+//! 布局（Drag，N = 目标点数量）：
 //! ```text
-//! [0 .. 316)                    头部（自带 CRC32）
-//! [316 .. 316 + data_len)       传感器记录流（键记录 35 字节 / 增量记录 25 字节）
-//! [.. + 0)                      尾部事件（本实现不产生圈事件，长度为 0）
+//! [0 .. 68)                    基础头（版本 / 时间 / 会话 id / 设备序列号）
+//! [68 .. 68+16+12N)            Drag 专属段（含 N 个加速目标点）
+//! [.. + 1+3)                   传感器类型表：数量 + GPS / GForce / Gyroscope
+//! [.. + 8)                     DataChecksum + HeaderChecksum
+//! [header_len .. + data_len)   传感器记录流（键记录 35 字节 / 增量记录 25 字节）
 //! ```
+//!
+//! 尾部事件长度为 0：Drag 不需要圈事件，服务端按记录流自己算加速成绩。
 
-use crate::protocol::{Record, SPEED_KMH_PER_UNIT};
+use crate::protocol::Record;
 use chrono::{Datelike as _, Timelike as _};
 use crc32fast::hash as crc32;
-
-/// 头部固定长度：68 基础 + 88 赛道 + 128 配置 + 20 统计 + 1 类型数 + 3 类型 + 8 校验和。
-pub const HEADER_LEN: usize = 316;
 
 /// 会话类型：0 是直线加速（Drag），1 是赛道（Track）。
 ///
 /// 一律写 Drag。云端对 Track 会话会去找起终点线匹配赛道，我们传的会话
 /// 关联的是 `"No Track"`，匹配不上就被归进「未关联赛道」，webapp 的
 /// 赛道列表里看不到。Drag 不要求赛道、也不算圈速，服务端直接出
-/// 0-100 / 0-200 / 分段加速这些分析，正是我们要的。
+/// 0-100 / 0-200 这些加速分析，正是我们要的。
 const SESSION_TYPE_DRAG: u8 = 0;
+
+/// `DragSessionMode::SpeedMetric`：目标点按「从起始速度加到目标速度」定义。
+const DRAG_MODE_SPEED_METRIC: u8 = 1;
+/// `DeviceUnits::KillometersPerHour`，写在目标点 units 半字节里。
+const UNITS_KPH: u8 = 15;
+
+/// Drag 专属段的固定部分：SessionMode / FT rollout / 目标点数量 / 圣诞树 /
+/// 首点纬度 / 首点经度 / 极速 / 跑次，共 16 字节。
+const DRAG_FIXED_LEN: usize = 16;
+/// 每个加速目标点在头部占 12 字节：6 字节定义 + 4 字节最好成绩 + 2 字节成绩所在跑次。
+const DRAG_PER_SETPOINT: usize = 12;
+/// 传感器类型数量：GPS / GForce / Gyroscope。
+const SENSOR_TYPE_COUNT: usize = 3;
+
+/// 默认加速目标点：(起始速度, 目标速度)，单位 km/h。
+///
+/// 只声明「想算什么」，成绩由服务端按记录流自己算（头部里那两个字段填 0 / -1）。
+/// 一次加速跑同时命中多个目标就记多条。
+const DEFAULT_SETPOINTS_KPH: [(u16, u16); 4] = [(0, 60), (0, 100), (0, 150), (0, 200)];
+
+/// Drag 会话的头部长度：68 基础 + Drag 段 + 类型表(1+3) + 两个 CRC。
+///
+/// 赛道会话固定 316，Drag 随目标点数量变——服务端按这个值定位记录流，
+/// 算错就是 `Failed to parse session`。
+pub fn header_len() -> usize {
+    68 + DRAG_FIXED_LEN + DEFAULT_SETPOINTS_KPH.len() * DRAG_PER_SETPOINT + 1 + SENSOR_TYPE_COUNT + 8
+}
 
 const KEY_RECORD_LEN: usize = 35;
 const DELTA_RECORD_LEN: usize = 25;
@@ -104,23 +140,6 @@ pub fn itow_from_unix(unix_ms: i64) -> u32 {
     v as u32
 }
 
-/// 无赛道关联时用的固定结构（88 字节）：前 12 字节是 id（全 0），
-/// 偏移 12 起是 32 字节名称。
-fn no_track() -> [u8; 88] {
-    let mut b = [0u8; 88];
-    b[12..20].copy_from_slice(b"No Track");
-    b
-}
-
-/// 默认赛道配置（128 字节）：同样是 12 字节 id + 32 字节名称，
-/// 偏移 45 处是 flags = 2（真实样本里的取值，表示「默认配置」）。
-fn default_config() -> [u8; 128] {
-    let mut b = [0u8; 128];
-    b[12..19].copy_from_slice(b"Default");
-    b[45] = 2;
-    b
-}
-
 /// f64 → i16，超出范围就饱和（Rust 的 float→int 转换本身就饱和，不会 panic）。
 fn i16_of(v: f64) -> i16 {
     v as i16
@@ -142,6 +161,19 @@ fn needs_key(last: Option<&TrackPoint>, p: &TrackPoint, idx: u8) -> bool {
         || (p.speed_mmps as i64 - l.speed_mmps as i64).abs() > MAX_DELTA_RAW as i64
 }
 
+/// 航向写成 **u16 ×100**（0..36000）。
+///
+/// 别用 i16：360° 需要 36000，超过 i16 上限 32767，328°-360° 会被截成 327.67°。
+/// 实测一段 2902 点的数据里有 547 个点落在这个区间，方向全错。
+fn u16_heading(deg: f64) -> u16 {
+    let d = if deg.is_finite() {
+        deg.rem_euclid(360.0)
+    } else {
+        0.0
+    };
+    (d * 100.0).round() as u16
+}
+
 fn write_key(out: &mut Vec<u8>, p: &TrackPoint) {
     out.push(RECORD_PREFIX_KEY);
     out.extend_from_slice(&p.itow.to_le_bytes());
@@ -149,7 +181,7 @@ fn write_key(out: &mut Vec<u8>, p: &TrackPoint) {
     out.extend_from_slice(&((p.lng * 1e7) as i32).to_le_bytes());
     out.extend_from_slice(&((p.alt * 1000.0) as i32).to_le_bytes());
     out.extend_from_slice(&p.speed_mmps.to_le_bytes());
-    out.extend_from_slice(&i16_of(p.heading * 100.0).to_le_bytes());
+    out.extend_from_slice(&u16_heading(p.heading).to_le_bytes());
     write_motion(out, p);
 }
 
@@ -160,7 +192,8 @@ fn write_delta(out: &mut Vec<u8>, p: &TrackPoint, last: &TrackPoint, idx: u8) {
     out.extend_from_slice(&i16_of((p.lng - last.lng) * 1e7).to_le_bytes());
     out.extend_from_slice(&i16_of((p.alt - last.alt) * 1000.0).to_le_bytes());
     out.extend_from_slice(&i16_of(p.speed_mmps as f64 - last.speed_mmps as f64).to_le_bytes());
-    out.extend_from_slice(&i16_of(p.heading * 100.0).to_le_bytes());
+    // 航向是绝对值，不参与增量
+    out.extend_from_slice(&u16_heading(p.heading).to_le_bytes());
     write_motion(out, p);
 }
 
@@ -229,7 +262,8 @@ fn record_from_point(
     put_i32(&mut raw, 28, i32_of(p.lat * 1e7));
     put_i32(&mut raw, 32, i32_of(p.alt * 1000.0));
     put_i32(&mut raw, 36, i32_of(p.alt * 1000.0));
-    put_i32(&mut raw, 48, i32_of(p.speed_mmps as f64 / 1000.0 * 3.6 / SPEED_KMH_PER_UNIT));
+    // 记录里速度是毫米每秒，点里也是毫米每秒，直接写
+    put_i32(&mut raw, 48, i32_of(p.speed_mmps as f64));
     put_i32(&mut raw, 52, i32_of(p.heading * 1e5));
     put_i16(&mut raw, 68, i16_of(p.gx * 1000.0));
     put_i16(&mut raw, 70, i16_of(p.gy * 1000.0));
@@ -327,6 +361,10 @@ fn write_i16(buf: &mut [u8], at: usize, v: i16) {
     buf[at..at + 2].copy_from_slice(&v.to_le_bytes());
 }
 
+fn write_i32(buf: &mut [u8], at: usize, v: i32) {
+    buf[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
 /// 编码一个完整的 Drag（直线加速）会话文件。
 ///
 /// 返回的字节流可以直接 `POST /v1/session`。采样点为空时返回 None
@@ -337,38 +375,20 @@ pub fn encode_session(points: &[TrackPoint], meta: &SessionMeta) -> Option<Vec<u
     }
     let (body, n_sensor) = encode_records(points);
 
-    // 统计量：服务端也会自己算一遍，但头部这些字段得填得说得过去，
-    // 否则文件解析阶段就可能被判为损坏。
-    let mut max_speed = f64::MIN;
-    let mut min_speed = f64::MAX;
-    let mut max_g = 0.0f64;
-    for (i, p) in points.iter().enumerate() {
-        let kph = p.speed_mmps as f64 / 1000.0 * 3.6;
-        if kph > max_speed {
-            max_speed = kph;
-        }
-        if i > 0 && kph < min_speed {
-            min_speed = kph;
-        }
-        let g = (p.gx * p.gx + p.gy * p.gy + (p.gz - 1.0) * (p.gz - 1.0)).sqrt();
-        if g > max_g {
-            max_g = g;
-        }
-    }
-    if min_speed == f64::MAX {
-        min_speed = 0.0;
-    }
-    if max_speed == f64::MIN {
-        max_speed = 0.0;
-    }
+    // Drag 头部只有「极速」这一个统计字段，跑次和成绩都交给服务端算。
+    let max_speed = points
+        .iter()
+        .map(|p| p.speed_mmps as f64 / 1000.0 * 3.6)
+        .fold(0.0f64, f64::max);
 
-    let mut h = [0u8; HEADER_LEN];
+    let header_len = header_len();
+    let mut h = vec![0u8; header_len];
     h[0..4].copy_from_slice(b"RB\x02\x01");
-    write_u16(&mut h, 4, HEADER_LEN as u16);
+    write_u16(&mut h, 4, header_len as u16);
     h[6] = meta.recorder.0;
     h[7] = meta.recorder.1;
     write_u16(&mut h, 8, 0); // OtherBytesLength
-    write_u16(&mut h, 10, 0); // FileSuffixLength（本实现不写圈事件）
+    write_u16(&mut h, 10, 0); // FileSuffixLength（Drag 不写尾部事件）
     write_u32(&mut h, 12, body.len() as u32);
     h[16] = SESSION_TYPE_DRAG;
     h[17] = 1; // IndexInTheDay
@@ -387,36 +407,50 @@ pub fn encode_session(points: &[TrackPoint], meta: &SessionMeta) -> Option<Vec<u
     h[46..58].copy_from_slice(&meta.session_id);
     h[60..68].copy_from_slice(&(meta.device_serial as i64).to_le_bytes());
 
-    h[68..156].copy_from_slice(&no_track());
-    h[156..284].copy_from_slice(&default_config());
+    // ---------- Drag 专属段（68 起）----------
+    let first = points[0];
+    h[68] = DRAG_MODE_SPEED_METRIC;
+    h[69] = 0; // FtRolloutEnabled
+    h[70] = DEFAULT_SETPOINTS_KPH.len() as u8;
+    h[71] = 0; // 圣诞树：(倒计时 << 4) | 模式
+    write_i32(&mut h, 72, i32_of(first.lat * 1e7));
+    write_i32(&mut h, 76, i32_of(first.lng * 1e7));
+    write_i16(&mut h, 80, i16_of(max_speed * 100.0));
+    write_u16(&mut h, 82, 0); // NumberOfRuns：服务端重算
 
-    // 时长按首尾时间戳算，而不是按点数 × 间隔——中间可能断过。
-    let duration_ms = points
-        .last()
-        .map(|p| p.itow.wrapping_sub(points[0].itow))
-        .unwrap_or(0);
-    write_u32(&mut h, 284, duration_ms);
-    h[288] = 0; // NumberOfLapEvents
-    h[289] = 0; // NumberOfLaps
-    write_u16(&mut h, 290, 0); // NumberOfSectorEvents
-    write_u32(&mut h, 292, 0); // BestLapTime
-    write_i16(&mut h, 296, i16_of(max_speed * 100.0));
-    write_i16(&mut h, 298, i16_of(min_speed * 100.0));
-    write_i16(&mut h, 300, i16_of(max_g * 1000.0));
-    h[302] = 0; // BestLapNumber
-    h[303] = 0; // AutoEnd: bit0 = 0 表示自动结束
+    let mut at = 68 + DRAG_FIXED_LEN;
+    for (from, to) in DEFAULT_SETPOINTS_KPH {
+        write_u16(&mut h, at, from);
+        write_u16(&mut h, at + 2, to);
+        // flags：bit0 = 已配置，bit1 = 距离模式（关），bit2 = 起始速度用英里（关），
+        // bit4-7 = 单位（15 = km/h）
+        h[at + 4] = 0x01 | (UNITS_KPH << 4);
+        h[at + 5] = 0;
+        at += 6;
+    }
+    for _ in DEFAULT_SETPOINTS_KPH {
+        write_i32(&mut h, at, 0); // BestResults：0 = 还没成绩
+        at += 4;
+    }
+    for _ in DEFAULT_SETPOINTS_KPH {
+        write_i16(&mut h, at, -1); // BestResultsRuns：-1 = 没有对应跑次
+        at += 2;
+    }
+    debug_assert_eq!(at, header_len - 12, "Drag 段长度与 header_len 对不上");
 
-    h[304] = 3;
-    h[305] = 1; // SensorType::GPS
-    h[306] = 2; // SensorType::GForce
-    h[307] = 3; // SensorType::Gyro
-    write_u32(&mut h, 308, crc32(&body));
-    // 头部校验和覆盖前 312 字节，字段里放的是它自己算出来的值。
-    // 先算完再写：同一句话里既可变借用 h 又只读借用 h 会被借用检查挡下来。
-    let header_crc = crc32(&h[..312]);
-    write_u32(&mut h, 312, header_crc);
+    // 传感器类型表 + 两个校验和，都贴在头部末尾
+    let types_at = header_len - 12;
+    h[types_at] = SENSOR_TYPE_COUNT as u8;
+    h[types_at + 1] = 1; // SensorType::GPS
+    h[types_at + 2] = 2; // SensorType::GForce
+    h[types_at + 3] = 3; // SensorType::Gyroscope
+    write_u32(&mut h, header_len - 8, crc32(&body));
+    // 头部校验和覆盖自身之前的所有字节（HeaderLength - 4）。
+    // 先算完再写：同一句话里既可变借用 h 又只读借用会被借用检查挡下来。
+    let header_crc = crc32(&h[..header_len - 4]);
+    write_u32(&mut h, header_len - 4, header_crc);
 
-    let mut out = Vec::with_capacity(HEADER_LEN + body.len());
+    let mut out = Vec::with_capacity(header_len + body.len());
     out.extend_from_slice(&h);
     out.extend_from_slice(&body);
     Some(out)
@@ -520,38 +554,77 @@ mod tests {
         }
     }
 
-    /// 头部自洽性：长度字段、CRC、类型表都要对得上。
+    /// 头部自洽性：长度字段、两个 CRC、类型表都要对得上。
     #[test]
     fn header_is_consistent() {
         let pts: Vec<TrackPoint> = (0..300).map(sample).collect();
         let blob = encode_session(&pts, &meta()).expect("非空");
+        let hl = header_len();
         assert_eq!(&blob[0..4], b"RB\x02\x01");
-        assert_eq!(u16::from_le_bytes([blob[4], blob[5]]) as usize, HEADER_LEN);
+        assert_eq!(u16::from_le_bytes([blob[4], blob[5]]) as usize, hl);
         let data_len = u32::from_le_bytes([blob[12], blob[13], blob[14], blob[15]]) as usize;
-        assert_eq!(blob.len(), HEADER_LEN + data_len);
+        assert_eq!(blob.len(), hl + data_len);
 
-        // 头部 CRC 覆盖前 312 字节
-        let want = u32::from_le_bytes([blob[312], blob[313], blob[314], blob[315]]);
-        assert_eq!(crc32(&blob[..312]), want);
+        // 头部 CRC 覆盖 HeaderLength - 4 字节
+        let want = u32::from_le_bytes([blob[hl - 4], blob[hl - 3], blob[hl - 2], blob[hl - 1]]);
+        assert_eq!(crc32(&blob[..hl - 4]), want);
         // 记录流 CRC
-        let want = u32::from_le_bytes([blob[308], blob[309], blob[310], blob[311]]);
-        assert_eq!(crc32(&blob[HEADER_LEN..]), want);
+        let want = u32::from_le_bytes([blob[hl - 8], blob[hl - 7], blob[hl - 6], blob[hl - 5]]);
+        assert_eq!(crc32(&blob[hl..]), want);
         // 类型表
-        assert_eq!(blob[304], 3);
-        assert_eq!(&blob[305..308], &[1, 2, 3]);
+        assert_eq!(blob[hl - 12], 3);
+        assert_eq!(&blob[hl - 11..hl - 8], &[1, 2, 3]);
     }
 
-    /// 类型字节必须是 Drag(0)：写成 Track(1) 云端会去匹配赛道，
-    /// 匹配不上就不在 app 里展示。
+    /// 头部必须是 Drag 结构：类型 0、Drag 专属段字段齐全。
+    ///
+    /// 只改类型字节不够——服务端按 Drag 的布局读头部，读到 Track 那
+    /// 88 + 128 字节赛道段就会错位，直接回 `Failed to parse session`。
     #[test]
-    fn session_type_is_drag() {
+    fn session_header_is_drag() {
         let pts: Vec<TrackPoint> = (0..10).map(sample).collect();
         let blob = encode_session(&pts, &meta()).expect("非空");
+        let n = DEFAULT_SETPOINTS_KPH.len();
+        let hl = header_len();
+        assert_eq!(hl, 96 + n * 12, "Drag 头长应为 96 + 12N");
+        assert_eq!(u16::from_le_bytes([blob[4], blob[5]]) as usize, hl);
         assert_eq!(blob[16], 0, "会话类型应为 Drag");
-        // Drag 会话不该带圈信息，否则云端可能当成赛道会话处理
-        assert_eq!(blob[289], 0, "NumberOfLaps 应为 0");
-        assert_eq!(blob[288], 0, "NumberOfLapEvents 应为 0");
+        assert_eq!(blob[17], 1, "IndexInTheDay");
+        assert_eq!(blob[68], DRAG_MODE_SPEED_METRIC);
+        assert_eq!(blob[70] as usize, n, "目标点数量");
+
+        // 首点坐标进了头部
+        let lat = i32::from_le_bytes([blob[72], blob[73], blob[74], blob[75]]) as f64 / 1e7;
+        assert!((lat - pts[0].lat).abs() < 1e-6, "lat {lat}");
+
+        // 每个目标点：已配置 + km/h
+        for (i, (from, to)) in DEFAULT_SETPOINTS_KPH.iter().enumerate() {
+            let at = 84 + i * 6;
+            assert_eq!(blob[at + 4], 0xF1, "第 {i} 个目标点的 flags");
+            assert_eq!(u16::from_le_bytes([blob[at], blob[at + 1]]), *from);
+            assert_eq!(u16::from_le_bytes([blob[at + 2], blob[at + 3]]), *to);
+        }
+        // 成绩留空：0 / -1，交给服务端算
+        let br = 84 + n * 6;
+        for i in 0..n {
+            let v = i32::from_le_bytes([
+                blob[br + i * 4],
+                blob[br + i * 4 + 1],
+                blob[br + i * 4 + 2],
+                blob[br + i * 4 + 3],
+            ]);
+            assert_eq!(v, 0, "BestResults[{i}] 应为 0");
+        }
+        let rr = br + n * 4;
+        for i in 0..n {
+            let v = i16::from_le_bytes([blob[rr + i * 2], blob[rr + i * 2 + 1]]);
+            assert_eq!(v, -1, "BestResultsRuns[{i}] 应为 -1");
+        }
+
+        // Drag 没有尾部事件、没有事件记录
         assert_eq!(u16::from_le_bytes([blob[10], blob[11]]), 0, "不应有尾部事件");
+        let n_event = u32::from_le_bytes([blob[28], blob[29], blob[30], blob[31]]);
+        assert_eq!(n_event, 0, "不应有事件记录");
     }
 
     /// 记录流必须能被逐条走完，且条数与头部声明一致。
@@ -559,7 +632,7 @@ mod tests {
     fn records_walk_to_the_end() {
         let pts: Vec<TrackPoint> = (0..500).map(sample).collect();
         let blob = encode_session(&pts, &meta()).expect("非空");
-        let body = &blob[HEADER_LEN..];
+        let body = &blob[header_len()..];
         let mut p = 0usize;
         let mut n = 0u32;
         while p < body.len() {
@@ -575,6 +648,21 @@ mod tests {
         assert_eq!(n, 500);
         let declared = u32::from_le_bytes([blob[20], blob[21], blob[22], blob[23]]);
         assert_eq!(declared, 500);
+    }
+
+    /// 航向写 u16 ×100：328°-360° 用 i16 会被截成 327.67°（方向全错）。
+    #[test]
+    fn heading_is_u16_not_i16() {
+        let mut p = sample(0);
+        p.heading = 350.0;
+        let (body, _) = encode_records(&[p]);
+        // 键记录：前缀(1) + iTOW(4) + lat(4) + lng(4) + alt(4) + speed(4) 之后是航向
+        assert_eq!(u16::from_le_bytes([body[21], body[22]]), 35_000);
+
+        let mut q = sample(0);
+        q.heading = 360.0;
+        let (body, _) = encode_records(&[q]);
+        assert_eq!(u16::from_le_bytes([body[21], body[22]]), 0, "360° 应归零");
     }
 
     /// 间隔超过 2 秒时必须重发键记录，否则服务端会算错时间轴。

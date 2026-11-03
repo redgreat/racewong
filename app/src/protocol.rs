@@ -29,7 +29,13 @@ pub const RBX2_VERSION: u8 = 2;
 pub const RBX2_MAX_BATCH_RECORDS: usize = 120;
 pub const DEVICE_FIELD_SIZE: usize = 48;
 
-pub const SPEED_KMH_PER_UNIT: f64 = 0.6;
+/// 记录里偏移 48 的速度字段是 **毫米每秒**（反编译字段名 `SpeedMMpS`，
+/// `UnitsConverterCore.SpeedMMpStoKPH`），换算成 km/h 就是 `× 3.6 / 1000`。
+///
+/// 曾经写成 `0.6`（当成「0.6 km/h 一个单位」），结果速度被放大 167 倍：
+/// 实测 51 km/h 会算成 8500 km/h，写进 Drag 会话头时还会被 i16 截到 327.67。
+/// 用 GPS 位移反算校验过：位移速度 / 原始速度 中位数 1.0024，所以 `× 0.0036` 才对。
+pub const SPEED_KMH_PER_UNIT: f64 = 3.6 / 1000.0;
 
 #[derive(Debug, Clone)]
 pub struct Packet {
@@ -183,7 +189,7 @@ impl Record {
             msl_altitude: i32le(&p[36..40]) as f64 / 1000.0,
             horizontal_accuracy: u32le(&p[40..44]) as f64 / 1000.0,
             vertical_accuracy: u32le(&p[44..48]) as f64 / 1000.0,
-            speed_kmh: i32le(&p[48..52]) as f64 * SPEED_KMH_PER_UNIT,
+            speed_kmh: u32le(&p[48..52]) as f64 * SPEED_KMH_PER_UNIT,
             heading: i32le(&p[52..56]) as f64 / 1e5,
             speed_accuracy: u32le(&p[56..60]),
             heading_accuracy: u32le(&p[60..64]) as f64 / 1e5,
@@ -404,7 +410,8 @@ mod tests {
         assert_eq!(rec.msl_altitude, 12.0);
         assert_eq!(rec.horizontal_accuracy, 1.5);
         assert_eq!(rec.vertical_accuracy, 2.0);
-        assert_eq!(rec.speed_kmh, 2778.0 * SPEED_KMH_PER_UNIT);
+        // 原始字段 2778 mm/s = 10.0008 km/h
+        assert!((rec.speed_kmh - 10.0008).abs() < 1e-9);
         assert_eq!(rec.heading, 0.45);
         assert_eq!(rec.speed_accuracy, 5);
         assert_eq!(rec.heading_accuracy, 0.02);
