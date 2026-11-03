@@ -8,6 +8,9 @@
 >
 > 分析过程的完整笔记在 `D:\wangcw\Documents\racebox-re\README-cloud-api.md`（本仓库之外），
 > 本文是浓缩后的「够用」版本。
+>
+> 本文只管**云接口**和**会话容器的逐字节表**。BLE 帧、80 字节记录、GPX/FIT
+> 导入、iTOW 与 CRC 的坑，见 [`racebox-parsing.md`](racebox-parsing.md)。
 
 ## 1. 账号与鉴权
 

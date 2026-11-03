@@ -3,6 +3,9 @@
 > **给接手的人（或智能体）**：本文件说明这个功能要做什么、架构怎么搭、
 > 代码写到了哪一步、还有哪些坑。看完它和 [`racebox-cloud-api.md`](./racebox-cloud-api.md)
 > 就能接着干，不用再去翻反编译过程。
+>
+> 涉及二进制解析（BLE 帧、80 字节记录、GPX/FIT、iTOW、CRC 范围）的细节，
+> 统一在 [`racebox-parsing.md`](./racebox-parsing.md) 里，本文不重复。
 
 ## 0. 一句话目标
 
