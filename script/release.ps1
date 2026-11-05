@@ -50,6 +50,18 @@ $ErrorActionPreference = 'Continue'
 if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
     $PSNativeCommandUseErrorActionPreference = $false
 }
+
+# Windows PowerShell 5.1 默认按系统 ANSI 解码 native 命令的 stdout（中文机器是
+# GBK/gb2312），而 git / gh / cargo 输出的都是 UTF-8。`Get-ReleaseNotes` 通过
+# Invoke-Cmd 捕获 `git log %s`，中文提交标题会先被解成「瀵归綈瀹樻柟…」这种
+# 乱码，再被 Write-Utf8File 原样写进 Release 正文——之后换什么环境都救不回来
+# （v0.1.9、v0.1.21~v0.1.24 的变更记录就是这么坏的）。
+# 显式统一成 UTF-8：PS 7 本来就是 UTF-8，设了也无害；只改解码，不改命令行为。
+# 注意别只改 $OutputEncoding —— 那是「发给 native 命令 stdin」的编码，
+# 接收 stdout 用的是 [Console]::OutputEncoding，两个都要设。
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
 Set-Location (Split-Path -Parent $PSScriptRoot)
 
 $AppDir  = 'app'
