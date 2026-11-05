@@ -291,3 +291,76 @@ GPS 时比 UTC 快 18 秒（2017 年起的闰跳）。实测样本与该公式�
   赛道列表里不显示；写成 Drag（`0x10 = 0`）才出现在 `sessions?type=drag` 里
 - BLE 下发的每条 80 字节记录（见 `app/src/protocol.rs` 的 `Record`）与该格式的
   采样点几乎一一对应：iTOW、经纬度、海拔、速度、航向、G 力、角速度全都有
+
+## 6. 客户端标识与网页版详情页（2026-11-05）
+
+对照同一账号里「真机/官方工具上传」和「本应用上传」的会话，发现两处必须和
+官方一致，否则手机 App 能看、网页版详情页却是一片 0：
+
+1. **请求头 / 登录身份**。官方 `BaseApiClient.PrepareRequestMessage` 对
+   racebox.pro 的每个请求都带 `X-RaceBox-App: 2.3.0`，UA 是
+   `RaceBox/2.3.0 (Android 14)`，登录体上报 `platform=Android,
+   version=2.3.0, devModel=SM-G991B, osVersion=Android 14`。
+   本应用早期只带 Cookie、登录上报 `Windows / 0.1.x / desktop`：
+   `syncmeta` 里 `runsCount`、`bestResults` 都正常，但 **`weather` 一直是 null**
+   （账号里 1235 条有天气的会话没有一条是这种传法）。
+   `tools/rbcloud.py` 用官方身份上传的测试会话则有天气。
+   服务端为什么按客户端区分处理没有公开说明，按「和官方一致」处理即可。
+
+2. **243 跑次开始标记的编号**。`GET /session/{id}/data` 拉回真机 Drag 会话
+   （`6ae47b30…`，5 跑）实测：记录流里只有 **4 条** 243 标记，编号是
+   **1、2、3、4**——第 0 跑是隐含的，会话开头不写标记。本应用以前给每一跑
+   （含第 0 跑）都写一条，编号 0..N-1，比真机多一条且整体错一位。
+   官方 `RaceBox.Core.dll` 的 `DragSession.Load` 对两种布局都返回 `Load=True`
+   （`RunResults` 条数正确），所以手机 App 看不出来；网页版按标记切跑次就会对不上。
+   现在 `app/src/racebox/session.rs::encode_records` 从第 1 跑开始写、编号 1..N-1，
+   单测 `run_start_markers_start_at_one` 钉住这个布局。
+
+3. **`deviceSerialNumber` 不能是 0（相关性最强）**。对同一账号
+   `syncmeta` 的 1531 条会话做离线统计：
+
+   | deviceSerialNumber | 条数 | weather 非空 | vehicleId 非空 |
+   | --- | --- | --- | --- |
+   | 3242704435 | 822 | 788 (95.9%) | 92%+ |
+   | 2254300997 | 471 | 445 (94.5%) | 92%+ |
+   | 0 | 238 | 2 (0.8%) | 0 (0%) |
+
+   两个非 0 号都是用户自己的真机（旧设备 / RaceBox Mini S），**不是填错**。
+   详情页空白的 `15b29b73…` 正是
+   `deviceSerialNumber=0 / vehicleId=null / weather=null / runsCount=14`。
+   两组会话的键集合完全相同，差别只在值：没有有效设备号时服务端不做天气 /
+   车辆等后处理，网页版详情页依赖这些服务端补齐的字段；手机 App 用官方
+   解析器直接读二进制，对 null 不敏感。这解释了「手机正常、网页空白」。
+
+   `config.rs` 里 `device_serial` 默认值是 0，新用户不填就上传会重演这个
+   问题。后续应加上传前校验（非 0 才允许上传，或至少在 UI 明确告警）。
+
+其它观察到的差异（`dragMode`：真机多为 `Custom=0`、我们是 `SpeedMetric=1`；
+`ftRollout`：真机 true、我们 false；`indexInTheDay` 我们固定 1）暂未确认
+与详情页有关，先不动。
+
+网页详情页的实际数据源仍未直接抓到：未登录时
+`GET /webapp/session/{id}` 一律 `302 → /webapp/login`（旧的
+`rb_network.json` 可离线复核），登录页有 Cloudflare Turnstile；公开静态资源
+里只有通用脚本，抓过一次的 `main-menu.js` 是 384 字节、自注 `OBSOLETE` 的
+滚动菜单效果。要确认前端取哪个字段，只能由已登录的浏览器在 F12 里看
+Console / Network。
+
+> 排查时别反复登录 / 刷页面：短时间内多次 `POST /v1/login` 会被源站
+> 临时 403；`www.racebox.pro/webapp/login` 还有 Cloudflare Turnstile，
+> 自动化浏览器拿不到 token。一轮只做一次登录 + 少量 API GET，
+> 剩下的靠 `GET /session/{id}/meta`、`/data` 和本地官方解析器离线比对。
+
+## 7. 部署验证的前置条件（2026-11-05 补记）
+
+改完代码不等于改完用户正在跑的程序。构建产物在
+`app/target/release/racewong-app.exe`，实际运行的是
+`%LOCALAPPDATA%\RaceBox Sync\racewong-app.exe`，两者不是同一个文件；
+应用又是单实例、关窗口只收进托盘（`close_action=Tray`），所以验证新版必须：
+
+1. `Stop-Process -Name racewong-app -Force`；
+2. 备份旧 exe，把 release 产物复制过去（比对 MD5）；
+3. 再启动，确认日志时间戳是新的。
+
+否则日志里新上传的会话仍是旧代码生成的，怎么测都不变。另注意旧云端
+会话不会因本地代码更新而改变，必须**重新上传一条新会话**才能验证。

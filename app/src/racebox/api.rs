@@ -11,6 +11,10 @@ use serde::Deserialize;
 
 const BASE: &str = "https://api.racebox.pro/v1/";
 const COOKIE_NAME: &str = "racebox-api-auth";
+/// 冒充官方 App 2.3.0：请求头、UA、登录上报的平台信息都用这一套。
+/// 详见 `CloudClient::new` 的注释，以及 `doc/racebox-cloud-api.md` §1。
+const APP_VERSION: &str = "2.3.0";
+const USER_AGENT: &str = "RaceBox/2.3.0 (Android 14)";
 /// 上传整段会话可能要几十秒（大文件），但也不能无限等。
 const UPLOAD_TIMEOUT_SECS: u64 = 300;
 
@@ -115,9 +119,21 @@ pub struct CloudClient {
 
 impl CloudClient {
     pub fn new(auth: Option<String>) -> Self {
+        // 官方 App（反编译 `BaseApiClient.PrepareRequestMessage`）对 racebox.pro 的
+        // **每一个**请求都会带 `X-RaceBox-App: <App 版本>`，UA 也是 App 那套。
+        // 实测：用这套头上传的会话，云端会补齐天气等元数据；之前只带 Cookie 上传的
+        // 会话 meta 里 weather 一直是 null，网页版详情页也就没有可画的数据。
+        // 服务端为什么按客户端标识区分处理没有公开文档，这里只做「和官方一致」。
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "X-RaceBox-App",
+            reqwest::header::HeaderValue::from_static(APP_VERSION),
+        );
         // 云接口不需要长连接复用，超时给宽一点：上传一段几百 KB 的会话
         // 在国内网络上可能要好几十秒。
         let http = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .default_headers(headers)
             .timeout(std::time::Duration::from_secs(UPLOAD_TIMEOUT_SECS))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
@@ -136,11 +152,14 @@ impl CloudClient {
             "email": email.trim().to_lowercase(),
             "password": password,
             "clientId": uuid::Uuid::new_v4().to_string(),
-            "platform": "Windows",
-            "version": env!("CARGO_PKG_VERSION"),
-            "devManufacturer": "racewong",
-            "devModel": "desktop",
-            "osVersion": std::env::consts::OS,
+            // 和 `tools/rbcloud.py`（已验证能拿到完整云端元数据）保持一致。
+            // 用 Windows/desktop + 0.1.x 版本号时，服务端只做最小解析：
+            // syncmeta 有 runsCount，但 weather 为 null，网页详情页一片空。
+            "platform": "Android",
+            "version": APP_VERSION,
+            "devManufacturer": "samsung",
+            "devModel": "SM-G991B",
+            "osVersion": "Android 14",
         });
         let resp = self
             .http

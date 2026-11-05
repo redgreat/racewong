@@ -377,10 +377,18 @@ pub fn encode_records(
     let mut next_event = 0usize;
     let mut n_sys = 0u32;
     for (i, p) in points.iter().enumerate() {
-        // 跑次开始：先写一条 243 记录，再写这一条采样记录
+        // 跑次开始：先写一条 243 记录，再写这一条采样记录。
+        //
+        // 真机文件（云端下载的 Drag 会话，5 跑 / 4 条 243）里**第 0 跑没有
+        // 标记**：会话开头那趟是隐含的，从第 1 跑起才写，标记里的序号就是
+        // 跑次号 1、2、3…。我们以前连第 0 跑也写了个 0 号标记，比真机多一条、
+        // 序号整体错一位；手机 App 用官方解析器能容错，网页版详情页按标记
+        // 切跑次时就会对不上。
         while next_run < runs.len() && runs[next_run].start == i {
-            out.push(RECORD_PREFIX_RUN_START);
-            out.extend_from_slice(&(next_run as u16).to_le_bytes());
+            if next_run > 0 {
+                out.push(RECORD_PREFIX_RUN_START);
+                out.extend_from_slice(&(next_run as u16).to_le_bytes());
+            }
             next_run += 1;
         }
         if needs_key(last.as_ref(), p, idx) {
@@ -406,11 +414,12 @@ pub fn encode_records(
             next_event += 1;
         }
         if i % SYSTEM_RECORD_EVERY == 0 && p.sats > 0 && p.hacc_m > 0.0 {
-            out.push(RECORD_PREFIX_SYSTEM);
-            out.push(0); // 电量未知：0 表示没数据，别编一个好看的数
-            out.push(0); // 存储占用未知
-            out.push((p.sats & 0x7F) << 1); // bit0 = 外接天线（未知，写 0）
-            out.extend_from_slice(&((p.hacc_m * 1000.0).round().max(0.0) as u32).to_le_bytes());
+            let mut rec = [0u8; SYSTEM_RECORD_LEN];
+            rec[0] = RECORD_PREFIX_SYSTEM;
+            // 电量 / 存储未知：0 表示没数据，别编一个好看的数
+            rec[3] = (p.sats & 0x7F) << 1; // bit0 = 外接天线（未知，写 0）
+            rec[4..8].copy_from_slice(&((p.hacc_m * 1000.0).round().max(0.0) as u32).to_le_bytes());
+            out.extend_from_slice(&rec);
             n_sys += 1;
         }
     }
@@ -1003,14 +1012,45 @@ mod tests {
         assert_eq!(n, 500);
         let declared = u32::from_le_bytes([blob[20], blob[21], blob[22], blob[23]]);
         assert_eq!(declared, 500);
-        // 记录流里的 243 记录数必须和头部 NumberOfRuns 一致
-        assert_eq!(runs, u16::from_le_bytes([blob[82], blob[83]]) as u32);
+        // 第 0 跑没有 243 标记：标记数 = 跑次数 - 1（与真机文件一致）
+        let n_runs = u16::from_le_bytes([blob[82], blob[83]]) as u32;
+        assert_eq!(runs + u32::from(n_runs > 0), n_runs);
         // 旁挂记录也要和头部报数一致，否则服务端解析循环会提前收尾
         assert_eq!(events, u32::from_le_bytes([blob[28], blob[29], blob[30], blob[31]]));
         assert_eq!(
             systems,
             u32::from_le_bytes([blob[24], blob[25], blob[26], blob[27]])
         );
+    }
+
+    /// 243 跑次开始标记要和真机文件一致：第 0 跑不写，后续跑编号 1、2、3…
+    #[test]
+    fn run_start_markers_start_at_one() {
+        let mut pts = acceleration_points();
+        pts.extend(acceleration_points());
+        let blob = encode_session(&pts, &meta()).expect("非空");
+        let n_runs = u16::from_le_bytes([blob[82], blob[83]]) as usize;
+        assert!(n_runs >= 2, "测试数据要能分出至少两跑");
+
+        let hl = header_len();
+        let data_len = u32::from_le_bytes([blob[12], blob[13], blob[14], blob[15]]) as usize;
+        let body = &blob[hl..hl + data_len];
+        let (mut p, mut marks) = (0usize, Vec::new());
+        while p < body.len() {
+            match body[p] {
+                RECORD_PREFIX_RUN_START => {
+                    marks.push(u16::from_le_bytes([body[p + 1], body[p + 2]]));
+                    p += RUN_START_RECORD_LEN;
+                }
+                RECORD_PREFIX_EVENT => p += EVENT_RECORD_LEN,
+                RECORD_PREFIX_SYSTEM => p += SYSTEM_RECORD_LEN,
+                RECORD_PREFIX_KEY => p += KEY_RECORD_LEN,
+                _ => p += DELTA_RECORD_LEN,
+            }
+        }
+        assert_eq!(p, body.len(), "记录流要能逐条走完");
+        let want: Vec<u16> = (1..n_runs as u16).collect();
+        assert_eq!(marks, want, "标记数 = 跑次数 - 1，且从 1 开始编号");
     }
 
     /// 240 系统记录（卫星数 / 定位精度）和 242 成绩记录都要写对，
