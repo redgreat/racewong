@@ -48,6 +48,42 @@ pub fn record_to_point(r: &Record) -> TrackPoint {
     }
 }
 
+/// 从 BLE 设备名里截出设备序列号。
+///
+/// 设备名形如 `RaceBox Mini S 2254300997 (E8:D9:EE:6D:DC:57)`，序列号是中间
+/// 那段 10 位数字。配置里 `cloud.device_serial` 没填（默认 0）时拿它兜底：
+/// 序列号是云端补全天气 / 车辆信息的依据，留 0 的会话实测 99% 没有
+/// `weather` 和 `vehicleId`，网页版详情页会缺一大片，手机 App 却照常显示。
+///
+/// 只认带 `RaceBox` 字样的名字、且数字至少 8 位：本地文件导入时
+/// `Session.device` 是文件名（可能含 `20261106` 这样的日期），不能误当序列号。
+pub fn serial_from_device_name(name: &str) -> Option<u64> {
+    if !name.to_ascii_lowercase().contains("racebox") {
+        return None;
+    }
+    let bytes = name.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            // 数字串全是 ASCII，切片边界一定落在字符边界上
+            if i - start >= 8 {
+                if let Ok(v) = name[start..i].parse::<u64>() {
+                    if v != 0 {
+                        return Some(v);
+                    }
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
 /// 会话 id：12 字节，云端返回的 id 就是它的十六进制。
 pub fn new_session_id() -> [u8; 12] {
     let u = uuid::Uuid::new_v4();
@@ -97,5 +133,27 @@ mod tests {
         let b = new_session_id();
         assert_eq!(a.len(), 12);
         assert_ne!(a, b, "两次生成的 id 不应相同");
+    }
+
+    #[test]
+    fn serial_from_device_name_works() {
+        assert_eq!(
+            serial_from_device_name("RaceBox Mini S 2254300997 (E8:D9:EE:6D:DC:57)"),
+            Some(2254300997)
+        );
+        assert_eq!(
+            serial_from_device_name("RaceBox Mini S 2254300997"),
+            Some(2254300997)
+        );
+        assert_eq!(
+            serial_from_device_name("RaceBox Micro 3242704435"),
+            Some(3242704435)
+        );
+        assert_eq!(serial_from_device_name(""), None);
+        assert_eq!(serial_from_device_name("未知设备"), None);
+        // 本地导入时 Session.device 是文件名，日期数字不能被误认成序列号
+        assert_eq!(serial_from_device_name("track_20261106.gpx"), None);
+        assert_eq!(serial_from_device_name("RaceBox-123"), None);
+        assert_eq!(serial_from_device_name("RaceBox Mini S"), None);
     }
 }

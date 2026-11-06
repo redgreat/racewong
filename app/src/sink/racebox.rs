@@ -14,16 +14,39 @@ use async_trait::async_trait;
 pub struct RaceBoxSink {
     client: CloudClient,
     device_serial: u64,
+    /// 配置没填时的第二兜底：上次连接过的蓝牙设备名里截出来的序列号。
+    /// 本地文件导入时 `Session.device` 是文件名，解析不出序列号就靠它。
+    fallback_serial: u64,
     tz_offset_min: i16,
 }
 
 impl RaceBoxSink {
-    pub fn new(auth: String, cfg: &CloudConfig) -> Self {
+    pub fn new(auth: String, cfg: &CloudConfig, last_device_name: Option<&str>) -> Self {
         Self {
             client: CloudClient::new(Some(auth)),
             device_serial: cfg.device_serial,
+            fallback_serial: last_device_name
+                .and_then(crate::racebox::serial_from_device_name)
+                .unwrap_or(0),
             tz_offset_min: cfg.tz_offset_min,
         }
+    }
+
+    /// 设备序列号取值顺序：配置 > 本次蓝牙设备名 > 上次记住的设备名 > 0。
+    ///
+    /// 配置里填了就以配置为准（用户可能用另一台旧设备归类）；没填才自动
+    /// 从设备名截取。返回值连来源一起打进上传日志，方便排查「详情页没天气」。
+    fn serial_for(&self, session: &Session) -> (u64, &'static str) {
+        if self.device_serial != 0 {
+            return (self.device_serial, "配置");
+        }
+        if let Some(v) = crate::racebox::serial_from_device_name(&session.device) {
+            return (v, "蓝牙设备名");
+        }
+        if self.fallback_serial != 0 {
+            return (self.fallback_serial, "上次连接的设备名");
+        }
+        (0, "未知")
     }
 }
 
@@ -38,9 +61,10 @@ impl DataSink for RaceBoxSink {
         session: &Session,
         progress: &(dyn Fn(usize) + Send + Sync),
     ) -> SinkResult {
+        let (device_serial, serial_source) = self.serial_for(session);
         let (bytes, runs) = crate::racebox::session_bytes(
             &session.records,
-            self.device_serial,
+            device_serial,
             self.tz_offset_min,
         )
         .ok_or_else(|| {
@@ -62,12 +86,19 @@ impl DataSink for RaceBoxSink {
         // 明确写出类型和跑次：云端按类型分列表，Drag 列表只展示「有跑次」的会话，
         // 日志里带上这两个数才好排查「传了但看不到」这类问题。
         log::info!(
-            "RaceBox 云: Drag 会话 {} 已上传，{} 条记录，{} 秒，{} 跑",
+            "RaceBox 云: Drag 会话 {} 已上传，{} 条记录，{} 秒，{} 跑，设备序列号 {}（{}）",
             uploaded.id,
             uploaded.records,
             uploaded.duration,
-            runs
+            runs,
+            device_serial,
+            serial_source
         );
+        if device_serial == 0 {
+            log::warn!(
+                "RaceBox 云: 设备序列号为空，官网可能不补全天气/车辆信息，网页版详情页会缺数据"
+            );
+        }
         Ok(())
     }
 }

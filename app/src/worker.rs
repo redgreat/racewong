@@ -508,7 +508,11 @@ async fn build_sinks(
     if cfg.cloud.enabled {
         let account = crate::racebox::store::load();
         if account.logged_in() {
-            sinks.push(Arc::new(RaceBoxSink::new(account.auth, &cfg.cloud)));
+            sinks.push(Arc::new(RaceBoxSink::new(
+                account.auth,
+                &cfg.cloud,
+                cfg.last_device_name.as_deref(),
+            )));
         } else {
             let _ = tx.send(UiEvent::Log(
                 LogLevel::Warn,

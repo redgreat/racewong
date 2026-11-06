@@ -572,6 +572,19 @@ fn track_setpoint(
     let mut start_at = run.start;
     let mut start_ll = (0.0f64, 0.0f64);
     let mut start_alt = 0.0f64;
+    // BLE 下载的数据段常从运动中开始：第一趟的起点前面没有静止采样，
+    // 「向上穿越起始速度」这个判定就永远等不到，整趟算不出任何成绩。
+    // 实测云端会话里最长的那一趟（4000+ 条、极速 55 km/h）就是这样变成
+    // 零成绩、进而在网页版被画成灰色不可点的。这时把跑次起点直接当起点，
+    // 后面达到的目标速度照样能算出来；只处理第 0 条，其它跑次前面
+    // 一定有静止段，走正常逻辑更准。
+    if run.start == 0 && filtered_mmps(&points[0]) > start_th {
+        started = true;
+        start_at = 0;
+        start_itow = points[0].itow as i64;
+        start_ll = (points[0].lat, points[0].lng);
+        start_alt = points[0].alt;
+    }
     for i in from..=run.end {
         let prev = filtered_mmps(&points[i - 1]);
         let new = filtered_mmps(&points[i]);
@@ -612,45 +625,84 @@ fn track_setpoint(
     None
 }
 
+/// 一趟算好的成绩，还没决定要不要写进文件。
+struct RunData {
+    run: Run,
+    top: f64,
+    max_g: f64,
+    /// 每个目标点一份；`None` 表示这趟没跑进这个目标。
+    results: Vec<Option<SetpointResult>>,
+}
+
 /// 编码尾部：每趟 `20 + 12×目标点数` 字节，同时算出头部要填的最好成绩，
 /// 以及要插进记录流的目标点成绩事件（242）。
 ///
-/// 返回 (尾部字节, 每个目标点的最好成绩 ms, 成绩所在的跑次, 事件列表)。
+/// **只把有成绩的趟写进跑次表**。网页版详情页的跑次下拉是按
+/// `NumberOfRuns` 逐项渲染的，但一项能不能点取决于记录流里有没有 242
+/// 成绩事件：一趟没有任何目标点成绩，前端就画成灰色、点不开。真机
+/// （手机上传）的每一跑都至少有一条 242，所以全都能点。
+///
+/// `detect_runs` 按 1 km/h 阈值切分，遇到红绿灯、GPS 抖动会切出大量
+/// 几秒的碎片（实测云端会话里 11 跑有 7 跑极速不到 22 km/h、条数不足
+/// 200），它们本来就达不到任何目标点。把这些趟留在跑次表里，等于给
+/// 用户列一排点不开的灰项；直接不写，列表里剩下的就都是能看的。
+/// 采样记录仍全部留在记录流里，只是不再被标记为跑次起点。
+///
+/// 返回 (尾部字节, 最好成绩 ms, 成绩所在跑次, 242 事件, 实际写入的跑次)。
 fn encode_run_suffix(
     points: &[TrackPoint],
     runs: &[Run],
-) -> (Vec<u8>, Vec<i32>, Vec<i16>, Vec<RunEvent>) {
+) -> (Vec<u8>, Vec<i32>, Vec<i16>, Vec<RunEvent>, Vec<Run>) {
     let n = DEFAULT_SETPOINTS_KPH.len();
+    let mut data: Vec<RunData> = runs
+        .iter()
+        .map(|run| {
+            let seg = &points[run.start..=run.end];
+            let top = seg
+                .iter()
+                .map(|p| filtered_mmps(p) / 1000.0 * 3.6)
+                .fold(0.0f64, f64::max);
+            // 最大 G 只算水平分量：z 轴压着 1 g 的重力，算进去就永远 ≥1 g。
+            // 真机样本对得上：0.538 / 0.547 与 sqrt(gx²+gy²) 的最大值完全一致。
+            let max_g = seg
+                .iter()
+                .map(|p| (p.gx * p.gx + p.gy * p.gy).sqrt())
+                .fold(0.0f64, f64::max);
+            let results = DEFAULT_SETPOINTS_KPH
+                .iter()
+                .map(|(from, to)| track_setpoint(points, run, *from as f64, *to as f64))
+                .collect();
+            RunData {
+                run: *run,
+                top,
+                max_g,
+                results,
+            }
+        })
+        .collect();
+    data.retain(|d| d.results.iter().any(Option::is_some));
+
     let mut out =
-        Vec::with_capacity(runs.len() * (RUN_SUFFIX_FIXED + n * RUN_SUFFIX_PER_SETPOINT));
+        Vec::with_capacity(data.len() * (RUN_SUFFIX_FIXED + n * RUN_SUFFIX_PER_SETPOINT));
     let mut best = vec![0i32; n];
     let mut best_run = vec![-1i16; n];
     let mut events = Vec::new();
 
-    for (ri, run) in runs.iter().enumerate() {
-        let n_records = (run.end - run.start + 1) as u32;
-        let seg = &points[run.start..=run.end];
-        let top = seg
-            .iter()
-            .map(|p| filtered_mmps(p) / 1000.0 * 3.6)
-            .fold(0.0f64, f64::max);
-        // 最大 G 只算水平分量：z 轴压着 1 g 的重力，算进去就永远 ≥1 g。
-        // 真机样本对得上：0.538 / 0.547 与 sqrt(gx²+gy²) 的最大值完全一致。
-        let max_g = seg
-            .iter()
-            .map(|p| (p.gx * p.gx + p.gy * p.gy).sqrt())
-            .fold(0.0f64, f64::max);
-        out.extend_from_slice(&(run.start as u32).to_le_bytes());
+    // 跑次序号按**过滤后**的下标算：243 标记和 BestResultsRuns 都用这个号，
+    // 沿用原始下标会让服务端把成绩归到不存在的跑次上。
+    for (ri, d) in data.iter().enumerate() {
+        let n_records = (d.run.end - d.run.start + 1) as u32;
+        out.extend_from_slice(&(d.run.start as u32).to_le_bytes());
         out.extend_from_slice(&n_records.to_le_bytes());
-        out.extend_from_slice(&i16_of(top * 100.0).to_le_bytes());
-        out.extend_from_slice(&i16_of(max_g * 1000.0).to_le_bytes()); // MaxGForce
+        out.extend_from_slice(&i16_of(d.top * 100.0).to_le_bytes());
+        out.extend_from_slice(&i16_of(d.max_g * 1000.0).to_le_bytes()); // MaxGForce
         out.extend_from_slice(&i16::MIN.to_le_bytes()); // ReactionTime 无效
         out.extend_from_slice(&0u16.to_le_bytes()); // FtRolloutRecordIndex
         out.extend_from_slice(&u16::MAX.to_le_bytes()); // FtRolloutTime 无效
         out.extend_from_slice(&0u16.to_le_bytes()); // 保留
 
-        for (si, (from, to)) in DEFAULT_SETPOINTS_KPH.iter().enumerate() {
-            match track_setpoint(points, run, *from as f64, *to as f64) {
+        for (si, result) in d.results.iter().enumerate() {
+            match result {
                 Some(r) => {
                     out.extend_from_slice(&r.time_ms.to_le_bytes());
                     out.extend_from_slice(&r.slope_x10.to_le_bytes());
@@ -679,7 +731,8 @@ fn encode_run_suffix(
     }
     // 记录流要求按位置递增；同一位置的多条（一跑同时命中几个目标）保持目标点顺序
     events.sort_by_key(|e| e.after);
-    (out, best, best_run, events)
+    let kept = data.iter().map(|d| d.run).collect();
+    (out, best, best_run, events, kept)
 }
 
 fn write_u32(buf: &mut [u8], at: usize, v: u32) {
@@ -704,9 +757,11 @@ pub fn encode_session(points: &[TrackPoint], meta: &SessionMeta) -> Option<Vec<u
     }
     // 服务端不自己分跑：跑次、成绩全靠文件里的 243 记录和尾部数据。
     // 不写这两样，云端就是 0 runs，webapp 的 Drag 列表里干脆看不到。
-    let mut runs = detect_runs(points);
-    runs.truncate(MAX_RUNS_PER_SESSION);
-    let (suffix, best, best_run, events) = encode_run_suffix(points, &runs);
+    let mut all_runs = detect_runs(points);
+    all_runs.truncate(MAX_RUNS_PER_SESSION);
+    // `encode_run_suffix` 会丢掉没有任何成绩的碎片跑；后面 `NumberOfRuns`、
+    // 尾部和 243 标记必须统一用过滤后的 `runs`，否则网页版又会出现灰色项。
+    let (suffix, best, best_run, events, runs) = encode_run_suffix(points, &all_runs);
     let (body, n_sensor, n_sys) = encode_records(points, &runs, &events);
 
     // Drag 头部只有「极速」这一个统计字段，其余交给尾部。
@@ -924,7 +979,9 @@ mod tests {
     /// 88 + 128 字节赛道段就会错位，直接回 `Failed to parse session`。
     #[test]
     fn session_header_is_drag() {
-        let pts: Vec<TrackPoint> = (0..10).map(sample).collect();
+        // 用一趟真的 0-100 加速：无成绩的跑现在不会写进跑次表，
+        // 拿恒定速度的样本会连尾部都测不到。
+        let pts = acceleration_points();
         let blob = encode_session(&pts, &meta()).expect("非空");
         let n = DEFAULT_SETPOINTS_KPH.len();
         let hl = header_len();
@@ -946,29 +1003,25 @@ mod tests {
             assert_eq!(u16::from_le_bytes([blob[at], blob[at + 1]]), *from);
             assert_eq!(u16::from_le_bytes([blob[at + 2], blob[at + 3]]), *to);
         }
-        // 成绩：这份样本一直是 36 km/h，跑不进 0-60，所以留 0 / -1
+        // 成绩：0-30 / 0-60 / 0-100 都命中，0-150 没跑到
         let br = 84 + n * 6;
-        for i in 0..n {
-            let v = i32::from_le_bytes([
-                blob[br + i * 4],
-                blob[br + i * 4 + 1],
-                blob[br + i * 4 + 2],
-                blob[br + i * 4 + 3],
-            ]);
-            assert_eq!(v, 0, "BestResults[{i}] 应为 0");
-        }
+        let best: Vec<i32> = (0..n)
+            .map(|i| i32::from_le_bytes(blob[br + i * 4..br + i * 4 + 4].try_into().unwrap()))
+            .collect();
+        assert!(best[0] > 0 && best[1] > 0 && best[2] > 0, "前三档要有成绩: {best:?}");
+        assert_eq!(best[3], 0, "没到 150 km/h");
         let rr = br + n * 4;
         for i in 0..n {
             let v = i16::from_le_bytes([blob[rr + i * 2], blob[rr + i * 2 + 1]]);
-            assert_eq!(v, -1, "BestResultsRuns[{i}] 应为 -1");
+            assert_eq!(v, if i < 3 { 0 } else { -1 }, "BestResultsRuns[{i}]");
         }
 
-        // 全程都在动 = 一趟跑，尾部就是这一趟的结果
+        // 一趟有成绩的跑，尾部就是这一趟的结果
         assert_eq!(u16::from_le_bytes([blob[82], blob[83]]), 1, "跑次应为 1");
         let suffix_len = u16::from_le_bytes([blob[10], blob[11]]) as usize;
         assert_eq!(suffix_len, RUN_SUFFIX_FIXED + n * RUN_SUFFIX_PER_SETPOINT);
         let n_event = u32::from_le_bytes([blob[28], blob[29], blob[30], blob[31]]);
-        assert_eq!(n_event, 0, "不应有事件记录");
+        assert_eq!(n_event, 3, "三个命中的目标点各一条 242");
     }
 
     /// 记录流必须能被逐条走完，且条数与头部声明一致。
@@ -1171,7 +1224,8 @@ mod tests {
         assert_eq!(runs.len(), 1, "应当只有一趟");
         assert_eq!(runs[0].start, 25, "第 25 条开始动");
 
-        let (suffix, best, best_run, events) = encode_run_suffix(&pts, &runs);
+        let (suffix, best, best_run, events, kept) = encode_run_suffix(&pts, &runs);
+        assert_eq!(kept.len(), 1, "有成绩的这一趟要保留");
         assert_eq!(
             suffix.len(),
             RUN_SUFFIX_FIXED + DEFAULT_SETPOINTS_KPH.len() * RUN_SUFFIX_PER_SETPOINT
@@ -1205,6 +1259,73 @@ mod tests {
         for e in &events {
             assert!(e.after >= runs[0].start && e.after <= runs[0].end);
         }
+    }
+
+    /// 网页版把没有 242 成绩事件的跑次画成灰色、点不开：
+    /// `detect_runs` 切出来的几秒碎片必须挡在跑次表之外。
+    #[test]
+    fn runs_without_any_result_are_dropped() {
+        let mut pts = acceleration_points();
+        // 夹一段「动 5 条就停」的碎片：极速 2 km/h，任何目标点都到不了
+        for (count, mmps) in [(20, 0u32), (5, 555), (20, 0)] {
+            for _ in 0..count {
+                let mut p = sample(0);
+                p.speed_mmps = mmps;
+                pts.push(p);
+            }
+        }
+        pts.extend(acceleration_points());
+        // iTOW 连续递增，避免时间戳回绕干扰
+        for (i, p) in pts.iter_mut().enumerate() {
+            p.itow = 500_000_000 + (i as u32) * 40;
+        }
+
+        let all = detect_runs(&pts);
+        assert_eq!(all.len(), 3, "两趟真加速 + 一趟碎片");
+        let (suffix, best, best_run, events, kept) = encode_run_suffix(&pts, &all);
+        assert_eq!(kept.len(), 2, "碎片跑不写进跑次表");
+        assert_eq!(
+            suffix.len(),
+            2 * (RUN_SUFFIX_FIXED + DEFAULT_SETPOINTS_KPH.len() * RUN_SUFFIX_PER_SETPOINT)
+        );
+        assert_eq!(events.len(), 6, "每趟 3 条 242");
+        assert!(best.iter().take(3).all(|v| *v > 0), "前三档要有成绩");
+        assert!(
+            best_run.iter().take(3).all(|r| *r >= 0 && *r < 2),
+            "成绩归属要用过滤后的跑次号: {best_run:?}"
+        );
+        // 留下的每一跑都必须有事件，否则网页里又是灰的
+        for r in &kept {
+            assert!(
+                events.iter().any(|e| e.after >= r.start && e.after <= r.end),
+                "跑次 {r:?} 没有 242 事件"
+            );
+        }
+
+        // 完整会话的 NumberOfRuns / 事件数也要用过滤后的值
+        let blob = encode_session(&pts, &meta()).expect("非空");
+        assert_eq!(u16::from_le_bytes([blob[82], blob[83]]), 2);
+        assert_eq!(u32::from_le_bytes([blob[28], blob[29], blob[30], blob[31]]), 6);
+    }
+
+    /// BLE 数据段从运动中开始时，第一趟前面没有静止采样，
+    /// 也要能算出成绩，否则整趟被当成空跑丢掉。
+    #[test]
+    fn first_segment_starting_in_motion_still_scores() {
+        // 去掉 acceleration_points 开头的 25 条静止，第一条就有速度
+        let pts = acceleration_points()[25..].to_vec();
+        assert!(pts[0].speed_mmps > 0);
+        let runs = detect_runs(&pts);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].start, 0);
+
+        let (_, best, _, events, kept) = encode_run_suffix(&pts, &runs);
+        assert_eq!(kept.len(), 1, "这一趟要保留");
+        assert!(
+            best[0] > 0 && best[1] > 0 && best[2] > 0,
+            "前三档都要有成绩: {best:?}"
+        );
+        assert_eq!(events.len(), 3);
     }
 
     /// 全程静止不能分出一趟，也不能写出非法的跑次。
