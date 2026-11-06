@@ -118,7 +118,8 @@ struct SessionRow {
 enum UpdateMsg {
     Current,
     Downloaded(crate::updater::UpdateInfo, std::path::PathBuf),
-    Failed(String),
+    /// 封装过的失败原因：底层 HTTP 文本只留在 `detail()` 里给日志用。
+    Failed(crate::updater::UpdateError),
 }
 
 /// 弹窗里在填的东西。
@@ -305,8 +306,9 @@ pub struct App {
     update_result: Option<(String, LogLevel)>,
     /// 本次检查是不是启动时自动发起的。
     ///
-    /// 自动检查是「顺手做的」：连不上 GitHub（内网、离线、墙）就当没这回事，
-    /// 一个字都不弹；手动点「检查并更新」才把失败原因摊开给用户看。
+    /// 自动检查是「顺手做的」：连不上 GitHub（内网、离线、限流、墙）就当
+    /// 没这回事，一个字都不弹。手动点「检查并更新」时也只有需要用户处理的
+    /// 失败才显示短句，底层 HTTP 报错永远不进界面。
     update_silent: bool,
     /// 启动时的自动检查跑过了没（只跑一次，别每帧都发请求）。
     auto_update_checked: bool,
@@ -727,12 +729,21 @@ impl App {
                     }
                 }
                 UpdateMsg::Failed(e) => {
-                    if silent {
-                        // 连不上 GitHub 是常事（内网 / 离线 / DNS 抽风），
-                        // 自动检查失败不值得打断用户，日志里留一句就够
-                        log::info!("自动检查更新失败，已忽略: {e}");
+                    // 原始错误（URL、HTTP 状态码、库报错）只写日志，永远不进界面。
+                    // 离线 / DNS / GitHub 限流 / 5xx 这类环境性失败连横幅都不给：
+                    // 用户没做错任何事，弹个红框除了添堵没别的用；顺手把
+                    // 「正在检查…」也收掉，别留一句永远不兑现的话。
+                    log::info!(
+                        "检查更新未成功: {} | 原始错误: {}",
+                        e.user_message(),
+                        e.detail()
+                    );
+                    if e.is_transient() {
+                        self.update_result = None;
+                    } else if silent {
+                        log::info!("自动更新失败，已忽略: {}", e.user_message());
                     } else {
-                        self.update_result = Some((e, LogLevel::Error));
+                        self.update_result = Some((e.user_message().to_string(), LogLevel::Error));
                     }
                 }
             }
@@ -780,10 +791,13 @@ impl App {
                 }
             }
             Err(e) => {
+                // 启动器失败会带脚本路径 / IO 原文，同样只进日志
+                let e = crate::updater::UpdateError::install_failed(e);
+                log::warn!("启动更新安装器失败: {}", e.detail());
                 if self.update_silent {
-                    log::info!("自动更新：启动安装器失败，已忽略: {e}");
+                    log::info!("自动更新失败，已忽略: {}", e.user_message());
                 } else {
-                    self.update_result = Some((e, LogLevel::Error));
+                    self.update_result = Some((e.user_message().to_string(), LogLevel::Error));
                 }
             }
         }
@@ -792,7 +806,8 @@ impl App {
     /// 查一次 GitHub Release，有新版本就下载并装。
     ///
     /// `silent` 是「启动时自动跑的那一次」：不写状态文字、失败也不弹，
-    /// 因为用户并没有要求这件事，联网失败只是常态。
+    /// 因为用户并没有要求这件事，联网失败只是常态。手动点按钮时也只有
+    /// 「需要用户处理」的失败才给一句短提示；连不上 / 限流一律静默收掉。
     fn check_update(&mut self, silent: bool) {
         if self.update_busy {
             return;
@@ -803,7 +818,7 @@ impl App {
             self.update_result = None;
         } else {
             self.update_result = Some((
-                t!("正在检查 GitHub Release…", "Checking GitHub Release…").to_string(),
+                t!("正在检查更新…", "Checking for updates…").to_string(),
                 LogLevel::Info,
             ));
         }
