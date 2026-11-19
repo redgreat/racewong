@@ -142,10 +142,7 @@ enum Dialog {
     /// 一句话提示（比如点上传时才发现没登录）。
     ///
     /// 这类话不常驻在页面上占一行——真走到那一步才弹一次。
-    Notice {
-        title: String,
-        body: String,
-    },
+    Notice { title: String, body: String },
 }
 
 /// 哪一路上传通道的连接参数。
@@ -323,6 +320,12 @@ pub struct App {
     pending_run: Option<RunMode>,
     /// 关于窗口上一次的矩形：判断点击是不是落在窗口外要靠它。
     about_rect: Option<egui::Rect>,
+    /// 最近一次可见主窗口的位置和大小，退出时一次性落盘。
+    last_window_rect: Option<egui::Rect>,
+    /// 启动后的后台动作只触发一次。
+    startup_tasks_started: bool,
+    /// 自动同步下次允许尝试的时间；失败后退避，避免持续扫描蓝牙。
+    next_auto_sync: Instant,
 }
 
 impl App {
@@ -332,6 +335,7 @@ impl App {
         tx: UnboundedSender<UiEvent>,
         rx: UnboundedReceiver<UiEvent>,
         window_handle: isize,
+        start_hidden: bool,
     ) -> Self {
         let (probe_tx, probe_rx) = std::sync::mpsc::channel::<crate::sink::mqtt::MqttSink>();
         let (update_tx, update_rx) = std::sync::mpsc::channel::<UpdateMsg>();
@@ -388,7 +392,7 @@ impl App {
             tray: None,
             tray_error: None,
             quit_requested: false,
-            hidden_to_tray: false,
+            hidden_to_tray: start_hidden,
             window_handle,
             update_tx,
             update_rx,
@@ -400,6 +404,9 @@ impl App {
             dialog: None,
             pending_run: None,
             about_rect: None,
+            last_window_rect: None,
+            startup_tasks_started: false,
+            next_auto_sync: Instant::now(),
         }
     }
 
@@ -431,16 +438,22 @@ impl App {
     }
 
     /// 处理托盘菜单与窗口关闭请求。
-    fn handle_close_and_tray(&mut self, ctx: &egui::Context) {        // 托盘里点了「退出」：标志位在点击时就立好了（窗口藏起来时不一定还有帧，
+    fn handle_close_and_tray(&mut self, ctx: &egui::Context) {
+        // 托盘里点了「退出」：标志位在点击时就立好了（窗口藏起来时不一定还有帧，
         // 队列里的命令可能来不及消费），这里必须先认下来，否则下面会把这次
         // 关闭请求当成「收进托盘」再 CancelClose 一次，窗口就再也关不掉了。
         if crate::tray::quit_requested() {
             self.quit_requested = true;
+            // 先主动 drop 托盘句柄，让 Shell_NotifyIcon 立即收到删除通知。
+            // 只等进程退出时析构，Windows 通知区域会短暂留下一个“幽灵图标”，
+            // 看起来像要再点一次才退出。
+            self.tray = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
         }
 
-        // Windows 在主窗口不可见且没有其它界面动画时，可能不会因为托盘菜单回调里的
-        // request_repaint() 及时进入下一次 update。保持一个很低频的心跳，让隐藏窗口后
-        // “显示主窗口 / 退出”两条命令都一定会被消费；5 Hz 对空闲占用可以忽略。
+        // 隐藏窗口后仍以很低频率消费菜单队列；macOS 的托盘操作依赖这条路径，
+        // Windows 也用它同步内部可见状态。5 Hz 对空闲占用可以忽略。
         if self.tray.is_some() {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
@@ -527,7 +540,7 @@ impl App {
     }
 
     fn push_log(&mut self, level: LogLevel, message: String) {
-        crate::write_ui_log(level_name(level), &message);
+        crate::app_log::ui(level_name(level), &message);
         self.logs.push((level, message));
         if self.logs.len() > 2000 {
             self.logs.drain(..500);
@@ -593,11 +606,7 @@ impl App {
                     }
                 }
                 UiEvent::Log(level, msg) => self.push_log(level, msg),
-                UiEvent::Notice {
-                    target,
-                    level,
-                    msg,
-                } => {
+                UiEvent::Notice { target, level, msg } => {
                     // 连接测试的结果只回写到设置页对应的卡片里，不往首页冒
                     match target {
                         NoticeTarget::Pg => {
@@ -669,7 +678,13 @@ impl App {
                         }
                     }
                 }
-                UiEvent::SessionInfo { index, name, records, ok, detail } => {
+                UiEvent::SessionInfo {
+                    index,
+                    name,
+                    records,
+                    ok,
+                    detail,
+                } => {
                     self.sessions.push(SessionRow {
                         index,
                         name,
@@ -683,9 +698,29 @@ impl App {
                 UiEvent::ReplayDone => {
                     self.replay_busy = false;
                     self.spool_pending = crate::sink::spool::pending_count();
+                    if self.cfg.notifications {
+                        crate::desktop::notify(
+                            t!("缓存重传完成", "Cached uploads finished").to_string(),
+                            if self.spool_pending == 0 {
+                                t!("待上传缓存已全部处理", "All cached uploads were processed")
+                                    .to_string()
+                            } else {
+                                tr!(
+                                    "仍有 {} 个缓存等待重传",
+                                    "{} cached upload(s) still pending",
+                                    self.spool_pending
+                                )
+                            },
+                            self.window_handle,
+                        );
+                    }
                 }
                 UiEvent::RunStats(stats) => self.run_stats = Some(stats),
-                UiEvent::Finished { ok, summary, cancelled } => {
+                UiEvent::Finished {
+                    ok,
+                    summary,
+                    cancelled,
+                } => {
                     self.close_phase();
                     self.running = false;
                     self.cancel_requested = false;
@@ -696,6 +731,17 @@ impl App {
                     } else {
                         Phase::Failed
                     };
+                    if self.cfg.notifications && !cancelled {
+                        crate::desktop::notify(
+                            if ok {
+                                t!("RaceBox 任务完成", "RaceBox task completed").to_string()
+                            } else {
+                                t!("RaceBox 任务失败", "RaceBox task failed").to_string()
+                            },
+                            summary.clone(),
+                            self.window_handle,
+                        );
+                    }
                     self.last_summary = summary;
                     self.erase_percent = None;
                     if !ok {
@@ -715,7 +761,11 @@ impl App {
                     // 自动检查：已经是最新版就别吭声，用户没问这件事
                     if !silent {
                         self.update_result = Some((
-                            tr!("当前已是最新版（{}）", "Already up to date ({})", env!("CARGO_PKG_VERSION")),
+                            tr!(
+                                "当前已是最新版（{}）",
+                                "Already up to date ({})",
+                                env!("CARGO_PKG_VERSION")
+                            ),
                             LogLevel::Success,
                         ));
                     }
@@ -941,7 +991,11 @@ impl App {
         self.channels.clear();
         self.push_log(
             LogLevel::Info,
-            tr!("任务开始: {}", "task started: {}", mode_text(RunMode::Import)),
+            tr!(
+                "任务开始: {}",
+                "task started: {}",
+                mode_text(RunMode::Import)
+            ),
         );
         let cfg = Arc::new(self.cfg.clone());
         let tx = self.tx.clone();
@@ -973,6 +1027,25 @@ impl App {
 
     fn save_config(&mut self) {
         self.commit_edits();
+        let old_auto_start = self.settings_snapshot.auto_start;
+        let startup_changed = self.cfg.auto_start != old_auto_start
+            || (self.cfg.auto_start
+                && self.cfg.startup_delay_secs != self.settings_snapshot.startup_delay_secs);
+        if startup_changed {
+            if let Err(e) =
+                crate::startup::set_enabled(self.cfg.auto_start, self.cfg.startup_delay_secs)
+            {
+                self.action_result = Some((
+                    tr!(
+                        "开机启动设置失败: {}",
+                        "failed to update startup setting: {}",
+                        e
+                    ),
+                    LogLevel::Error,
+                ));
+                return;
+            }
+        }
         match config::save(&self.cfg) {
             Ok(()) => {
                 let msg = t!("配置已保存", "settings saved").to_string();
@@ -983,6 +1056,13 @@ impl App {
                 self.tab = Tab::Sync;
             }
             Err(e) => {
+                // 系统启动项已经改过但配置没保存下来时回滚，保证两边一致。
+                if startup_changed {
+                    let _ = crate::startup::set_enabled(
+                        old_auto_start,
+                        self.settings_snapshot.startup_delay_secs,
+                    );
+                }
                 let msg = tr!("保存失败: {e}", "failed to save: {e}");
                 self.action_result = Some((msg, LogLevel::Error));
             }
@@ -1165,7 +1245,6 @@ impl App {
         });
     }
 
-
     /// 通道状态要不要显示：有通道数据、且任务跑过（或正在跑）才展开。
     fn show_channels(&self) -> bool {
         !self.channels.is_empty() && (self.running || self.phase.is_final())
@@ -1306,7 +1385,9 @@ impl App {
         };
         let ring_text: Option<String> = match ring {
             // 导入任务也只有一圈，但那是上传进度，不是清理进度
-            style::RingMode::Single { progress: Some(f), .. } if import_task => Some(tr!(
+            style::RingMode::Single {
+                progress: Some(f), ..
+            } if import_task => Some(tr!(
                 "上传 {}% · {}/{} 条",
                 "upload {}% · {}/{}",
                 (f * 100.0).round() as u32,
@@ -1333,11 +1414,7 @@ impl App {
                         self.upload_total
                     ))
                 } else {
-                    Some(tr!(
-                        "下载 {}%",
-                        "download {}%",
-                        (f * 100.0).round() as u32
-                    ))
+                    Some(tr!("下载 {}%", "download {}%", (f * 100.0).round() as u32))
                 }
             }
             style::RingMode::Dual { download: None, .. } if self.upload_total > 0 => Some(tr!(
@@ -1622,7 +1699,10 @@ impl App {
                 };
                 // 汇总统计只在完整同步时展示
                 if is_sync_task
-                    && (stats.is_some() || downloading || self.uploaded > 0 || erase_percent.is_some())
+                    && (stats.is_some()
+                        || downloading
+                        || self.uploaded > 0
+                        || erase_percent.is_some())
                 {
                     ui.add_space(12.0);
                     // 导入没有「下载」和「清理内存」这两格：数据是本地读的，设备也没动过
@@ -1650,7 +1730,11 @@ impl App {
                             tr!("{} 条", "{} rec", synced),
                             p.success,
                         ));
-                        cells.push((t!("清理内存", "Erased"), erase_text.to_string(), erase_color));
+                        cells.push((
+                            t!("清理内存", "Erased"),
+                            erase_text.to_string(),
+                            erase_color,
+                        ));
                     }
                     cells.push((t!("上传速度", "Upload speed"), speed_text, p.text));
                     cells.push((
@@ -1669,10 +1753,7 @@ impl App {
                                 ui.vertical(|ui| {
                                     ui.colored_label(p.muted, label);
                                     ui.label(
-                                        egui::RichText::new(value)
-                                            .strong()
-                                            .size(16.0)
-                                            .color(color),
+                                        egui::RichText::new(value).strong().size(16.0).color(color),
                                     );
                                 });
                             }
@@ -1692,12 +1773,7 @@ impl App {
                 if self.running && downloading {
                     ui.add_space(8.0);
                     let mut text = if total > 0 {
-                        tr!(
-                            "已下载 {} / {} 条",
-                            "downloaded {} / {}",
-                            parsed,
-                            total
-                        )
+                        tr!("已下载 {} / {} 条", "downloaded {} / {}", parsed, total)
                     } else {
                         tr!("已下载 {} 条", "downloaded {}", parsed)
                     };
@@ -1729,11 +1805,7 @@ impl App {
                             }
                             ui.colored_label(p.muted, name.text());
                             ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new(fmt_dur(*d))
-                                    .strong()
-                                    .color(p.text),
-                            );
+                            ui.label(egui::RichText::new(fmt_dur(*d)).strong().color(p.text));
                         }
                     });
                 }
@@ -1748,7 +1820,8 @@ impl App {
                         t!("否", "no")
                     };
                     let mem_text = format!("{}%", s.memory_level);
-                    let stored_text = tr!("{}/{} 条", "{}/{} rec", s.stored_messages, s.max_messages);
+                    let stored_text =
+                        tr!("{}/{} 条", "{}/{} rec", s.stored_messages, s.max_messages);
                     let lock_text = if s.security_enabled {
                         t!("已启用", "enabled")
                     } else {
@@ -1874,6 +1947,26 @@ impl App {
         });
         if let Some(ctx) = self.ctx.clone() {
             ctx.request_repaint();
+        }
+    }
+
+    fn run_background_tasks(&mut self) {
+        if !self.startup_tasks_started {
+            self.startup_tasks_started = true;
+            self.spool_pending = crate::sink::spool::pending_count();
+            if self.cfg.auto_replay && self.spool_pending > 0 {
+                self.retry_spool();
+            }
+        }
+        if self.cfg.auto_sync
+            && !self.running
+            && !self.replay_busy
+            && Instant::now() >= self.next_auto_sync
+            && self.channel_ready()
+        {
+            // 一次尝试后至少退避 5 分钟；设备不在附近时不能连续扫描。
+            self.next_auto_sync = Instant::now() + Duration::from_secs(5 * 60);
+            self.start(RunMode::Sync);
         }
     }
 
@@ -2105,8 +2198,8 @@ impl App {
                                 p,
                                 "cloud_login_cred",
                                 t!(
-                                    "凭据只保存在本机的应用数据目录（cloud.json），不进 config.json。",
-                                    "Credentials stay in the app data folder on this machine (cloud.json); they are not written into config.json."
+                                    "凭据保存在系统安全凭据库，不写入 config.json。",
+                                    "Credentials are stored in the system secure store, not config.json."
                                 ),
                             );
                             ui.add_space(6.0);
@@ -2518,6 +2611,106 @@ impl App {
                     ),
                 );
             }
+            ui.add_space(14.0);
+            ui.separator();
+            ui.add_space(12.0);
+            let startup_supported = crate::startup::supported();
+            ui.add_enabled_ui(startup_supported, |ui| {
+                style::toggle_row(
+                    ui,
+                    p,
+                    t!("开机自动启动", "Start automatically at login"),
+                    &mut self.cfg.auto_start,
+                );
+            });
+            ui.add_space(4.0);
+            ui.colored_label(
+                p.muted,
+                if startup_supported {
+                    t!(
+                        "开机后仅显示托盘图标，不打开主页面",
+                        "Starts in the tray without opening the main window"
+                    )
+                } else {
+                    t!(
+                        "当前平台暂不支持开机后台启动",
+                        "Background startup is not supported on this platform"
+                    )
+                },
+            );
+            if self.cfg.auto_start && startup_supported {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.colored_label(p.muted, t!("开机启动延迟", "Startup delay"));
+                    ui.add(
+                        egui::DragValue::new(&mut self.cfg.startup_delay_secs)
+                            .range(0..=120)
+                            .suffix(t!(" 秒", " s")),
+                    );
+                });
+            }
+            ui.add_space(12.0);
+            style::toggle_row(
+                ui,
+                p,
+                t!("系统通知", "System notifications"),
+                &mut self.cfg.notifications,
+            );
+            ui.add_space(4.0);
+            ui.colored_label(
+                p.muted,
+                t!(
+                    "同步完成、失败或缓存重传结束后发送通知",
+                    "Notify when sync, failure, or cached replay finishes"
+                ),
+            );
+            ui.add_space(12.0);
+            style::toggle_row(
+                ui,
+                p,
+                t!("启动后自动重传缓存", "Replay cached uploads after startup"),
+                &mut self.cfg.auto_replay,
+            );
+            ui.add_space(12.0);
+            style::toggle_row(
+                ui,
+                p,
+                t!("自动同步附近设备", "Automatically sync nearby device"),
+                &mut self.cfg.auto_sync,
+            );
+            ui.add_space(4.0);
+            ui.colored_label(
+                p.warn,
+                t!(
+                    "空闲时每 5 分钟尝试一次；仍遵守“全部上传成功后才擦除”",
+                    "Tries every 5 minutes while idle; erase still requires every upload to succeed"
+                ),
+            );
+            ui.add_space(12.0);
+            style::toggle_row(
+                ui,
+                p,
+                t!("记住窗口位置和大小", "Remember window position and size"),
+                &mut self.cfg.remember_window,
+            );
+            ui.add_space(12.0);
+            if ui
+                .add(style::secondary_button(p, t!("导出诊断包", "Export diagnostics")))
+                .clicked()
+            {
+                match crate::desktop::export_diagnostics(&self.cfg) {
+                    Ok(path) => {
+                        self.action_result = Some((
+                            tr!("诊断包已导出: {}", "diagnostics exported: {}", path.display()),
+                            LogLevel::Success,
+                        ));
+                    }
+                    Err(e) if e != "已取消" => {
+                        self.action_result = Some((e, LogLevel::Error));
+                    }
+                    Err(_) => {}
+                }
+            }
         });
 
         ui.add_space(10.0);
@@ -2609,10 +2802,7 @@ impl App {
                     .color(p.text),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(style::small_button(p, t!("收起", "Hide")))
-                    .clicked()
-                {
+                if ui.add(style::small_button(p, t!("收起", "Hide"))).clicked() {
                     self.show_logs = false;
                 }
                 ui.add_space(6.0);
@@ -2706,6 +2896,11 @@ fn mode_text(mode: RunMode) -> &'static str {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+            if rect.width() >= 760.0 && rect.height() >= 560.0 {
+                self.last_window_rect = Some(rect);
+            }
+        }
         if self.ctx.is_none() {
             self.ctx = Some(ctx.clone());
             // 启动时 main.rs 已经 apply 过一次，但那时还没进入真正的帧循环，
@@ -2730,6 +2925,7 @@ impl eframe::App for App {
         self.drain_events(ctx);
         // 云的后台任务（登录、文件导入）不管在哪个页面都要按时收结果
         self.cloud.poll();
+        self.run_background_tasks();
 
         let p = self.palette();
 
@@ -2753,7 +2949,8 @@ impl eframe::App for App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if style::info_button(ui, &p)
                             .on_hover_text(t!("关于", "About"))
-                            .clicked() {
+                            .clicked()
+                        {
                             self.about_open = true;
                         }
                         if self.tab != Tab::Settings {
@@ -2838,15 +3035,13 @@ impl eframe::App for App {
                             tr!("待重传 {}", "{} pending", self.spool_pending)
                         };
                         let pending = ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(pending_text)
-                                    .size(12.0)
-                                    .color(if self.spool_pending > 0 {
-                                        p.warn
-                                    } else {
-                                        p.muted
-                                    }),
-                            )
+                            egui::Label::new(egui::RichText::new(pending_text).size(12.0).color(
+                                if self.spool_pending > 0 {
+                                    p.warn
+                                } else {
+                                    p.muted
+                                },
+                            ))
                             .sense(egui::Sense::click()),
                         );
                         if self.spool_pending > 0 {
@@ -2920,77 +3115,72 @@ impl eframe::App for App {
                 .default_open(true)
                 .frame(style::window(&p));
             let mut open = true;
-            let resp = win
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.set_width(300.0);
-                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                    ui.vertical_centered(|ui| {
-                        // 应用图标
-                        if let Some(tex) = &self.about_icon {
-                            ui.add(egui::Image::new((
-                                tex.id(),
-                                egui::vec2(52.0, 52.0),
-                            )));
-                        } else {
-                            ui.add(egui::Label::new(
-                                egui::RichText::new("RaceBox").strong().size(20.0),
-                            ));
-                        }
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new(t!("RaceBox同步", "RaceBox Sync"))
-                                .strong()
-                                .size(18.0)
-                                .color(p.text),
-                        );
-                        ui.add_space(4.0);
-                        // 版本号 + 「检查并更新」：更新入口只留在这里，
-                        // 设置页那张卡已经去掉（每次启动都会自动查一次，不用摆个按钮占地方）
-                        ui.label(
-                            egui::RichText::new(tr!(
-                                "版本 {}",
-                                "version {}",
-                                env!("CARGO_PKG_VERSION")
-                            ))
-                            .size(12.5)
-                            .color(p.muted),
-                        );
-                        ui.add_space(8.0);
-                        let busy = self.update_busy;
-                        let check_btn = ui.add_enabled(
-                            !busy,
-                            style::secondary_button(&p, t!("检查并更新", "Check and update")),
-                        );
-                        if check_btn
-                            .on_hover_text(t!(
-                                "点这里检查 GitHub Release 上的新版本",
-                                "click to check GitHub Releases for a newer version"
-                            ))
-                            .clicked()
-                        {
-                            self.check_update(false);
-                        }
-                        if busy {
-                            ui.add_space(6.0);
-                            ui.spinner();
-                        }
-                    });
-                    if let Some((text, level)) = &self.update_result {
-                        style::status_banner(ui, &p, level_color(&p, *level), text);
-                        ui.add_space(8.0);
+            let resp = win.open(&mut open).show(ctx, |ui| {
+                ui.set_width(300.0);
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                ui.vertical_centered(|ui| {
+                    // 应用图标
+                    if let Some(tex) = &self.about_icon {
+                        ui.add(egui::Image::new((tex.id(), egui::vec2(52.0, 52.0))));
+                    } else {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new("RaceBox").strong().size(20.0),
+                        ));
                     }
-                    ui.add_space(6.0);
-                    about_row(ui, &p, t!("作者", "Author"), "wangcw");
-                    about_row(ui, &p, t!("邮箱", "Email"), "rubygreat@msn.com");
-                    about_row(
-                        ui,
-                        &p,
-                        t!("协议", "Protocol"),
-                        "ublox BLE · PostgreSQL / MQTT (RBX2)",
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(t!("RaceBox同步", "RaceBox Sync"))
+                            .strong()
+                            .size(18.0)
+                            .color(p.text),
                     );
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
+                    // 版本号 + 「检查并更新」：更新入口只留在这里，
+                    // 设置页那张卡已经去掉（每次启动都会自动查一次，不用摆个按钮占地方）
+                    ui.label(
+                        egui::RichText::new(tr!(
+                            "版本 {}",
+                            "version {}",
+                            env!("CARGO_PKG_VERSION")
+                        ))
+                        .size(12.5)
+                        .color(p.muted),
+                    );
+                    ui.add_space(8.0);
+                    let busy = self.update_busy;
+                    let check_btn = ui.add_enabled(
+                        !busy,
+                        style::secondary_button(&p, t!("检查并更新", "Check and update")),
+                    );
+                    if check_btn
+                        .on_hover_text(t!(
+                            "点这里检查 GitHub Release 上的新版本",
+                            "click to check GitHub Releases for a newer version"
+                        ))
+                        .clicked()
+                    {
+                        self.check_update(false);
+                    }
+                    if busy {
+                        ui.add_space(6.0);
+                        ui.spinner();
+                    }
                 });
+                if let Some((text, level)) = &self.update_result {
+                    style::status_banner(ui, &p, level_color(&p, *level), text);
+                    ui.add_space(8.0);
+                }
+                ui.add_space(6.0);
+                about_row(ui, &p, t!("作者", "Author"), "wangcw");
+                about_row(ui, &p, t!("邮箱", "Email"), "rubygreat@msn.com");
+                about_row(
+                    ui,
+                    &p,
+                    t!("协议", "Protocol"),
+                    "ublox BLE · PostgreSQL / MQTT (RBX2)",
+                );
+                ui.add_space(6.0);
+            });
             self.about_rect = resp.and_then(|r| Some(r.response.rect));
             if !open {
                 self.about_open = false;
@@ -3032,7 +3222,10 @@ impl eframe::App for App {
                     ui.add_space(14.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .add(style::primary_button(&p, t!("保存并退出", "Save and close")))
+                            .add(style::primary_button(
+                                &p,
+                                t!("保存并退出", "Save and close"),
+                            ))
                             .clicked()
                         {
                             self.save_config();
@@ -3041,7 +3234,10 @@ impl eframe::App for App {
                             self.tab = Tab::Sync;
                         }
                         if ui
-                            .add(style::secondary_button(&p, t!("不保存退出", "Close without saving")))
+                            .add(style::secondary_button(
+                                &p,
+                                t!("不保存退出", "Close without saving"),
+                            ))
                             .clicked()
                         {
                             self.discard_edits();
@@ -3073,6 +3269,20 @@ impl eframe::App for App {
         }
         self.show_dialog(ctx, &p);
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 先移除通知区域图标，再结束其它资源，避免 Explorer 留幽灵图标。
+        self.tray = None;
+        if self.cfg.remember_window {
+            if let Some(rect) = self.last_window_rect {
+                self.cfg.window_x = Some(rect.min.x);
+                self.cfg.window_y = Some(rect.min.y);
+                self.cfg.window_width = Some(rect.width());
+                self.cfg.window_height = Some(rect.height());
+            }
+        }
+        let _ = config::save(&self.cfg);
+    }
 }
 
 /// 关于弹窗里的“标签: 值”信息行。
@@ -3084,7 +3294,8 @@ fn about_row(ui: &mut egui::Ui, p: &Palette, key: &str, value: &str) {
         if value.contains('@') {
             // 邮箱可选中复制
             ui.add(
-                egui::Label::new(egui::RichText::new(value.to_owned()).color(p.info)).selectable(true),
+                egui::Label::new(egui::RichText::new(value.to_owned()).color(p.info))
+                    .selectable(true),
             );
         } else {
             ui.label(value);

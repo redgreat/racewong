@@ -40,6 +40,24 @@ pub fn quit_requested() -> bool {
     QUIT_REQUESTED.load(Ordering::SeqCst)
 }
 
+/// 从系统通知等非 UI 线程唤回主窗口。
+#[cfg(target_os = "windows")]
+pub fn show_window(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        if win32::IsWindow(hwnd) == 0 {
+            return;
+        }
+        if win32::IsIconic(hwnd) != 0 {
+            win32::ShowWindow(hwnd, win32::SW_RESTORE);
+        }
+        win32::ShowWindow(hwnd, win32::SW_SHOW);
+        win32::SetForegroundWindow(hwnd);
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod win32 {
     #[link(name = "user32")]
@@ -59,15 +77,15 @@ mod win32 {
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod platform {
     use super::TrayCommand;
+    #[cfg(target_os = "windows")]
+    use super::QUIT_REQUESTED;
     use crate::{t, tr};
     use std::collections::VecDeque;
+    #[cfg(target_os = "windows")]
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use tray_icon::menu::{Menu, MenuItem};
     use tray_icon::{TrayIcon, TrayIconBuilder};
-    #[cfg(target_os = "windows")]
-    use super::QUIT_REQUESTED;
-    #[cfg(target_os = "windows")]
-    use std::sync::atomic::Ordering;
 
     pub struct Tray {
         // 必须一直持有：句柄一 drop，托盘图标就消失了
@@ -86,8 +104,10 @@ mod platform {
             let menu = Menu::new();
             let show = MenuItem::new(t!("显示主窗口", "Show window"), true, None);
             let quit = MenuItem::new(t!("退出", "Quit"), true, None);
-            menu.append(&show).map_err(|e| tr!("托盘菜单创建失败: {e}", "failed to create tray menu: {e}"))?;
-            menu.append(&quit).map_err(|e| tr!("托盘菜单创建失败: {e}", "failed to create tray menu: {e}"))?;
+            menu.append(&show)
+                .map_err(|e| tr!("托盘菜单创建失败: {e}", "failed to create tray menu: {e}"))?;
+            menu.append(&quit)
+                .map_err(|e| tr!("托盘菜单创建失败: {e}", "failed to create tray menu: {e}"))?;
 
             let show_id = show.id().clone();
             let quit_id = quit.id().clone();
@@ -147,10 +167,7 @@ mod platform {
                 .build()
                 .map_err(|e| tr!("托盘图标创建失败: {e}", "failed to create tray icon: {e}"))?;
 
-            Ok(Self {
-                _icon: icon,
-                queue,
-            })
+            Ok(Self { _icon: icon, queue })
         }
 
         /// 取出待处理的菜单命令（非阻塞，先进先出）。
@@ -200,7 +217,8 @@ mod platform {
         let img = eframe::icon_data::from_png_bytes(bytes)
             .map_err(|e| tr!("托盘图标解码失败: {e}", "failed to decode tray icon: {e}"))?;
         let (rgba, w, h) = resize(&img.rgba, img.width, img.height, 32);
-        tray_icon::Icon::from_rgba(rgba, w, h).map_err(|e| tr!("托盘图标无效: {e}", "invalid tray icon: {e}"))
+        tray_icon::Icon::from_rgba(rgba, w, h)
+            .map_err(|e| tr!("托盘图标无效: {e}", "invalid tray icon: {e}"))
     }
 
     /// 面积平均缩小（按 alpha 预乘再还原，避免透明边缘发黑）。

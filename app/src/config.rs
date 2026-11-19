@@ -36,7 +36,9 @@ impl Default for PgConfig {
 
 impl PgConfig {
     pub fn ready(&self) -> bool {
-        !self.host.trim().is_empty() && !self.database.trim().is_empty() && !self.user.trim().is_empty()
+        !self.host.trim().is_empty()
+            && !self.database.trim().is_empty()
+            && !self.user.trim().is_empty()
     }
 
     /// 端口没填（0）时用 PostgreSQL 的默认端口。
@@ -216,7 +218,10 @@ impl CloseAction {
             // macOS 上常驻的位置是菜单栏，不叫“托盘”
             CloseAction::Tray => {
                 if cfg!(target_os = "macos") {
-                    t!("隐藏到菜单栏，后台继续运行", "Hide to menu bar and keep running")
+                    t!(
+                        "隐藏到菜单栏，后台继续运行",
+                        "Hide to menu bar and keep running"
+                    )
                 } else {
                     t!("隐藏到托盘，后台继续运行", "Hide to tray and keep running")
                 }
@@ -236,6 +241,32 @@ pub struct Config {
     /// 点关闭按钮时的行为（老配置里没有这一项，默认直接退出）。
     #[serde(default)]
     pub close_action: CloseAction,
+    /// 登录系统后自动启动，并只显示托盘图标。
+    #[serde(default)]
+    pub auto_start: bool,
+    /// 开机启动前等待，避免刚登录时和系统蓝牙、网络初始化争抢。
+    #[serde(default = "default_startup_delay")]
+    pub startup_delay_secs: u32,
+    /// 后台空闲时自动尝试连接记住的设备并同步。
+    #[serde(default)]
+    pub auto_sync: bool,
+    /// 启动后自动重传落盘缓存。
+    #[serde(default = "default_true")]
+    pub auto_replay: bool,
+    /// 任务完成或失败时发系统通知。
+    #[serde(default = "default_true")]
+    pub notifications: bool,
+    /// 记住主窗口位置和大小。
+    #[serde(default = "default_true")]
+    pub remember_window: bool,
+    #[serde(default)]
+    pub window_x: Option<f32>,
+    #[serde(default)]
+    pub window_y: Option<f32>,
+    #[serde(default)]
+    pub window_width: Option<f32>,
+    #[serde(default)]
+    pub window_height: Option<f32>,
     #[serde(default)]
     pub theme: Theme,
     /// 界面语言（老配置里没有这一项，默认中文）。
@@ -255,6 +286,14 @@ fn default_scan_timeout() -> u32 {
     45
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_startup_delay() -> u32 {
+    15
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -263,6 +302,16 @@ impl Default for Config {
             sink_mode: SinkMode::default(),
             cloud: CloudConfig::default(),
             close_action: CloseAction::default(),
+            auto_start: false,
+            startup_delay_secs: default_startup_delay(),
+            auto_sync: false,
+            auto_replay: true,
+            notifications: true,
+            remember_window: true,
+            window_x: None,
+            window_y: None,
+            window_width: None,
+            window_height: None,
             theme: Theme::default(),
             lang: Lang::default(),
             auto_erase: true,
@@ -375,7 +424,7 @@ pub fn log_path() -> PathBuf {
 
 pub fn load() -> Config {
     let path = config_path();
-    let cfg = match std::fs::read_to_string(&path) {
+    let mut cfg = match std::fs::read_to_string(&path) {
         // UTF-8 BOM 会让 serde_json 直接报 "expected value at line 1 column 1"，
         // 然后整份配置被丢掉换成默认值。Windows 上的编辑器/PowerShell 很容易写出
         // 带 BOM 的 JSON，所以读进来先剥掉。
@@ -388,6 +437,11 @@ pub fn load() -> Config {
         },
         Err(_) => Config::default(),
     };
+    // 老版本把 PG/MQTT 密码写在 JSON；先迁进系统凭据库，再重写一份脱敏配置。
+    if crate::credentials::migrate_plaintext(&cfg) {
+        let _ = save(&cfg);
+    }
+    crate::credentials::load_config(&mut cfg);
     // 语言是全局状态，读配置的地方就是唯一入口，在这里同步最省事
     // （否则每个调用点都得记着自己 set 一次）
     crate::i18n::set(cfg.lang);
@@ -396,8 +450,9 @@ pub fn load() -> Config {
 
 pub fn save(cfg: &Config) -> std::io::Result<()> {
     let path = config_path();
-    let text = serde_json::to_string_pretty(cfg).unwrap_or_else(|_| "{}".to_string());
-    std::fs::write(&path, text)
+    let disk = crate::credentials::config_for_disk(cfg).map_err(std::io::Error::other)?;
+    let text = serde_json::to_string_pretty(&disk).unwrap_or_else(|_| "{}".to_string());
+    atomic_write(&path, text.as_bytes())
 }
 
 /// 只把云上传那一段写回 `config.json`。
@@ -424,7 +479,38 @@ pub fn save_cloud(cloud: &CloudConfig) -> std::io::Result<()> {
         );
     }
     let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string());
-    std::fs::write(&path, text)
+    atomic_write(&path, text.as_bytes())
+}
+
+/// 同目录临时文件写完再替换，避免断电或进程崩溃留下半截 JSON。
+fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, data)?;
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+        }
+        const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+        let from: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let ok = unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -445,7 +531,8 @@ mod tests {
         // 不剥掉的话整份配置会被当成解析失败、静默退回默认值。
         let body = serde_json::to_string(&Config::default()).unwrap();
         let with_bom = format!("\u{feff}{body}");
-        let parsed = serde_json::from_str::<Config>(with_bom.trim_start_matches('\u{feff}')).unwrap();
+        let parsed =
+            serde_json::from_str::<Config>(with_bom.trim_start_matches('\u{feff}')).unwrap();
         assert_eq!(parsed.lang, Config::default().lang);
         // 反过来确认：不剥 BOM 确实会失败，这个测试才有意义
         assert!(serde_json::from_str::<Config>(&with_bom).is_err());
@@ -463,6 +550,12 @@ mod tests {
             SinkMode::Mqtt
         );
     }
+
+    #[test]
+    fn old_config_without_auto_start_still_loads() {
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        value.as_object_mut().unwrap().remove("auto_start");
+        let parsed: Config = serde_json::from_value(value).unwrap();
+        assert!(!parsed.auto_start);
+    }
 }
-
-

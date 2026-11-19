@@ -171,7 +171,10 @@ impl CloudClient {
 
         // auth 既可能出现在响应体里，也可能只在 Set-Cookie 里，两处都收。
         let from_cookie = extract_auth_cookie(resp.headers());
-        let text = resp.text().await.map_err(|e| format!("读取响应失败: {e}"))?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("读取响应失败: {e}"))?;
         let env: LoginEnvelope =
             serde_json::from_str(&text).map_err(|e| format!("响应不是合法 JSON: {e}"))?;
         if env.error_code != 0 {
@@ -206,7 +209,7 @@ impl CloudClient {
     /// 不传也能成功，但保持和 App 一致更稳妥。
     pub async fn upload_session(
         &self,
-        bytes: &[u8],
+        bytes: Vec<u8>,
         if_unmodified_since: &str,
     ) -> Result<UploadedSession, CloudError> {
         let cookie = self
@@ -218,7 +221,9 @@ impl CloudClient {
             .header("Cookie", cookie)
             .header("Content-Type", "application/octet-stream")
             .header("If-Unmodified-Since", if_unmodified_since)
-            .body(bytes.to_vec())
+            // reqwest 接管这块 Vec，不再从切片复制整段会话；大轨迹上传时
+            // 峰值内存能少一份文件大小。
+            .body(bytes)
             .send()
             .await
             .map_err(|e| CloudError::transient(format!("网络错误: {e}")))?;
@@ -229,7 +234,10 @@ impl CloudClient {
             .await
             .map_err(|e| CloudError::transient(format!("读取响应失败: {e}")))?;
         let env: UploadEnvelope = serde_json::from_str(&text).map_err(|_| {
-            CloudError::from_status(status, format!("HTTP {status}，响应: {}", truncate(&text, 200)))
+            CloudError::from_status(
+                status,
+                format!("HTTP {status}，响应: {}", truncate(&text, 200)),
+            )
         })?;
         if env.error_code != 0 {
             return Err(CloudError::from_status(
@@ -244,8 +252,7 @@ impl CloudClient {
         env.session
             .ok_or_else(|| CloudError::permanent("响应里没有 session"))
     }
-
-    }
+}
 
 /// 从 `Set-Cookie` 里取出 auth 值。
 fn extract_auth_cookie(headers: &reqwest::header::HeaderMap) -> Option<String> {

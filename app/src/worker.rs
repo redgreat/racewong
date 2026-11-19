@@ -1,6 +1,8 @@
 use crate::ble;
 use crate::config::Config;
-use crate::protocol::{self, DeviceStatus, FrameReader, Record, CMD_DOWNLOAD, CMD_ERASE, CMD_STATUS};
+use crate::protocol::{
+    self, DeviceStatus, FrameReader, Record, CMD_DOWNLOAD, CMD_ERASE, CMD_STATUS,
+};
 use crate::sink::mqtt::MqttSink;
 use crate::sink::pg::PgSink;
 use crate::sink::racebox::RaceBoxSink;
@@ -8,8 +10,8 @@ use crate::sink::{spool, DataSink, Session};
 use crate::{t, tr};
 use btleplug::api::Characteristic;
 use btleplug::platform::Peripheral;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -105,8 +107,14 @@ pub enum UiEvent {
         level: LogLevel,
         msg: String,
     },
-    DeviceFound { name: String, address: String },
-    RememberDevice { address: String, name: String },
+    DeviceFound {
+        name: String,
+        address: String,
+    },
+    RememberDevice {
+        address: String,
+        name: String,
+    },
     Status(DeviceStatus),
     /// 下载进度：`received`/`total` 是设备返回的消息数，`parsed` 是其中有效定位记录数。
     DownloadProgress {
@@ -114,11 +122,20 @@ pub enum UiEvent {
         total: usize,
         parsed: usize,
     },
-    SessionInfo { index: u32, name: String, records: usize, ok: bool, detail: String },
+    SessionInfo {
+        index: u32,
+        name: String,
+        records: usize,
+        ok: bool,
+        detail: String,
+    },
     EraseProgress(u8),
     SpoolPending(usize),
     /// 上传进度（外圈环用）：已上传记录数 / 计划总数。
-    UploadProgress { uploaded: usize, total: usize },
+    UploadProgress {
+        uploaded: usize,
+        total: usize,
+    },
     /// 本次任务要跑哪几路上传通道：`ChannelProgress` 按路名更新进度。
     ///
     /// 每次同步开始都会先发一次，界面用它把上一次的通道残留清掉——
@@ -393,7 +410,11 @@ fn spawn_flush(
                 Ok(path) => {
                     let _ = tx.send(UiEvent::Log(
                         LogLevel::Warn,
-                        tr!("已写入本地缓存: {}", "saved to local cache: {}", path.display()),
+                        tr!(
+                            "已写入本地缓存: {}",
+                            "saved to local cache: {}",
+                            path.display()
+                        ),
                     ));
                     detail.push_str(t!("，已转本地缓存", ", saved to local cache"));
                 }
@@ -462,7 +483,10 @@ async fn preflight(
         Ok(Ok(detail)) => {
             let _ = tx.send(UiEvent::Log(
                 LogLevel::Success,
-                tr!("PostgreSQL 可用（{detail}）", "PostgreSQL is ready ({detail})"),
+                tr!(
+                    "PostgreSQL 可用（{detail}）",
+                    "PostgreSQL is ready ({detail})"
+                ),
             ));
             Ok(())
         }
@@ -547,7 +571,13 @@ async fn query_status(
     let mut stream = ble::notification_stream(peripheral)
         .await
         .ok()
-        .ok_or_else(|| t!("设备通知通道打开失败", "failed to open device notification channel").to_string())?;
+        .ok_or_else(|| {
+            t!(
+                "设备通知通道打开失败",
+                "failed to open device notification channel"
+            )
+            .to_string()
+        })?;
     ble::write_command(peripheral, rx_char, &CMD_STATUS)
         .await
         .ok()
@@ -589,7 +619,8 @@ async fn query_status(
                 protocol::MSG_NACK => {
                     let _ = tx.send(UiEvent::Log(
                         LogLevel::Warn,
-                        t!("设备不支持状态查询", "device does not support status query").to_string(),
+                        t!("设备不支持状态查询", "device does not support status query")
+                            .to_string(),
                     ));
                     return Ok(None);
                 }
@@ -641,7 +672,10 @@ async fn erase_memory(
                     }
                 }
                 protocol::MSG_ACK => {
-                    if packet.payload.starts_with(&[0xFF, protocol::MSG_ERASE_PROGRESS]) {
+                    if packet
+                        .payload
+                        .starts_with(&[0xFF, protocol::MSG_ERASE_PROGRESS])
+                    {
                         let _ = tx.send(UiEvent::Log(
                             LogLevel::Success,
                             t!("设备内存清除完成", "device memory erased").to_string(),
@@ -740,7 +774,10 @@ async fn download_and_upload(
     let _ = tx.send(UiEvent::Phase(Phase::Downloading));
     let _ = tx.send(UiEvent::Log(
         LogLevel::Info,
-        tr!("正在从设备 {device} 下载数据...", "downloading from device {device}..."),
+        tr!(
+            "正在从设备 {device} 下载数据...",
+            "downloading from device {device}..."
+        ),
     ));
 
     let sync_id = *uuid::Uuid::new_v4().as_bytes();
@@ -827,7 +864,11 @@ async fn download_and_upload(
                     if received_total % 50 == 0 {
                         let _ = tx.send(UiEvent::DownloadProgress {
                             received: received_total,
-                            total: if total_upper > 0 { total_upper } else { received_total },
+                            total: if total_upper > 0 {
+                                total_upper
+                            } else {
+                                received_total
+                            },
                             parsed: parsed_total,
                         });
                     }
@@ -863,7 +904,10 @@ async fn download_and_upload(
                     session_started = Instant::now();
                 }
                 protocol::MSG_ACK => {
-                    if packet.payload.starts_with(&[0xFF, protocol::MSG_DOWNLOAD_START]) {
+                    if packet
+                        .payload
+                        .starts_with(&[0xFF, protocol::MSG_DOWNLOAD_START])
+                    {
                         download_done = true;
                     }
                 }
@@ -887,7 +931,7 @@ async fn download_and_upload(
         sync_total_upper: total_upper,
         sync_received_total: received_total,
         sync_final: true,
-                display: None,
+        display: None,
     };
     records_total += flush.records.len();
     let _ = tx.send(UiEvent::Phase(Phase::Uploading));
@@ -904,7 +948,11 @@ async fn download_and_upload(
 
     let _ = tx.send(UiEvent::DownloadProgress {
         received: received_total,
-        total: if total_upper > 0 { total_upper } else { received_total },
+        total: if total_upper > 0 {
+            total_upper
+        } else {
+            received_total
+        },
         parsed: parsed_total,
     });
     // 等所有后台上传任务收尾（取消时已经提前 return，走不到这里）
@@ -1063,7 +1111,14 @@ async fn run_inner(
             }
             RunMode::Sync => {
                 let result = download_and_upload(
-                    cfg, &sinks, &device_name, &peripheral, &rx_char, &tx_char, tx, &cancel_arc,
+                    cfg,
+                    &sinks,
+                    &device_name,
+                    &peripheral,
+                    &rx_char,
+                    &tx_char,
+                    tx,
+                    &cancel_arc,
                 )
                 .await?;
                 let summary = tr!(
@@ -1080,11 +1135,7 @@ async fn run_inner(
                     match erase_memory(&peripheral, &rx_char, &tx_char, tx, cancel).await {
                         Ok(()) => {
                             erased = Some(true);
-                            tr!(
-                                "{}，设备内存已清理",
-                                "{}, device memory erased",
-                                summary
-                            )
+                            tr!("{}，设备内存已清理", "{}, device memory erased", summary)
                         }
                         Err(e) => {
                             erased = Some(false);
@@ -1143,7 +1194,11 @@ pub async fn run_import(
     match result {
         Ok(summary) => {
             let _ = tx.send(UiEvent::Log(LogLevel::Success, summary.clone()));
-            let _ = tx.send(UiEvent::Finished { ok: true, summary, cancelled: false });
+            let _ = tx.send(UiEvent::Finished {
+                ok: true,
+                summary,
+                cancelled: false,
+            });
         }
         Err(e) if e == CANCELLED => {
             let _ = tx.send(UiEvent::Log(
@@ -1158,7 +1213,11 @@ pub async fn run_import(
         }
         Err(e) => {
             let _ = tx.send(UiEvent::Log(LogLevel::Error, e.clone()));
-            let _ = tx.send(UiEvent::Finished { ok: false, summary: e, cancelled: false });
+            let _ = tx.send(UiEvent::Finished {
+                ok: false,
+                summary: e,
+                cancelled: false,
+            });
         }
     }
 }
@@ -1172,17 +1231,26 @@ async fn import_inner(
     if paths.is_empty() {
         return Err(t!("还没有勾选任何文件", "no file selected").to_string());
     }
-    // ---------- 先解析 ----------
-    // 总条数要提前知道：进度条和圆环的分母是「所有文件的记录总数」，
-    // 边传边算的话分母会一直变，进度条会往回跳。
+    // 先做通道自检，再逐个“解析 -> 上传 -> 释放”。旧实现会把所有文件的
+    // Vec<Record> 一次性留在内存里，大批量导入时峰值等于全部轨迹之和。
+    let _ = tx.send(UiEvent::Phase(Phase::Preflight));
+    let sinks = build_sinks(cfg, tx, cancel).await?;
+    let _ = tx.send(UiEvent::ChannelList(
+        sinks.iter().map(|s| s.name().to_string()).collect(),
+    ));
+    let counters = FlushCounters::new(&sinks);
+    let sync_id = *uuid::Uuid::new_v4().as_bytes();
+    let imp_stamp = uuid::Uuid::new_v4().to_string();
+
     let _ = tx.send(UiEvent::Phase(Phase::Parsing));
     let _ = tx.send(UiEvent::Log(
         LogLevel::Info,
         tr!("解析 {} 个文件...", "parsing {} files...", paths.len()),
     ));
-    let mut parsed: Vec<(String, Vec<Record>, f64)> = Vec::new();
-    let mut failed = 0usize;
-    for path in &paths {
+    let mut ok = 0usize;
+    let mut bad = 0usize;
+    let mut total = 0usize;
+    for (i, path) in paths.iter().enumerate() {
         if cancelled(cancel) {
             return Err(CANCELLED.to_string());
         }
@@ -1198,26 +1266,61 @@ async fn import_inner(
                 let start_ms = unix_ms_of(track.start_utc);
                 let records = crate::racebox::records_from_points(&track.points, start_ms);
                 if records.is_empty() {
-                    failed += 1;
+                    bad += 1;
                     let _ = tx.send(UiEvent::SessionInfo {
-                        index: parsed.len() as u32 + 1,
+                        index: i as u32 + 1,
                         name,
                         records: 0,
                         ok: false,
                         detail: t!("没有有效轨迹点", "no usable track point").to_string(),
                     });
-                } else {
-                    parsed.push((name, records, track.duration_secs));
+                    continue;
                 }
+                total += records.len();
+                let _ = tx.send(UiEvent::Phase(Phase::Uploading));
+                let _ = tx.send(UiEvent::UploadProgress {
+                    uploaded: counters.uploaded.load(Ordering::SeqCst),
+                    total,
+                });
+                let flush = SessionFlush {
+                    device: name.clone(),
+                    sync_id,
+                    imp_stamp: imp_stamp.clone(),
+                    records,
+                    session_index: i as u32 + 1,
+                    duration_secs: track.duration_secs,
+                    sync_offset: 0,
+                    sync_total_upper: total,
+                    sync_received_total: total,
+                    sync_final: true,
+                    display: Some(name),
+                };
+                let result = match spawn_flush(
+                    cfg.clone(),
+                    sinks.clone(),
+                    tx.clone(),
+                    counters.clone(),
+                    cancel.clone(),
+                    flush,
+                ) {
+                    Some(handle) => matches!(handle.await, Ok(true)),
+                    None => false,
+                };
+                if result {
+                    ok += 1;
+                } else {
+                    bad += 1;
+                }
+                let _ = tx.send(UiEvent::Phase(Phase::Parsing));
             }
             Ok(Err(e)) => {
-                failed += 1;
+                bad += 1;
                 let _ = tx.send(UiEvent::Log(
                     LogLevel::Error,
                     tr!("解析 {name} 失败: {e}", "failed to parse {name}: {e}"),
                 ));
                 let _ = tx.send(UiEvent::SessionInfo {
-                    index: parsed.len() as u32 + 1,
+                    index: i as u32 + 1,
                     name,
                     records: 0,
                     ok: false,
@@ -1225,9 +1328,9 @@ async fn import_inner(
                 });
             }
             Err(e) => {
-                failed += 1;
+                bad += 1;
                 let _ = tx.send(UiEvent::SessionInfo {
-                    index: parsed.len() as u32 + 1,
+                    index: i as u32 + 1,
                     name,
                     records: 0,
                     ok: false,
@@ -1236,63 +1339,15 @@ async fn import_inner(
             }
         }
     }
-    if parsed.is_empty() {
+    if total == 0 {
         return Err(t!("没有解析出任何可上传的轨迹", "no track could be parsed").to_string());
-    }
-
-    // ---------- 再上传（和蓝牙同步同一套通道） ----------
-    let total: usize = parsed.iter().map(|(_, r, _)| r.len()).sum();
-    let _ = tx.send(UiEvent::Phase(Phase::Preflight));
-    let sinks = build_sinks(cfg, tx, cancel).await?;
-    let _ = tx.send(UiEvent::ChannelList(
-        sinks.iter().map(|s| s.name().to_string()).collect(),
-    ));
-    let _ = tx.send(UiEvent::UploadProgress { uploaded: 0, total });
-    let counters = FlushCounters::new(&sinks);
-    let sync_id = *uuid::Uuid::new_v4().as_bytes();
-    let imp_stamp = uuid::Uuid::new_v4().to_string();
-    let _ = tx.send(UiEvent::Phase(Phase::Uploading));
-
-    let mut handles = Vec::new();
-    for (i, (name, records, duration)) in parsed.into_iter().enumerate() {
-        if cancelled(cancel) {
-            break;
-        }
-        let flush = SessionFlush {
-            device: name.clone(),
-            sync_id,
-            imp_stamp: imp_stamp.clone(),
-            records,
-            session_index: i as u32 + 1,
-            duration_secs: duration,
-            sync_offset: 0,
-            sync_total_upper: total,
-            sync_received_total: total,
-            sync_final: true,
-            display: Some(name),
-        };
-        if let Some(h) = spawn_flush(
-            cfg.clone(),
-            sinks.clone(),
-            tx.clone(),
-            counters.clone(),
-            cancel.clone(),
-            flush,
-        ) {
-            handles.push(h);
-        }
-    }
-    let mut ok = 0usize;
-    let mut bad = failed;
-    for h in handles {
-        match h.await {
-            Ok(true) => ok += 1,
-            _ => bad += 1,
-        }
     }
     let _ = tx.send(UiEvent::SpoolPending(spool::pending_count()));
     let uploaded_ok = counters.uploaded_ok.load(Ordering::SeqCst);
-    let _ = tx.send(UiEvent::UploadProgress { uploaded: total, total });
+    let _ = tx.send(UiEvent::UploadProgress {
+        uploaded: total,
+        total,
+    });
     let _ = tx.send(UiEvent::RunStats(RunStats {
         downloaded: total,
         uploaded: uploaded_ok,
@@ -1350,7 +1405,11 @@ pub async fn run_sync(
     match result {
         Ok(summary) => {
             let _ = tx.send(UiEvent::Log(LogLevel::Success, summary.clone()));
-            let _ = tx.send(UiEvent::Finished { ok: true, summary, cancelled: false });
+            let _ = tx.send(UiEvent::Finished {
+                ok: true,
+                summary,
+                cancelled: false,
+            });
         }
         Err(e) if e == CANCELLED => {
             let _ = tx.send(UiEvent::Log(
@@ -1365,7 +1424,11 @@ pub async fn run_sync(
         }
         Err(e) => {
             let _ = tx.send(UiEvent::Log(LogLevel::Error, e.clone()));
-            let _ = tx.send(UiEvent::Finished { ok: false, summary: e, cancelled: false });
+            let _ = tx.send(UiEvent::Finished {
+                ok: false,
+                summary: e,
+                cancelled: false,
+            });
         }
     }
 }

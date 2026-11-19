@@ -28,6 +28,8 @@ const UNINSTALL_EXE: &str = "uninstall.exe";
 /// 注册表路径，相对 HKEY_CURRENT_USER。安装时 MSI 把 ProductCode 写在这里。
 const REG_APP_KEY: &str = r"Software\racewong\RaceBoxSync";
 const REG_VENDOR_KEY: &str = r"Software\racewong";
+const REG_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const REG_RUN_VALUE: &str = "RaceBoxSync";
 const TITLE: &str = "RaceBox同步 卸载程序";
 /// 标记"我是被复制到临时目录的那一份"，防止无限自我复制。
 const RELOCATED_ENV: &str = "RACEWONG_UNINSTALL_RELOCATED";
@@ -77,7 +79,9 @@ fn run() -> Result<(), String> {
         .skip(1)
         .map(|a| a.to_ascii_lowercase())
         .collect();
-    let silent = flags.iter().any(|f| f == "/s" || f == "-s" || f == "--silent");
+    let silent = flags
+        .iter()
+        .any(|f| f == "/s" || f == "-s" || f == "--silent");
     let purge = flags.iter().any(|f| f == "/purge" || f == "--purge");
     // 安装目录由 relocate 通过环境变量带过来（卸载完用来兜底清残留）
     let install_dir = std::env::var_os(INSTALL_DIR_ENV).map(std::path::PathBuf::from);
@@ -137,6 +141,7 @@ fn run() -> Result<(), String> {
     let data_gone = if keep_data {
         false
     } else {
+        clear_secure_credentials();
         std::fs::remove_dir_all(&data).is_ok() || !data.exists()
     };
 
@@ -211,7 +216,19 @@ fn schedule_self_delete() {
     // 注意 `>` 和 `&` 要作为独立参数传：Rust 只在含空格时才加引号，
     // 这两个符号原样落到 cmd 的命令行里才会被当成重定向和分隔符。
     let _ = hidden("cmd")
-        .args(["/c", "ping", "-n", "3", "127.0.0.1", ">", "nul", "&", "del", "/f", "/q"])
+        .args([
+            "/c",
+            "ping",
+            "-n",
+            "3",
+            "127.0.0.1",
+            ">",
+            "nul",
+            "&",
+            "del",
+            "/f",
+            "/q",
+        ])
         .arg(self_path)
         .spawn();
 }
@@ -262,6 +279,24 @@ fn run_msi_uninstall(code: &str, silent: bool) -> Result<i32, String> {
 #[cfg(windows)]
 fn cleanup_registry() {
     winreg::delete_tree(REG_VENDOR_KEY);
+    // 开机启动项不在厂商键下面，必须单独删除；否则卸载后每次登录都会尝试
+    // 启动一个已经不存在的 exe。
+    let _ = hidden("reg.exe")
+        .args(["DELETE", REG_RUN_KEY, "/v", REG_RUN_VALUE, "/f"])
+        .output();
+}
+
+#[cfg(windows)]
+fn clear_secure_credentials() {
+    for name in [
+        "postgresql-password",
+        "mqtt-password",
+        "racebox-cloud-account",
+    ] {
+        if let Ok(entry) = keyring::Entry::new("cn.wongcw.racewong", name) {
+            let _ = entry.delete_credential();
+        }
+    }
 }
 
 /// 兜底清理安装目录。
@@ -301,7 +336,12 @@ mod msgbox {
 
     #[link(name = "user32")]
     extern "system" {
-        fn MessageBoxW(hwnd: *mut c_void, text: *const u16, caption: *const u16, u_type: u32) -> i32;
+        fn MessageBoxW(
+            hwnd: *mut c_void,
+            text: *const u16,
+            caption: *const u16,
+            u_type: u32,
+        ) -> i32;
     }
 
     const MB_OK: u32 = 0x0000_0000;

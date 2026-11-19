@@ -142,6 +142,14 @@ app/    ui/                设置页 + 主页（设备、进度、日志）
 - 语言：`lang` = `zh` / `en` / `ja` / `ko` / `pt` / `es` / `ru` / `fr` / `de` / `it`
   （设置页“语言 / Language”卡片里的下拉列表，切换即保存；缺省为 `zh`）
 - 关闭行为：`close_action` = `Quit` / `Tray`（缺省 `Quit`）
+- 桌面集成：`auto_start`、`startup_delay_secs`、`notifications`、
+  `remember_window`；开机启动时只显示托盘，窗口位置和大小可选记忆
+- 后台任务：`auto_replay`（启动后重传缓存，默认开）、`auto_sync`
+  （空闲时每 5 分钟尝试附近设备，默认关）
+
+Windows / macOS 上 PostgreSQL、MQTT 和 RaceBox 云密码写入系统安全凭据库，
+`config.json` / `cloud.json` 不再保存明文；首次读取旧配置时会自动迁移并清除旧明文。
+配置保存采用“临时文件 + 原子替换”，异常断电时不会留下半截 JSON。
 
 界面为 egui 自绘的卡片式布局，暗色 / 亮色两套主题共用同一套配色变量
 （`src/style.rs` 的 `Palette`），改颜色只动这一处。
@@ -465,7 +473,15 @@ cargo build --release
   （macOS 是菜单栏），正在跑的同步任务不会中断。托盘菜单：`显示主窗口` / `退出`，
   点 `退出` 才会真正结束进程。
 
-托盘图标只在选“隐藏到托盘”时才常驻；切回“直接退出”会立刻摘掉，不会留一个隐形图标。
+托盘图标在程序运行期间常驻；“点关闭按钮时”只决定点 × 后是退出还是隐藏。
+
+### 开机后台启动
+
+设置 → 行为 → 「开机自动启动」可随时打开或关闭。打开后，下次登录系统会以
+`--background` 参数启动，可设置 0–120 秒延迟：创建托盘图标，但不显示主页面；用户手动点快捷方式仍正常
+打开主页面。Windows 使用当前用户的 `HKCU\...\Run`，macOS 使用用户级
+`~/Library/LaunchAgents/cn.wongcw.racewong.plist`，均不需要管理员权限。Linux 因当前
+没有托盘后端，设置页会禁用这个开关。
 
 | | Windows | macOS |
 | --- | --- | --- |
@@ -503,8 +519,20 @@ Linux 暂不支持托盘（`tray-icon` 的 Linux 后端要 GTK / AppIndicator �
 ### 配置位置
 
 `%APPDATA%\wongcw\racewong\config\config.json`（首次运行自动生成默认值；`conf/db.cnf`
-不参与打包，密码在设置页填写）。本地 spool 在 `...\racewong\config\spool\`，日志在
-`...\config\racewong.log`。
+不参与打包，密码在设置页填写并进入系统安全凭据库）。本地 spool 在
+`...\racewong\config\spool\`，日志在 `...\config\racewong.log`。设置页可导出经过脱敏、
+只带最后 512 KiB 日志的 ZIP 诊断包。
+
+### 桌面端与运行性能
+
+- 托盘退出先销毁托盘句柄再关闭窗口，避免 Windows 通知区域残留幽灵图标；隐藏窗口仍保留
+  5 Hz 低频事件心跳，确保“显示主窗口 / 退出”都能被消费
+- 日志通过有界后台队列统一写文件，磁盘慢时不阻塞 egui 主线程；队列满时丢弃低价值日志，
+  不让 UI 或蓝牙同步反向堵塞
+- 批量导入按文件执行“解析 → 上传 → 释放”，峰值内存从全部轨迹之和降为单个轨迹文件
+- 同步、失败和缓存重传完成后可发系统通知；Windows 通知的“打开”动作会唤回主窗口
+- RaceBox 云成绩计算预先按配置生成阈值并使用有序点插值，避免循环内重复换算和整段复制；
+  相关边界由单元测试锁定
 
 ## 8. 发布脚本与 CI（Windows / macOS / Linux）
 

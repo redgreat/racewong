@@ -62,23 +62,20 @@ impl DataSink for RaceBoxSink {
         progress: &(dyn Fn(usize) + Send + Sync),
     ) -> SinkResult {
         let (device_serial, serial_source) = self.serial_for(session);
-        let (bytes, runs) = crate::racebox::session_bytes(
-            &session.records,
-            device_serial,
-            self.tz_offset_min,
-        )
-        .ok_or_else(|| {
-            SinkError::cloud(
-                t!("这一段没有有效记录", "segment has no valid record"),
-                false,
-            )
-        })?;
+        let (bytes, runs) =
+            crate::racebox::session_bytes(&session.records, device_serial, self.tz_offset_min)
+                .ok_or_else(|| {
+                    SinkError::cloud(
+                        t!("这一段没有有效记录", "segment has no valid record"),
+                        false,
+                    )
+                })?;
 
         // 服务端用这个头做增量判断；用当前时间即可（我们没有本地会话文件的 mtime）。
         let stamp = rfc1123(std::time::SystemTime::now());
         let uploaded = self
             .client
-            .upload_session(&bytes, &stamp)
+            .upload_session(bytes, &stamp)
             .await
             .map_err(|e| SinkError::cloud(e.msg, e.retry))?;
 

@@ -113,6 +113,10 @@
         <RemoveRegistryKey Root="HKCU"
                            Key="Software\Microsoft\Windows\CurrentVersion\App Paths\racewong-app.exe"
                            Action="removeOnUninstall" />
+        <!-- 用户在应用里打开过开机启动时，标准 MSI 卸载也要清掉 Run 项。 -->
+        <RemoveRegistryValue Root="HKCU"
+                             Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                             Name="RaceBoxSync" Action="removeOnUninstall" />
       </Component>
     </DirectoryRef>
 

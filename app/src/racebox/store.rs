@@ -33,11 +33,7 @@ impl CloudAccount {
         if !self.name.is_empty() {
             return self.name.clone();
         }
-        self.email
-            .split('@')
-            .next()
-            .unwrap_or("")
-            .to_string()
+        self.email.split('@').next().unwrap_or("").to_string()
     }
 }
 
@@ -46,6 +42,21 @@ pub fn path() -> PathBuf {
 }
 
 pub fn load() -> CloudAccount {
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        if let Some(text) = crate::credentials::get("racebox-cloud-account") {
+            return serde_json::from_str(&text).unwrap_or_default();
+        }
+        // 首次升级时把旧 cloud.json 迁入系统凭据库。
+        if let Ok(text) = std::fs::read_to_string(path()) {
+            if let Ok(account) = serde_json::from_str::<CloudAccount>(&text) {
+                if save(&account).is_ok() {
+                    let _ = std::fs::remove_file(path());
+                }
+                return account;
+            }
+        }
+        return CloudAccount::default();
+    }
     let p = path();
     match std::fs::read_to_string(&p) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
@@ -54,6 +65,11 @@ pub fn load() -> CloudAccount {
 }
 
 pub fn save(account: &CloudAccount) -> std::io::Result<()> {
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        let text = serde_json::to_string(account).map_err(std::io::Error::other)?;
+        return crate::credentials::set("racebox-cloud-account", &text)
+            .map_err(std::io::Error::other);
+    }
     let p = path();
     let text = serde_json::to_string_pretty(account).unwrap_or_else(|_| "{}".to_string());
     std::fs::write(&p, text)?;
@@ -68,6 +84,9 @@ pub fn save(account: &CloudAccount) -> std::io::Result<()> {
 }
 
 pub fn clear() -> std::io::Result<()> {
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        crate::credentials::set("racebox-cloud-account", "").map_err(std::io::Error::other)?;
+    }
     let p = path();
     if p.exists() {
         std::fs::remove_file(p)?;

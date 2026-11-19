@@ -69,7 +69,11 @@ const DEFAULT_SETPOINTS_KPH: [(u16, u16); 4] = [(0, 30), (0, 60), (0, 100), (0, 
 /// 赛道会话固定 316，Drag 随目标点数量变——服务端按这个值定位记录流，
 /// 算错就是 `Failed to parse session`。
 pub fn header_len() -> usize {
-    68 + DRAG_FIXED_LEN + DEFAULT_SETPOINTS_KPH.len() * DRAG_PER_SETPOINT + 1 + SENSOR_TYPE_COUNT + 8
+    68 + DRAG_FIXED_LEN
+        + DEFAULT_SETPOINTS_KPH.len() * DRAG_PER_SETPOINT
+        + 1
+        + SENSOR_TYPE_COUNT
+        + 8
 }
 
 const KEY_RECORD_LEN: usize = 35;
@@ -248,11 +252,7 @@ pub fn records_from_points(points: &[TrackPoint], start_unix_ms: i64) -> Vec<Rec
 }
 
 /// 单个点 -> 一条记录：先按布局写 raw，再把解码后的字段填回去。
-fn record_from_point(
-    p: &TrackPoint,
-    unix_ms: i64,
-    dt: chrono::DateTime<chrono::Utc>,
-) -> Record {
+fn record_from_point(p: &TrackPoint, unix_ms: i64, dt: chrono::DateTime<chrono::Utc>) -> Record {
     let mut raw = [0u8; crate::protocol::RECORD_SIZE];
     let year = dt.year().max(0) as u16;
     let nanos = ((unix_ms.rem_euclid(1000)) * 1_000_000) as i32;
@@ -446,8 +446,8 @@ const RUN_SUFFIX_FIXED: usize = 20;
 /// 尾部每一趟里每个目标点占 12 字节。
 const RUN_SUFFIX_PER_SETPOINT: usize = 12;
 /// 尾部长度字段只有 u16，跑次太多会溢出。超了就只保留前这么多趟。
-const MAX_RUNS_PER_SESSION: usize =
-    (u16::MAX as usize) / (RUN_SUFFIX_FIXED + DEFAULT_SETPOINTS_KPH.len() * RUN_SUFFIX_PER_SETPOINT);
+const MAX_RUNS_PER_SESSION: usize = (u16::MAX as usize)
+    / (RUN_SUFFIX_FIXED + DEFAULT_SETPOINTS_KPH.len() * RUN_SUFFIX_PER_SETPOINT);
 
 /// 一趟加速跑：记录流里 `[start, end]` 闭区间。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -492,7 +492,7 @@ pub fn detect_runs(points: &[TrackPoint]) -> Vec<Run> {
             stationary = 0;
         } else {
             stationary += 1;
-            if stationary > STATIONARY_RECORDS_TO_END_RUN {
+            if stationary >= STATIONARY_RECORDS_TO_END_RUN {
                 // 这一趟结束在第一个静止记录之前
                 let end = i.saturating_sub(stationary);
                 if end >= start {
@@ -595,9 +595,19 @@ fn track_setpoint(
                 // 穿越发生在 i-1 与 i 之间，起点按 i-1 算；跑次第一条之前没有采样点，
                 // 就退到跑次起点（固件那边 StartRecordIndex = recordIndex - 1 也是这个意思）
                 start_at = (i - 1).max(run.start);
-                start_itow = points[start_at].itow as i64;
-                start_ll = (points[start_at].lat, points[start_at].lng);
-                start_alt = points[start_at].alt;
+                let frac = if new > prev {
+                    ((start_th - prev) / (new - prev)).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let dt = points[i].itow as i64 - points[i - 1].itow as i64;
+                start_itow = points[i - 1].itow as i64 + (dt as f64 * frac) as i64;
+                // 距离和坡度也从真实穿越点算，不能仍从前一采样点起算。
+                start_ll = (
+                    points[i - 1].lat + (points[i].lat - points[i - 1].lat) * frac,
+                    points[i - 1].lng + (points[i].lng - points[i - 1].lng) * frac,
+                );
+                start_alt = points[i - 1].alt + (points[i].alt - points[i - 1].alt) * frac;
             }
             continue;
         }
@@ -682,8 +692,7 @@ fn encode_run_suffix(
         .collect();
     data.retain(|d| d.results.iter().any(Option::is_some));
 
-    let mut out =
-        Vec::with_capacity(data.len() * (RUN_SUFFIX_FIXED + n * RUN_SUFFIX_PER_SETPOINT));
+    let mut out = Vec::with_capacity(data.len() * (RUN_SUFFIX_FIXED + n * RUN_SUFFIX_PER_SETPOINT));
     let mut best = vec![0i32; n];
     let mut best_run = vec![-1i16; n];
     let mut events = Vec::new();
@@ -835,7 +844,7 @@ pub fn encode_session(points: &[TrackPoint], meta: &SessionMeta) -> Option<Vec<u
     h[types_at + 1] = 1; // SensorType::GPS
     h[types_at + 2] = 2; // SensorType::GForce
     h[types_at + 3] = 3; // SensorType::Gyroscope
-    // DataChecksum 覆盖「记录流 + 尾部」，两段要一起算
+                         // DataChecksum 覆盖「记录流 + 尾部」，两段要一起算
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&body);
     hasher.update(&suffix);
@@ -876,9 +885,7 @@ fn local_from_utc(
 ) -> (i32, u32, u32, u32, u32, u32) {
     // 用 chrono 做进位，避免自己写月份天数表。
     use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, Timelike};
-    let base = NaiveDate::from_ymd_opt(y, mo, d).and_then(|date| {
-        date.and_hms_opt(hh, mi, ss)
-    });
+    let base = NaiveDate::from_ymd_opt(y, mo, d).and_then(|date| date.and_hms_opt(hh, mi, ss));
     match base {
         Some(dt) => {
             let shifted: NaiveDateTime = dt + Duration::minutes(offset_min);
@@ -1008,7 +1015,10 @@ mod tests {
         let best: Vec<i32> = (0..n)
             .map(|i| i32::from_le_bytes(blob[br + i * 4..br + i * 4 + 4].try_into().unwrap()))
             .collect();
-        assert!(best[0] > 0 && best[1] > 0 && best[2] > 0, "前三档要有成绩: {best:?}");
+        assert!(
+            best[0] > 0 && best[1] > 0 && best[2] > 0,
+            "前三档要有成绩: {best:?}"
+        );
         assert_eq!(best[3], 0, "没到 150 km/h");
         let rr = br + n * 4;
         for i in 0..n {
@@ -1069,7 +1079,10 @@ mod tests {
         let n_runs = u16::from_le_bytes([blob[82], blob[83]]) as u32;
         assert_eq!(runs + u32::from(n_runs > 0), n_runs);
         // 旁挂记录也要和头部报数一致，否则服务端解析循环会提前收尾
-        assert_eq!(events, u32::from_le_bytes([blob[28], blob[29], blob[30], blob[31]]));
+        assert_eq!(
+            events,
+            u32::from_le_bytes([blob[28], blob[29], blob[30], blob[31]])
+        );
         assert_eq!(
             systems,
             u32::from_le_bytes([blob[24], blob[25], blob[26], blob[27]])
@@ -1152,7 +1165,10 @@ mod tests {
         let at = ev.expect("应当有成绩记录");
         assert_eq!(body[at + 1], 0, "0-30 是第 0 个目标点");
         let ms = u32::from_le_bytes([body[at + 2], body[at + 3], body[at + 4], body[at + 5]]);
-        assert!((ms as i32 - 1_160).abs() < 120, "0-30 约 1.16 秒，实际 {ms} ms");
+        assert!(
+            (ms as i32 - 1_160).abs() < 120,
+            "0-30 约 1.16 秒，实际 {ms} ms"
+        );
     }
 
     /// 航向写 u16 ×100：328°-360° 用 i16 会被截成 327.67°（方向全错）。
@@ -1297,7 +1313,9 @@ mod tests {
         // 留下的每一跑都必须有事件，否则网页里又是灰的
         for r in &kept {
             assert!(
-                events.iter().any(|e| e.after >= r.start && e.after <= r.end),
+                events
+                    .iter()
+                    .any(|e| e.after >= r.start && e.after <= r.end),
                 "跑次 {r:?} 没有 242 事件"
             );
         }
@@ -1305,7 +1323,10 @@ mod tests {
         // 完整会话的 NumberOfRuns / 事件数也要用过滤后的值
         let blob = encode_session(&pts, &meta()).expect("非空");
         assert_eq!(u16::from_le_bytes([blob[82], blob[83]]), 2);
-        assert_eq!(u32::from_le_bytes([blob[28], blob[29], blob[30], blob[31]]), 6);
+        assert_eq!(
+            u32::from_le_bytes([blob[28], blob[29], blob[30], blob[31]]),
+            6
+        );
     }
 
     /// BLE 数据段从运动中开始时，第一趟前面没有静止采样，
@@ -1340,6 +1361,32 @@ mod tests {
         let blob = encode_session(&pts, &meta()).expect("非空");
         assert_eq!(u16::from_le_bytes([blob[82], blob[83]]), 0, "跑次应为 0");
         assert_eq!(u16::from_le_bytes([blob[10], blob[11]]), 0, "尾部应为空");
+    }
+
+    #[test]
+    fn ten_stationary_records_end_the_run() {
+        let mut pts: Vec<TrackPoint> = (0..11).map(sample).collect();
+        pts[0].speed_mmps = 1_000;
+        for p in &mut pts[1..] {
+            p.speed_mmps = 0;
+        }
+        assert_eq!(detect_runs(&pts), vec![Run { start: 0, end: 0 }]);
+    }
+
+    #[test]
+    fn setpoint_start_uses_subsample_interpolation() {
+        let mut pts: Vec<TrackPoint> = (0..3).map(sample).collect();
+        for (i, p) in pts.iter_mut().enumerate() {
+            p.itow = i as u32 * 1_000;
+            p.speed_mmps = (10_000 + i * 10_000) as u32;
+            p.lat = 0.0;
+            p.lng = i as f64 * 0.001;
+        }
+        let run = Run { start: 0, end: 2 };
+        // 54 km/h = 15 m/s，在第 0~1 秒正中穿过；72 km/h = 20 m/s，
+        // 恰好在第 1 秒命中，因此成绩应是 500 ms，而不是旧实现的 1000 ms。
+        let result = track_setpoint(&pts, &run, 54.0, 72.0).expect("应命中目标速度");
+        assert_eq!(result.time_ms, 500);
     }
 
     #[test]

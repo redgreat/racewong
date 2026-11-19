@@ -22,6 +22,7 @@ async-trait = "0.1"
 futures-util = "0.3"
 flexi_logger = "0.29"
 log = "0.4"
+notify-rust = "4.18"
 # 系统原生文件选择框（Windows 的 IFileOpenDialog、macOS 的 NSOpenPanel、
 # Linux 的 xdg-desktop-portal）。用户点「选择本地文件」时得真的弹出资源管理器，
 # 不能只靠「填目录 + 扫描」——那是给批处理用的，不是给鼠标用的。
@@ -32,6 +33,7 @@ rfd = "0.17"
 # 会让 `cargo test` 和原生构建凭空多出系统依赖，而交叉编译 Windows 用不到。
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 tray-icon = "0.19"
+keyring = "4.2"
 
 # 取主窗口的 HWND（托盘菜单直接操作窗口用）。
 # eframe / winit 本来就依赖同一个 0.6，这里只是显式声明，不会多编译一份。

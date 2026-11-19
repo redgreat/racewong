@@ -1,13 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod app_log;
 mod ble;
 mod cloud_ui;
 mod config;
+mod credentials;
+mod desktop;
 mod i18n;
 mod protocol;
 mod racebox;
 mod single_instance;
 mod sink;
+mod startup;
 mod style;
 mod tray;
 mod ui;
@@ -16,7 +20,6 @@ mod worker;
 
 use std::sync::Arc;
 use tokio::runtime::Runtime;
-
 
 fn setup_fonts(ctx: &eframe::egui::Context) {
     let mut fonts = eframe::egui::FontDefinitions::default();
@@ -109,63 +112,17 @@ fn setup_fonts(ctx: &eframe::egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-fn init_file_logger() {
-    struct FileLogger;
-    impl log::Log for FileLogger {
-        fn enabled(&self, _metadata: &log::Metadata) -> bool {
-            true
-        }
-
-        fn log(&self, record: &log::Record) {
-            if !self.enabled(record.metadata()) {
-                return;
-            }
-            let line = format!(
-                "{} [{}] {}\n",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                record.level(),
-                record.args()
-            );
-            use std::io::Write;
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(config::log_path())
-            {
-                let _ = file.write_all(line.as_bytes());
-            }
-        }
-
-        fn flush(&self) {}
-    }
-    let _ = log::set_boxed_logger(Box::new(FileLogger));
-    log::set_max_level(log::LevelFilter::Info);
-}
-
 fn window_icon() -> Option<std::sync::Arc<eframe::egui::IconData>> {
     let bytes = include_bytes!("../assets/icon256.png");
     match eframe::icon_data::from_png_bytes(bytes) {
         Ok(icon) => Some(std::sync::Arc::new(icon)),
         Err(e) => {
-            eprintln!("{}: {e}", crate::t!("窗口图标加载失败", "failed to load window icon"));
+            eprintln!(
+                "{}: {e}",
+                crate::t!("窗口图标加载失败", "failed to load window icon")
+            );
             None
         }
-    }
-}
-
-/// 把界面上的日志同步写一份到日志文件，方便 GUI 里看不到时报错时排查。
-pub fn write_ui_log(level: &str, message: &str) {
-    use std::io::Write;
-    let line = format!(
-        "{} [UI/{level}] {message}\n",
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-    );
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(config::log_path())
-    {
-        let _ = file.write_all(line.as_bytes());
     }
 }
 
@@ -187,7 +144,10 @@ async fn run_check() {
     );
 
     if cfg.uses_database() {
-        print!("PostgreSQL {}:{}/{} ... ", cfg.pg.host, cfg.pg.port, cfg.pg.database);
+        print!(
+            "PostgreSQL {}:{}/{} ... ",
+            cfg.pg.host, cfg.pg.port, cfg.pg.database
+        );
         // 和界面上的“测试连接”一致：走真实写入链路（事务内试写后回滚）
         match crate::sink::pg::PgSink::probe(&cfg.pg).await {
             Ok(detail) => println!("OK ({detail})"),
@@ -196,7 +156,10 @@ async fn run_check() {
     }
 
     if cfg.uses_mqtt() {
-        print!("MQTT {}:{}/{} ... ", cfg.mqtt.broker, cfg.mqtt.port, cfg.mqtt.topic);
+        print!(
+            "MQTT {}:{}/{} ... ",
+            cfg.mqtt.broker, cfg.mqtt.port, cfg.mqtt.topic
+        );
         match crate::sink::mqtt::MqttSink::new(cfg.mqtt.clone(), None).await {
             Ok(sink) => {
                 println!("OK ({})", crate::t!("已收到 CONNACK", "CONNACK received"));
@@ -208,11 +171,21 @@ async fn run_check() {
 }
 
 fn main() -> eframe::Result<()> {
-    init_file_logger();
+    app_log::init();
     if std::env::args().any(|a| a == "--check" || a == "-c") {
         let runtime = Runtime::new().expect("创建 tokio 运行时失败");
         runtime.block_on(run_check());
         return Ok(());
+    }
+    let cfg = config::load();
+    let start_hidden = startup::requested_by_args() && cfg.auto_start;
+    if start_hidden {
+        let delay = startup::delay_from_args()
+            .unwrap_or(cfg.startup_delay_secs)
+            .min(120);
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(delay as u64));
+        }
     }
     // 单实例：托盘常驻时窗口只是藏起来，用户再点一次快捷方式就会起第二个进程，
     // 通知区域于是多出一个同名图标。这里抢不到互斥体就把已有窗口拉到前台再退出。
@@ -222,13 +195,26 @@ fn main() -> eframe::Result<()> {
     }
     let runtime = Runtime::new().expect("创建 tokio 运行时失败");
     let runtime = Arc::new(runtime);
-    let cfg = config::load();
     // 用 tokio 的无界通道而不是 std 的：上传进度回调要在后台任务里
     // 被 `&(dyn Fn(usize) + Send + Sync)` 捕获，std 的 Sender 满足不了 Sync 约束。
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let remembered_size = if cfg.remember_window {
+        [
+            cfg.window_width.unwrap_or(980.0).clamp(760.0, 3840.0),
+            cfg.window_height.unwrap_or(720.0).clamp(560.0, 2160.0),
+        ]
+    } else {
+        [980.0, 720.0]
+    };
     let mut viewport = eframe::egui::ViewportBuilder::default()
-        .with_inner_size([980.0, 720.0])
-        .with_min_inner_size([760.0, 560.0]);
+        .with_inner_size(remembered_size)
+        .with_min_inner_size([760.0, 560.0])
+        .with_visible(!start_hidden);
+    if cfg.remember_window {
+        if let (Some(x), Some(y)) = (cfg.window_x, cfg.window_y) {
+            viewport = viewport.with_position([x, y]);
+        }
+    }
     if let Some(icon) = window_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -253,6 +239,7 @@ fn main() -> eframe::Result<()> {
                 tx,
                 rx,
                 window_handle,
+                start_hidden,
             )))
         }),
     )
