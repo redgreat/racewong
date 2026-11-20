@@ -117,6 +117,7 @@ struct SessionRow {
 
 enum UpdateMsg {
     Current,
+    Downloading,
     Downloaded(crate::updater::UpdateInfo, std::path::PathBuf),
     /// 封装过的失败原因：底层 HTTP 文本只留在 `detail()` 里给日志用。
     Failed(crate::updater::UpdateError),
@@ -318,8 +319,8 @@ pub struct App {
     /// 因为「连接信息还没填」被拦下来的那次任务：弹窗填完就接着跑，
     /// 不用让用户回去再点一次开始。
     pending_run: Option<RunMode>,
-    /// 关于窗口上一次的矩形：判断点击是不是落在窗口外要靠它。
-    about_rect: Option<egui::Rect>,
+    /// 手动更新失败提示的消失时间。
+    update_notice_until: Option<Instant>,
     /// 最近一次可见主窗口的位置和大小，退出时一次性落盘。
     last_window_rect: Option<egui::Rect>,
     /// 启动后的后台动作只触发一次。
@@ -403,7 +404,7 @@ impl App {
             pending_update: None,
             dialog: None,
             pending_run: None,
-            about_rect: None,
+            update_notice_until: None,
             last_window_rect: None,
             startup_tasks_started: false,
             next_auto_sync: Instant::now(),
@@ -464,6 +465,10 @@ impl App {
                 break;
             };
             match cmd {
+                crate::tray::TrayCommand::About => {
+                    self.about_open = true;
+                    ctx.send_viewport_cmd_to(about_viewport_id(), egui::ViewportCommand::Focus);
+                }
                 crate::tray::TrayCommand::Show => {
                     self.hidden_to_tray = false;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -716,7 +721,7 @@ impl App {
                         Phase::Failed
                     };
                     // 完成后再计冷却时间，避免恢复窗口时新任务立刻覆盖结果。
-                    self.next_auto_sync = Instant::now() + Duration::from_secs(5 * 60);
+                    self.next_auto_sync = Instant::now() + self.auto_sync_interval();
                     self.last_summary = summary;
                     self.erase_percent = None;
                     if !ok {
@@ -729,9 +734,19 @@ impl App {
             self.mqtt_probe = Some(sink);
         }
         while let Ok(message) = self.update_rx.try_recv() {
+            if matches!(&message, UpdateMsg::Downloading) {
+                if self.about_open {
+                    self.update_result = Some((
+                        t!("正在下载…", "Downloading…").to_string(),
+                        LogLevel::Info,
+                    ));
+                }
+                continue;
+            }
             self.update_busy = false;
             let silent = self.update_silent;
             match message {
+                UpdateMsg::Downloading => unreachable!(),
                 UpdateMsg::Current => {
                     // 自动检查：已经是最新版就别吭声，用户没问这件事
                     if !silent {
@@ -755,20 +770,17 @@ impl App {
                 }
                 UpdateMsg::Failed(e) => {
                     // 原始错误（URL、HTTP 状态码、库报错）只写日志，永远不进界面。
-                    // 离线 / DNS / GitHub 限流 / 5xx 这类环境性失败连横幅都不给：
-                    // 用户没做错任何事，弹个红框除了添堵没别的用；顺手把
-                    // 「正在检查…」也收掉，别留一句永远不兑现的话。
+                    // 自动检查失败保持静默，手动检查则显示短提示。
                     log::info!(
                         "检查更新未成功: {} | 原始错误: {}",
                         e.user_message(),
                         e.detail()
                     );
-                    if e.is_transient() {
+                    if silent {
                         self.update_result = None;
-                    } else if silent {
                         log::info!("自动更新失败，已忽略: {}", e.user_message());
                     } else {
-                        self.update_result = Some((e.user_message().to_string(), LogLevel::Error));
+                        self.show_update_failure(ctx, &e);
                     }
                 }
             }
@@ -822,7 +834,7 @@ impl App {
                 if self.update_silent {
                     log::info!("自动更新失败，已忽略: {}", e.user_message());
                 } else {
-                    self.update_result = Some((e.user_message().to_string(), LogLevel::Error));
+                    self.show_update_failure(ctx, &e);
                 }
             }
         }
@@ -830,14 +842,20 @@ impl App {
 
     /// 查一次 GitHub Release，有新版本就下载并装。
     ///
-    /// `silent` 是「启动时自动跑的那一次」：不写状态文字、失败也不弹，
-    /// 因为用户并没有要求这件事，联网失败只是常态。手动点按钮时也只有
-    /// 「需要用户处理」的失败才给一句短提示；连不上 / 限流一律静默收掉。
+    /// 自动检查失败保持静默，手动检查失败显示短提示。
+    fn show_update_failure(&mut self, ctx: &egui::Context, error: &crate::updater::UpdateError) {
+        self.update_result = Some((error.user_message().to_string(), LogLevel::Error));
+        let duration = Duration::from_secs(4);
+        self.update_notice_until = Some(Instant::now() + duration);
+        ctx.request_repaint_after(duration);
+    }
+
     fn check_update(&mut self, silent: bool) {
         if self.update_busy {
             return;
         }
         self.update_busy = true;
+        self.update_notice_until = None;
         self.update_silent = silent;
         if silent {
             self.update_result = None;
@@ -848,16 +866,26 @@ impl App {
             ));
         }
         let tx = self.update_tx.clone();
+        let ctx = self.ctx.clone();
         self.runtime.spawn(async move {
             let message = match crate::updater::check(silent).await {
                 Ok(None) => UpdateMsg::Current,
-                Ok(Some(info)) => match crate::updater::download(&info).await {
-                    Ok(path) => UpdateMsg::Downloaded(info, path),
-                    Err(e) => UpdateMsg::Failed(e),
-                },
+                Ok(Some(info)) => {
+                    let _ = tx.send(UpdateMsg::Downloading);
+                    if let Some(ctx) = &ctx {
+                        ctx.request_repaint();
+                    }
+                    match crate::updater::download(&info).await {
+                        Ok(path) => UpdateMsg::Downloaded(info, path),
+                        Err(e) => UpdateMsg::Failed(e),
+                    }
+                }
                 Err(e) => UpdateMsg::Failed(e),
             };
             let _ = tx.send(message);
+            if let Some(ctx) = &ctx {
+                ctx.request_repaint();
+            }
         });
     }
 
@@ -1025,7 +1053,11 @@ impl App {
             Ok(()) => {
                 let msg = t!("配置已保存", "settings saved").to_string();
                 self.action_result = Some((msg.clone(), LogLevel::Success));
+                let interval_changed = self.settings_snapshot.auto_sync_minutes != self.cfg.auto_sync_minutes;
                 self.settings_snapshot = self.cfg.clone();
+                if interval_changed {
+                    self.next_auto_sync = Instant::now() + self.auto_sync_interval();
+                }
                 self.push_log(LogLevel::Success, msg);
                 // 保存成功直接回首页
                 self.tab = Tab::Sync;
@@ -1981,6 +2013,10 @@ impl App {
         sender
     }
 
+    fn auto_sync_interval(&self) -> Duration {
+        Duration::from_secs(u64::from(self.settings_snapshot.auto_sync_minutes.clamp(1, 120)) * 60)
+    }
+
     fn run_background_tasks(&mut self) {
         if !self.startup_tasks_started {
             self.startup_tasks_started = true;
@@ -1989,15 +2025,20 @@ impl App {
                 self.retry_spool();
             }
         }
-        if self.cfg.auto_sync
+        if self.settings_snapshot.auto_sync
             && !self.running
             && !self.replay_busy
-            && Instant::now() >= self.next_auto_sync
             && self.channel_ready()
         {
-            // 一次尝试后至少退避 5 分钟；设备不在附近时不能连续扫描。
-            self.next_auto_sync = Instant::now() + Duration::from_secs(5 * 60);
-            self.start(RunMode::Sync);
+            let now = Instant::now();
+            if now >= self.next_auto_sync {
+                // 先安排下一次尝试，避免没有实际启动时连续扫描。
+                self.next_auto_sync = now + self.auto_sync_interval();
+                self.start(RunMode::Sync);
+            }
+            if let Some(ctx) = &self.ctx {
+                ctx.request_repaint_after(self.next_auto_sync.saturating_duration_since(now));
+            }
         }
     }
 
@@ -2710,11 +2751,17 @@ impl App {
                 &mut self.cfg.auto_sync,
             );
             ui.add_space(4.0);
+            ui.add_enabled_ui(self.cfg.auto_sync, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(t!("自动同步间隔（分钟）", "Auto-sync interval (minutes)"));
+                    ui.add(egui::DragValue::new(&mut self.cfg.auto_sync_minutes).range(1..=120));
+                });
+            });
             ui.colored_label(
                 p.warn,
                 t!(
-                    "空闲时每 5 分钟尝试一次；仍遵守“全部上传成功后才擦除”",
-                    "Tries every 5 minutes while idle; erase still requires every upload to succeed"
+                    "空闲时按间隔尝试，全部上传成功后才擦除。",
+                    "Tries at the set interval while idle. Erasing requires every upload to succeed."
                 ),
             );
             ui.add_space(12.0);
@@ -3135,101 +3182,89 @@ impl eframe::App for App {
                         Some(ctx.load_texture("about_icon", image, Default::default()));
                 }
             }
-            // 标题栏可拖动：拖动后 egui 会记住位置，下次打开还在那儿；
-            // 首次没记录时才用这个居中坐标兜一下。
-            let center = ctx.screen_rect().center();
-            let win = egui::Window::new(t!("关于", "About"))
-                .default_pos(egui::pos2(center.x - 170.0, center.y - 180.0))
-                .collapsible(false)
-                .resizable(false)
-                .default_size([320.0, 360.0])
-                .default_open(true)
-                .frame(style::window(&p));
-            let mut open = true;
-            let resp = win.open(&mut open).show(ctx, |ui| {
-                ui.set_width(300.0);
-                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                ui.vertical_centered(|ui| {
-                    // 应用图标
-                    if let Some(tex) = &self.about_icon {
-                        ui.add(egui::Image::new((tex.id(), egui::vec2(52.0, 52.0))));
-                    } else {
-                        ui.add(egui::Label::new(
-                            egui::RichText::new("RaceBox").strong().size(20.0),
-                        ));
-                    }
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(t!("RaceBox同步", "RaceBox Sync"))
-                            .strong()
-                            .size(18.0)
-                            .color(p.text),
-                    );
-                    ui.add_space(4.0);
-                    // 版本号 + 「检查并更新」：更新入口只留在这里，
-                    // 设置页那张卡已经去掉（每次启动都会自动查一次，不用摆个按钮占地方）
-                    ui.label(
-                        egui::RichText::new(tr!(
-                            "版本 {}",
-                            "version {}",
-                            env!("CARGO_PKG_VERSION")
-                        ))
-                        .size(12.5)
-                        .color(p.muted),
-                    );
-                    ui.add_space(8.0);
-                    let busy = self.update_busy;
-                    let check_btn = ui.add_enabled(
-                        !busy,
-                        style::secondary_button(&p, t!("检查并更新", "Check and update")),
-                    );
-                    if check_btn
-                        .on_hover_text(t!(
-                            "点这里检查 GitHub Release 上的新版本",
-                            "click to check GitHub Releases for a newer version"
-                        ))
-                        .clicked()
-                    {
-                        self.check_update(false);
-                    }
-                    if busy {
-                        ui.add_space(6.0);
-                        ui.spinner();
-                    }
-                });
-                if let Some((text, level)) = &self.update_result {
-                    style::status_banner(ui, &p, level_color(&p, *level), text);
-                    ui.add_space(8.0);
-                }
-                ui.add_space(6.0);
-                about_row(ui, &p, t!("作者", "Author"), "wangcw");
-                about_row(ui, &p, t!("邮箱", "Email"), "rubygreat@msn.com");
-                about_row(
-                    ui,
-                    &p,
-                    t!("协议", "Protocol"),
-                    "ublox BLE · PostgreSQL / MQTT (RBX2)",
-                );
-                ui.add_space(6.0);
-            });
-            self.about_rect = resp.and_then(|r| Some(r.response.rect));
-            if !open {
-                self.about_open = false;
-                // 关窗就把上次的检查结果丢掉，下次打开不会看到一条陈年旧话
+            if self.update_notice_until.is_some_and(|until| Instant::now() >= until) {
+                self.update_notice_until = None;
                 self.update_result = None;
-            } else {
-                // 点（或 Esc）在窗体之外就关掉：窗体内部要留给按钮和文本选择
-                let outside = ctx.pointer_interact_pos().map_or(true, |pos| {
-                    self.about_rect.map_or(true, |rect| !rect.contains(pos))
-                });
-                let pressed_outside = outside && ctx.input(|i| i.pointer.any_pressed());
-                if pressed_outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    self.about_open = false;
-                    self.update_result = None;
-                }
             }
-        } else {
-            self.about_rect = None;
+            let close = ctx.show_viewport_immediate(
+                about_viewport_id(),
+                egui::ViewportBuilder::default()
+                    .with_title(t!("关于", "About"))
+                    .with_inner_size([350.0, 365.0])
+                    .with_resizable(false),
+                |ctx, _| {
+                    let close = ctx.input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape));
+                    if let Some(until) = self.update_notice_until {
+                        ctx.request_repaint_after(until.saturating_duration_since(Instant::now()));
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.add_space(12.0);
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        ui.vertical_centered(|ui| {
+                            // 应用图标
+                            if let Some(tex) = &self.about_icon {
+                                ui.add(egui::Image::new((tex.id(), egui::vec2(52.0, 52.0))));
+                            } else {
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new("RaceBox").strong().size(20.0),
+                                ));
+                            }
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(t!("RaceBox同步", "RaceBox Sync"))
+                                    .strong()
+                                    .size(18.0)
+                                    .color(p.text),
+                            );
+                            ui.add_space(4.0);
+                            // 版本号 + 「检查并更新」：更新入口只留在这里，
+                            // 设置页那张卡已经去掉（每次启动都会自动查一次，不用摆个按钮占地方）
+                            ui.label(
+                                egui::RichText::new(tr!(
+                                    "版本 {}",
+                                    "version {}",
+                                    env!("CARGO_PKG_VERSION")
+                                ))
+                                .size(12.5)
+                                .color(p.muted),
+                            );
+                            ui.add_space(8.0);
+                            let busy = self.update_busy;
+                            let check_btn = ui.add_enabled(
+                                !busy,
+                                style::secondary_button(&p, t!("检查并更新", "Check and update")),
+                            );
+                            if check_btn.clicked() {
+                                self.check_update(false);
+                            }
+                            if busy {
+                                ui.add_space(6.0);
+                                ui.spinner();
+                            }
+                            if let Some((text, level)) = &self.update_result {
+                                ui.add_space(6.0);
+                                ui.colored_label(level_color(&p, *level), text);
+                            }
+                        });
+                        ui.add_space(6.0);
+                        about_row(ui, &p, t!("作者", "Author"), "wangcw");
+                        about_row(ui, &p, t!("邮箱", "Email"), "rubygreat@msn.com");
+                        about_row(
+                            ui,
+                            &p,
+                            t!("协议", "Protocol"),
+                            "ublox BLE · PostgreSQL / MQTT (RBX2)",
+                        );
+                        ui.add_space(6.0);
+                    });
+                    close
+                },
+            );
+            if close {
+                self.about_open = false;
+                self.update_result = None;
+                self.update_notice_until = None;
+            }
         }
 
         // 关闭设置页前的“有未保存更改”确认弹窗
@@ -3317,6 +3352,10 @@ impl eframe::App for App {
 }
 
 /// 关于弹窗里的“标签: 值”信息行。
+fn about_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("racebox-about")
+}
+
 fn about_row(ui: &mut egui::Ui, p: &Palette, key: &str, value: &str) {
     ui.horizontal(|ui| {
         ui.add_space(24.0);

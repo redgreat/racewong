@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// 用户在托盘菜单里点了什么。
 #[derive(Clone, Copy, Debug)]
 pub enum TrayCommand {
+    About,
     /// 显示主窗口。
     Show,
     /// 退出应用。
@@ -73,6 +74,7 @@ mod win32 {
     pub const SW_SHOW: i32 = 5;
     pub const SW_RESTORE: i32 = 9;
     pub const WM_CLOSE: u32 = 0x0010;
+    pub const WM_PAINT: u32 = 0x000F;
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -117,13 +119,17 @@ mod platform {
             let menu = Menu::new();
             let show = MenuItem::new(t!("显示主窗口", "Show window"), true, None);
             let quit = MenuItem::new(t!("退出", "Quit"), true, None);
+            let about = MenuItem::new(t!("关于", "About"), true, None);
             menu.append(&show)
+                .map_err(|e| tr!("托盘菜单创建失败: {e}", "failed to create tray menu: {e}"))?;
+            menu.append(&about)
                 .map_err(|e| tr!("托盘菜单创建失败: {e}", "failed to create tray menu: {e}"))?;
             menu.append(&quit)
                 .map_err(|e| tr!("托盘菜单创建失败: {e}", "failed to create tray menu: {e}"))?;
 
             let show_id = show.id().clone();
             let quit_id = quit.id().clone();
+            let about_id = about.id().clone();
 
             let queue: Arc<Mutex<VecDeque<TrayCommand>>> = Arc::new(Mutex::new(VecDeque::new()));
 
@@ -136,13 +142,15 @@ mod platform {
                         TrayCommand::Show
                     } else if event.id == quit_id {
                         TrayCommand::Quit
+                    } else if event.id == about_id {
+                        TrayCommand::About
                     } else {
                         return;
                     };
-                    dispatch(cmd, hwnd);
                     if let Ok(mut q) = menu_queue.lock() {
                         q.push_back(cmd);
                     }
+                    dispatch(cmd, hwnd);
                     menu_ctx.request_repaint();
                 },
             ));
@@ -206,6 +214,10 @@ mod platform {
                 return;
             }
             match cmd {
+                TrayCommand::About => {
+                    // 隐藏的根窗口也需要处理一帧，才能创建关于窗口。
+                    super::win32::PostMessageW(hwnd, super::win32::WM_PAINT, 0, 0);
+                }
                 TrayCommand::Show => {
                     if super::quit_requested() {
                         return;

@@ -250,6 +250,8 @@ pub struct Config {
     /// 后台空闲时自动尝试连接记住的设备并同步。
     #[serde(default)]
     pub auto_sync: bool,
+    #[serde(default = "default_auto_sync_minutes")]
+    pub auto_sync_minutes: u32,
     /// 启动后自动重传落盘缓存。
     #[serde(default = "default_true")]
     pub auto_replay: bool,
@@ -294,6 +296,10 @@ fn default_startup_delay() -> u32 {
     15
 }
 
+fn default_auto_sync_minutes() -> u32 {
+    5
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -305,6 +311,7 @@ impl Default for Config {
             auto_start: false,
             startup_delay_secs: default_startup_delay(),
             auto_sync: false,
+            auto_sync_minutes: default_auto_sync_minutes(),
             auto_replay: true,
             notifications: true,
             remember_window: true,

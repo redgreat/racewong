@@ -9,6 +9,20 @@
 use super::table::{row, Row};
 
 pub const ROWS: &[Row] = &[
+    row("正在下载…", "Downloading…", "ダウンロード中…", "다운로드 중…", "A baixar…", "Descargando…", "Загрузка…", "Téléchargement…", "Wird heruntergeladen…", "Download in corso…"),
+    row("自动同步间隔（分钟）", "Auto-sync interval (minutes)", "自動同期の間隔（分）", "자동 동기화 간격(분)", "Intervalo de sincronização automática (minutos)", "Intervalo de sincronización automática (minutos)", "Интервал автосинхронизации (минуты)", "Intervalle de synchronisation automatique (minutes)", "Intervall der automatischen Synchronisierung (Minuten)", "Intervallo di sincronizzazione automatica (minuti)"),
+    row(
+        "空闲时按间隔尝试，全部上传成功后才擦除。",
+        "Tries at the set interval while idle. Erasing requires every upload to succeed.",
+        "待機中は設定間隔で試行し、すべてのアップロード成功後に消去します。",
+        "대기 중 설정된 간격으로 시도하며 모든 업로드가 성공한 후에만 삭제합니다.",
+        "Tenta no intervalo definido quando inativo. Só apaga após todos os envios.",
+        "Intenta sincronizar en reposo según el intervalo. Solo borra tras completar todos los envíos.",
+        "В простое синхронизация идёт по интервалу. Удаление только после успешной отправки всех данных.",
+        "En veille, les tentatives suivent l’intervalle choisi. L’effacement exige que tous les envois réussissent.",
+        "Im Leerlauf gilt das eingestellte Intervall. Gelöscht wird erst nach allen erfolgreichen Uploads.",
+        "Quando inattivo, prova all’intervallo impostato. Cancella solo dopo tutti i caricamenti riusciti.",
+    ),
     // ---------------- 蓝牙 / 设备 ----------------
     row(
         "未找到蓝牙适配器，请确认蓝牙已开启",
