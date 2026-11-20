@@ -874,6 +874,11 @@ async fn download_and_upload(
                     }
                 }
                 protocol::MSG_SESSION_BOUNDARY => {
+                    if current.is_empty() {
+                        session_base = received_total;
+                        session_started = Instant::now();
+                        continue;
+                    }
                     session_index += 1;
                     let flush = SessionFlush {
                         device: device.to_string(),
@@ -919,7 +924,9 @@ async fn download_and_upload(
         }
     }
 
-    session_index += 1;
+    if !current.is_empty() {
+        session_index += 1;
+    }
     let flush = SessionFlush {
         device: device.to_string(),
         sync_id,

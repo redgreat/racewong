@@ -1933,9 +1933,15 @@ impl App {
         let notifications = self.cfg.notifications;
         let window = self.window_handle;
         self.runtime.spawn(async move {
+            let mut downloaded = None;
             while let Some(event) = events.recv().await {
+                if let UiEvent::RunStats(stats) = &event {
+                    downloaded = Some(stats.downloaded);
+                }
                 if notifications {
                     let notice = match &event {
+                        UiEvent::Finished { ok: true, .. }
+                            if matches!(downloaded, Some(0..=4)) => None,
                         UiEvent::Finished { ok, summary, cancelled: false } => Some((
                             if *ok {
                                 t!("RaceBox 任务完成", "RaceBox task completed")

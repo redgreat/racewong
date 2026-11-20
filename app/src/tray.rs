@@ -63,6 +63,7 @@ mod win32 {
     #[link(name = "user32")]
     extern "system" {
         pub fn IsWindow(hwnd: isize) -> i32;
+        pub fn IsWindowVisible(hwnd: isize) -> i32;
         pub fn IsIconic(hwnd: isize) -> i32;
         pub fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
         pub fn SetForegroundWindow(hwnd: isize) -> i32;
@@ -87,10 +88,22 @@ mod platform {
     use tray_icon::menu::{Menu, MenuItem};
     use tray_icon::{TrayIcon, TrayIconBuilder};
 
+    #[cfg(target_os = "windows")]
+    thread_local! {
+        static NATIVE_ICON: std::cell::RefCell<Option<TrayIcon>> = const { std::cell::RefCell::new(None) };
+    }
+
     pub struct Tray {
         // 必须一直持有：句柄一 drop，托盘图标就消失了
         _icon: TrayIcon,
         queue: Arc<Mutex<VecDeque<TrayCommand>>>,
+    }
+
+    #[cfg(target_os = "windows")]
+    impl Drop for Tray {
+        fn drop(&mut self) {
+            NATIVE_ICON.with(|icon| { icon.borrow_mut().take(); });
+        }
     }
 
     impl Tray {
@@ -167,6 +180,8 @@ mod platform {
                 .build()
                 .map_err(|e| tr!("托盘图标创建失败: {e}", "failed to create tray icon: {e}"))?;
 
+            #[cfg(target_os = "windows")]
+            NATIVE_ICON.with(|slot| *slot.borrow_mut() = Some(icon.clone()));
             Ok(Self { _icon: icon, queue })
         }
 
@@ -192,6 +207,9 @@ mod platform {
             }
             match cmd {
                 TrayCommand::Show => {
+                    if super::quit_requested() {
+                        return;
+                    }
                     if super::win32::IsIconic(hwnd) != 0 {
                         super::win32::ShowWindow(hwnd, super::win32::SW_RESTORE);
                     }
@@ -202,6 +220,15 @@ mod platform {
                     // 先立旗：eframe 收到 WM_CLOSE 会立刻跑一次 update，
                     // 那次必须认出“是用户要退出”，否则会被当成“收进托盘”再藏起来。
                     QUIT_REQUESTED.store(true, Ordering::SeqCst);
+                    NATIVE_ICON.with(|slot| {
+                        if let Some(icon) = slot.borrow_mut().take() {
+                            let _ = icon.set_visible(false);
+                        }
+                    });
+                    // 隐藏窗口不会处理绘制驱动的 CloseRequested，不能靠重新显示窗口退出。
+                    if super::win32::IsWindowVisible(hwnd) == 0 {
+                        std::process::exit(0);
+                    }
                     super::win32::PostMessageW(hwnd, super::win32::WM_CLOSE, 0, 0);
                 }
             }

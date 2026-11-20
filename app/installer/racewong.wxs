@@ -164,7 +164,9 @@
       <DialogRef Id="FilesInUse" />
       <DialogRef Id="MsiRMFilesInUse" />
       <DialogRef Id="PrepareDlg" />
-      <DialogRef Id="ProgressDlg" />
+      <InstallUISequence>
+        <Show Dialog="RaceBoxProgressDlg" Before="ExecuteAction" />
+      </InstallUISequence>
       <DialogRef Id="ResumeDlg" />
       <DialogRef Id="UserExit" />
 
@@ -222,6 +224,10 @@
         <Control Id="FolderLabel" Type="Text" X="20" Y="60" Width="290" Height="30" NoPrefix="yes" Text="!(loc.InstallDirDlgFolderLabel)" />
         <Control Id="Folder" Type="PathEdit" X="20" Y="100" Width="320" Height="18" Property="WIXUI_INSTALLDIR" Indirect="yes" />
         <Control Id="ChangeFolder" Type="PushButton" X="20" Y="120" Width="56" Height="17" Text="!(loc.InstallDirDlgChange)" />
+        <Control Id="DiskSpace" Type="PushButton" X="84" Y="120" Width="75" Height="17" Text="磁盘空间(&amp;S)">
+          <Publish Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1">1</Publish>
+          <Publish Event="SpawnDialog" Value="DiskCostDlg" Order="2">1</Publish>
+        </Control>
 
         <!-- 新增：桌面快捷方式。CheckBoxValue 是"勾上时写进属性的值"，
              取消勾选时 MSI 会把 DESKTOPSHORTCUT 清空（不是置 0），
@@ -231,6 +237,22 @@
         <Control Id="DesktopShortcutHint" Type="Text" X="36" Y="170" Width="314" Height="15"
                  NoPrefix="yes" Transparent="yes"
                  Text="取消勾选则只在开始菜单里放一个入口，桌面保持干净。" />
+      </Dialog>
+      <!-- 给本地化的操作文字留出两行，避免高 DPI 下文字被进度条裁切。 -->
+      <Dialog Id="RaceBoxProgressDlg" Width="370" Height="270" Title="!(loc.ProgressDlg_Title)" Modeless="yes">
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg">1</Publish>
+        </Control>
+        <Control Id="Banner" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="!(loc.ProgressDlgBannerBitmap)" />
+        <Control Id="Title" Type="Text" X="20" Y="15" Width="280" Height="18" Transparent="yes" Text="{\WixUI_Font_Title}正在处理 [ProductName]" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="Status" Type="Text" X="20" Y="74" Width="330" Height="28" NoPrefix="yes">
+          <Subscribe Event="ActionText" Attribute="Text" />
+        </Control>
+        <Control Id="Progress" Type="ProgressBar" X="20" Y="112" Width="330" Height="12" ProgressBlocks="yes">
+          <Subscribe Event="SetProgress" Attribute="Progress" />
+        </Control>
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
       </Dialog>
     </UI>
 

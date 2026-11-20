@@ -326,8 +326,8 @@ pub async fn download(info: &UpdateInfo) -> Result<PathBuf, UpdateError> {
 /// * 安装位置用当前 exe 所在目录传给 MSI（`INSTALLFOLDER=`），这样升级一定
 ///   落在上次的目录里，不会因为静默安装没人能改路径而被搬回默认位置；
 /// * 不能直接 spawn msiexec —— 它要覆盖的就是正在运行的 exe。先写一个短命
-///   `cmd` 脚本，等 2 秒（够本进程退出、文件锁释放）再装，装完把程序重新拉起来；
-///   这个 `cmd` 用 `CREATE_NO_WINDOW` 起，不会在屏幕上闪一个命令行窗口；
+///   PowerShell 脚本，等旧进程退出后再装，装完把程序重新拉起来；
+///   脚本用 `CREATE_NO_WINDOW` 启动，失败时显示错误码和日志路径；
 /// * 留一份安装日志在 `%TEMP%\racewong-update\install.log`，静默安装失败时能查。
 pub fn launch_installer(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
@@ -336,31 +336,38 @@ pub fn launch_installer(path: &std::path::Path) -> Result<(), String> {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let install_dir = exe.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        let script = dir.join("apply-update.cmd");
+        let script = dir.join("apply-update.ps1");
         let log = dir.join("install.log");
 
-        // ping 当 sleep 用：`timeout` 在无控制台的进程里会直接报错
-        let body = format!(
-            "@echo off\r\n\
-             ping -n 3 127.0.0.1 >nul\r\n\
-             msiexec.exe /i \"{msi}\" /qn /norestart INSTALLFOLDER=\"{dir}\" /l*v \"{log}\"\r\n\
-             if exist \"{exe}\" start \"\" \"{exe}\"\r\n\
-             del \"%~f0\"\r\n",
-            msi = path.display(),
-            dir = install_dir.display(),
-            log = log.display(),
-            exe = exe.display(),
-        );
+        // 用独立参数传递 Unicode 路径，等待旧进程真正释放 EXE，再检查 MSI 的退出码。
+        let body = r#"param([int]$AppPid, [string]$Msi, [string]$Log, [string]$Exe)
+$old = Get-Process -Id $AppPid -ErrorAction SilentlyContinue
+if ($old) { $old.WaitForExit() }
+$folder = [IO.Path]::GetDirectoryName($Exe)
+$argsLine = '/i "{0}" /qn /norestart "INSTALLFOLDER={1}" /l*v "{2}"' -f $Msi,$folder,$Log
+try {
+    $code = (Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $argsLine -Wait -PassThru -ErrorAction Stop).ExitCode
+} catch {
+    $code = -1
+    $_.ToString() | Out-File -LiteralPath $Log
+}
+if ($code -ne 0 -and $code -ne 3010) {
+    Add-Type -AssemblyName System.Windows.Forms
+    [void][Windows.Forms.MessageBox]::Show("RaceBox update failed ($code).`nLog: $Log", "RaceBox Sync")
+}
+if (Test-Path -LiteralPath $Exe) { Start-Process -FilePath $Exe }
+"#;
         std::fs::write(&script, body).map_err(|e| format!("写入升级脚本失败: {e}"))?;
-        // 本程序是 GUI 子系统，spawn cmd.exe 时系统会给它新建一个控制台，
-        // 屏幕上就会闪一个黑框——「静默更新」看着一点也不静默。
-        // CREATE_NO_WINDOW 让子进程用隐藏的控制台跑，从头到尾看不见窗口。
+        // GUI 程序启动 PowerShell 时不需要新建控制台。
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let mut cmd = std::process::Command::new("cmd.exe");
-        cmd.arg("/c")
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(&script)
+            .arg(std::process::id().to_string())
+            .arg(path)
+            .arg(log)
+            .arg(exe)
             .creation_flags(CREATE_NO_WINDOW);
         return cmd
             .spawn()
