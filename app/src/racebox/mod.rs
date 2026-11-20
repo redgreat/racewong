@@ -104,7 +104,8 @@ pub fn session_bytes(
     tz_offset_min: i16,
 ) -> Option<(Vec<u8>, usize)> {
     let first = records.first()?;
-    let points: Vec<TrackPoint> = records.iter().map(record_to_point).collect();
+    let mut points: Vec<TrackPoint> = records.iter().map(record_to_point).collect();
+    session::clean_cloud_points(&mut points);
     let meta = SessionMeta {
         session_id: new_session_id(),
         utc: (

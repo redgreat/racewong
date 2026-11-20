@@ -82,6 +82,58 @@ const RECORD_PREFIX_KEY: u8 = 0;
 const MAX_DELTA_RECORDS: u8 = 200;
 const MAX_DELTA_MS: i64 = 2000;
 const MAX_DELTA_RAW: f64 = 16384.0;
+const GPS_WEEK_MS: i64 = 604_800_000;
+
+/// 按相邻采样间隔小于半周展开时间，小幅倒序仍保留负号。
+fn tow_delta(from: u32, to: u32) -> i64 {
+    let delta = i64::from(to) - i64::from(from);
+    if from >= GPS_WEEK_MS as u32 || to >= GPS_WEEK_MS as u32 {
+        return delta;
+    }
+    if delta < -GPS_WEEK_MS / 2 {
+        delta + GPS_WEEK_MS
+    } else if delta > GPS_WEEK_MS / 2 {
+        delta - GPS_WEEK_MS
+    } else {
+        delta
+    }
+}
+
+/// 仅修正孤立尖峰和明确静止时的位置漂移，保留连续加速和低速移动。
+pub(super) fn clean_cloud_points(points: &mut [TrackPoint]) {
+    let Some(mut before) = points.first().copied() else { return };
+    for i in 1..points.len().saturating_sub(1) {
+        let current = points[i];
+        let after = points[i + 1];
+        let left = tow_delta(before.itow, current.itow);
+        let right = tow_delta(current.itow, after.itow);
+        if (1..=1000).contains(&left) && (1..=1000).contains(&right) {
+            let v = i64::from(current.speed_mmps);
+            let a = i64::from(before.speed_mmps);
+            let b = i64::from(after.speed_mmps);
+            let jump = (v - a).signum() == (v - b).signum()
+                && (v - a).abs() > (30 * left).max(3000)
+                && (v - b).abs() > (30 * right).max(3000)
+                && (a - b).abs() <= 15 * (left + right);
+            if jump {
+                points[i].speed_mmps = (a + (b - a) * left / (left + right)) as u32;
+            }
+        }
+        before = current;
+    }
+    let mut anchor: Option<TrackPoint> = None;
+    for point in points {
+        if filtered_mmps(point) > 0.0 {
+            anchor = None;
+            continue;
+        }
+        let base = *anchor.get_or_insert(*point);
+        let radius = point.hacc_m.clamp(2.0, 8.0);
+        if distance_m((base.lat, base.lng), (point.lat, point.lng)) <= radius {
+            (point.lat, point.lng) = (base.lat, base.lng);
+        }
+    }
+}
 
 /// 一个采样点。字段单位与文件里的原始整数一一对应，转换放在编码时做，
 /// 这样上层（BLE 记录 / GPX / FIT）只要填物理量就行。
@@ -227,23 +279,19 @@ fn write_motion(out: &mut Vec<u8>, p: &TrackPoint) {
 /// 和设备下来的数据长得一模一样。
 ///
 /// `start_unix_ms` 是首个采样点的 UTC 毫秒，后面每个点按 iTOW 的增量推时间——
-/// iTOW 跨周会回绕，所以差值超过半周就补（减）一整周。
+/// 对相邻点逐段累计，跨周时补足周长，倒序点不会让日期时间回退。
 pub fn records_from_points(points: &[TrackPoint], start_unix_ms: i64) -> Vec<Record> {
-    const WEEK_MS: i64 = 7 * 86_400_000;
     if points.is_empty() {
         return Vec::new();
     }
-    let first = points[0].itow as i64;
+    let mut previous = points[0].itow;
+    let mut elapsed = 0;
     points
         .iter()
         .map(|p| {
-            let mut delta = p.itow as i64 - first;
-            if delta < -WEEK_MS / 2 {
-                delta += WEEK_MS;
-            } else if delta > WEEK_MS / 2 {
-                delta -= WEEK_MS;
-            }
-            let unix_ms = start_unix_ms + delta;
+            elapsed += tow_delta(previous, p.itow).max(0);
+            previous = p.itow;
+            let unix_ms = start_unix_ms + elapsed;
             let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(unix_ms)
                 .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
             record_from_point(p, unix_ms, dt)
@@ -569,6 +617,7 @@ fn track_setpoint(
     }
     let mut started = false;
     let mut start_itow = 0i64;
+    let mut elapsed = 0i64;
     let mut start_at = run.start;
     let mut start_ll = (0.0f64, 0.0f64);
     let mut start_alt = 0.0f64;
@@ -581,11 +630,17 @@ fn track_setpoint(
     if run.start == 0 && filtered_mmps(&points[0]) > start_th {
         started = true;
         start_at = 0;
-        start_itow = points[0].itow as i64;
         start_ll = (points[0].lat, points[0].lng);
         start_alt = points[0].alt;
     }
     for i in from..=run.end {
+        let dt = tow_delta(points[i - 1].itow, points[i].itow);
+        if dt <= 0 {
+            started = false;
+            continue;
+        }
+        let previous_time = elapsed;
+        elapsed += dt;
         let prev = filtered_mmps(&points[i - 1]);
         let new = filtered_mmps(&points[i]);
         if !started {
@@ -600,8 +655,7 @@ fn track_setpoint(
                 } else {
                     0.0
                 };
-                let dt = points[i].itow as i64 - points[i - 1].itow as i64;
-                start_itow = points[i - 1].itow as i64 + (dt as f64 * frac) as i64;
+                start_itow = previous_time + (dt as f64 * frac) as i64;
                 // 距离和坡度也从真实穿越点算，不能仍从前一采样点起算。
                 start_ll = (
                     points[i - 1].lat + (points[i].lat - points[i - 1].lat) * frac,
@@ -613,8 +667,7 @@ fn track_setpoint(
         }
         if prev <= end_th && end_th <= new && prev < new {
             let frac = (end_th - prev) / (new - prev);
-            let dt = points[i].itow as i64 - points[i - 1].itow as i64;
-            let end_itow = points[i - 1].itow as i64 + (dt as f64 * frac) as i64;
+            let end_itow = previous_time + (dt as f64 * frac) as i64;
             let dist = distance_m(start_ll, (points[i].lat, points[i].lng));
             let slope = if dist > 0.0 {
                 (points[i].alt - start_alt) * 100.0 / dist
@@ -1387,6 +1440,36 @@ mod tests {
         // 恰好在第 1 秒命中，因此成绩应是 500 ms，而不是旧实现的 1000 ms。
         let result = track_setpoint(&pts, &run, 54.0, 72.0).expect("应命中目标速度");
         assert_eq!(result.time_ms, 500);
+    }
+
+    #[test]
+    fn setpoint_and_import_cross_gps_week() {
+        let mut points = [sample(0), sample(1), sample(2)];
+        for (i, point) in points.iter_mut().enumerate() {
+            point.itow = (GPS_WEEK_MS - 1000 + i as i64 * 1000)
+                .rem_euclid(GPS_WEEK_MS) as u32;
+            point.speed_mmps = 10_000 + i as u32 * 10_000;
+        }
+        let result = track_setpoint(&points, &Run { start: 0, end: 2 }, 54.0, 72.0).unwrap();
+        assert_eq!(result.time_ms, 500);
+        let records = records_from_points(&points, 1_700_000_000_000);
+        assert_eq!(records[2].second, records[0].second + 2);
+        assert_eq!(tow_delta(100, 90), -10);
+    }
+
+    #[test]
+    fn cloud_filter_preserves_ramp_and_freezes_small_stationary_drift() {
+        let mut points = [sample(0), sample(1), sample(2), sample(3), sample(4)];
+        for (point, speed) in points.iter_mut().zip([0, 50_000, 0, 400, 800]) {
+            point.speed_mmps = speed;
+        }
+        points[1].lat = points[0].lat + 0.00001;
+        let moving_lat = points[3].lat;
+        clean_cloud_points(&mut points);
+        assert_eq!(points[1].speed_mmps, 0);
+        assert_eq!(points[1].lat, points[0].lat);
+        assert_eq!(points[3].lat, moving_lat);
+        assert_eq!(points[3].speed_mmps, 400);
     }
 
     #[test]
