@@ -102,11 +102,13 @@ pub fn session_bytes(
     records: &[Record],
     device_serial: u64,
     tz_offset_min: i16,
+    segment_index: u32,
 ) -> Option<(Vec<u8>, usize)> {
     let first = records.first()?;
     let mut points: Vec<TrackPoint> = records.iter().map(record_to_point).collect();
     session::clean_cloud_points(&mut points);
     let meta = SessionMeta {
+        index_in_day: segment_index.clamp(1, u8::MAX.into()) as u8,
         session_id: new_session_id(),
         utc: (
             first.year as i32,

@@ -165,6 +165,8 @@ pub struct TrackPoint {
 
 /// 会话头部的元信息。
 pub struct SessionMeta {
+    /// 云端会话列表显示的一基序号。
+    pub index_in_day: u8,
     /// 12 字节会话 id，云端返回的 id 就是它的十六进制。
     pub session_id: [u8; 12],
     /// UTC 起始时间 (年, 月, 日, 时, 分, 秒)。
@@ -842,7 +844,7 @@ pub fn encode_session(points: &[TrackPoint], meta: &SessionMeta) -> Option<Vec<u
     write_u16(&mut h, 10, suffix.len() as u16); // FileSuffixLength
     write_u32(&mut h, 12, body.len() as u32);
     h[16] = SESSION_TYPE_DRAG;
-    h[17] = 1; // IndexInTheDay
+    h[17] = meta.index_in_day;
     h[18] = 0; // SensorRecordsTimeDelta
     h[19] = 0;
     write_u32(&mut h, 20, n_sensor);
@@ -1002,6 +1004,7 @@ mod tests {
 
     fn meta() -> SessionMeta {
         SessionMeta {
+            index_in_day: 7,
             session_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             utc: (2026, 8, 18, 0, 12, 50),
             tz_offset_min: 480,
@@ -1048,7 +1051,7 @@ mod tests {
         assert_eq!(hl, 96 + n * 12, "Drag 头长应为 96 + 12N");
         assert_eq!(u16::from_le_bytes([blob[4], blob[5]]) as usize, hl);
         assert_eq!(blob[16], 0, "会话类型应为 Drag");
-        assert_eq!(blob[17], 1, "IndexInTheDay");
+        assert_eq!(blob[17], 7, "IndexInTheDay");
         assert_eq!(blob[68], DRAG_MODE_SPEED_METRIC);
         assert_eq!(blob[70] as usize, n, "目标点数量");
 

@@ -74,6 +74,17 @@ fn main() {
     }
 
     let result = if cfg!(windows) {
+        // 本机的 VS 内置 SDK 可能没有注册到 Windows Kits。优先使用开发环境
+        // 已经放进 PATH 的资源编译器，再交给 winres 从注册表找正式 SDK。
+        println!("cargo:rerun-if-env-changed=PATH");
+        if let Some(dir) = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .find(|dir| dir.is_absolute() && dir.join("rc.exe").is_file())
+            .and_then(|dir| dir.into_os_string().into_string().ok())
+        {
+            res.set_toolkit_path(&dir);
+        }
         res.compile()
     } else if let Some(shim) = prepare_rc_shim(&out_dir) {
         res.set_toolkit_path(shim.to_str().unwrap_or("."));

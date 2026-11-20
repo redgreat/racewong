@@ -63,7 +63,12 @@ impl DataSink for RaceBoxSink {
     ) -> SinkResult {
         let (device_serial, serial_source) = self.serial_for(session);
         let (bytes, runs) =
-            crate::racebox::session_bytes(&session.records, device_serial, self.tz_offset_min)
+            crate::racebox::session_bytes(
+                &session.records,
+                device_serial,
+                self.tz_offset_min,
+                session.session_index,
+            )
                 .ok_or_else(|| {
                     SinkError::cloud(
                         t!("这一段没有有效记录", "segment has no valid record"),

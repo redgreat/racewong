@@ -698,22 +698,6 @@ impl App {
                 UiEvent::ReplayDone => {
                     self.replay_busy = false;
                     self.spool_pending = crate::sink::spool::pending_count();
-                    if self.cfg.notifications {
-                        crate::desktop::notify(
-                            t!("缓存重传完成", "Cached uploads finished").to_string(),
-                            if self.spool_pending == 0 {
-                                t!("待上传缓存已全部处理", "All cached uploads were processed")
-                                    .to_string()
-                            } else {
-                                tr!(
-                                    "仍有 {} 个缓存等待重传",
-                                    "{} cached upload(s) still pending",
-                                    self.spool_pending
-                                )
-                            },
-                            self.window_handle,
-                        );
-                    }
                 }
                 UiEvent::RunStats(stats) => self.run_stats = Some(stats),
                 UiEvent::Finished {
@@ -731,17 +715,8 @@ impl App {
                     } else {
                         Phase::Failed
                     };
-                    if self.cfg.notifications && !cancelled {
-                        crate::desktop::notify(
-                            if ok {
-                                t!("RaceBox 任务完成", "RaceBox task completed").to_string()
-                            } else {
-                                t!("RaceBox 任务失败", "RaceBox task failed").to_string()
-                            },
-                            summary.clone(),
-                            self.window_handle,
-                        );
-                    }
+                    // 完成后再计冷却时间，避免恢复窗口时新任务立刻覆盖结果。
+                    self.next_auto_sync = Instant::now() + Duration::from_secs(5 * 60);
                     self.last_summary = summary;
                     self.erase_percent = None;
                     if !ok {
@@ -923,7 +898,7 @@ impl App {
             tr!("任务开始: {}", "task started: {}", mode_text(mode)),
         );
         let cfg = Arc::new(self.cfg.clone());
-        let tx = self.tx.clone();
+        let tx = self.background_events();
         let runtime = self.runtime.clone();
         let cancel = self.cancel_flag.clone();
         runtime.spawn(async move {
@@ -998,7 +973,7 @@ impl App {
             ),
         );
         let cfg = Arc::new(self.cfg.clone());
-        let tx = self.tx.clone();
+        let tx = self.background_events();
         let runtime = self.runtime.clone();
         let cancel = self.cancel_flag.clone();
         runtime.spawn(async move {
@@ -1939,7 +1914,7 @@ impl App {
             t!("开始重传本地缓存…", "replaying cached segments…").to_string(),
         );
         let cfg = Arc::new(self.cfg.clone());
-        let tx = self.tx.clone();
+        let tx = self.background_events();
         let cancel = self.cancel_flag.clone();
         cancel.store(false, Ordering::SeqCst);
         self.runtime.spawn(async move {
@@ -1948,6 +1923,56 @@ impl App {
         if let Some(ctx) = self.ctx.clone() {
             ctx.request_repaint();
         }
+    }
+
+    /// 即使窗口没有绘制帧，也在后台消费完成事件并发送通知。
+    fn background_events(&self) -> UnboundedSender<UiEvent> {
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let ui = self.tx.clone();
+        let ctx = self.ctx.clone();
+        let notifications = self.cfg.notifications;
+        let window = self.window_handle;
+        self.runtime.spawn(async move {
+            while let Some(event) = events.recv().await {
+                if notifications {
+                    let notice = match &event {
+                        UiEvent::Finished { ok, summary, cancelled: false } => Some((
+                            if *ok {
+                                t!("RaceBox 任务完成", "RaceBox task completed")
+                            } else {
+                                t!("RaceBox 任务失败", "RaceBox task failed")
+                            },
+                            summary.clone(),
+                        )),
+                        UiEvent::ReplayDone => {
+                            let pending = crate::sink::spool::pending_count();
+                            Some((
+                                t!("缓存重传完成", "Cached uploads finished"),
+                                if pending == 0 {
+                                    t!("待上传缓存已全部处理", "All cached uploads were processed").to_string()
+                                } else {
+                                    tr!("仍有 {} 个缓存等待重传", "{} cached upload(s) still pending", pending)
+                                },
+                            ))
+                        }
+                        _ => None,
+                    };
+                    if let Some((title, body)) = notice {
+                        crate::desktop::notify(title.to_string(), body, window);
+                    }
+                }
+                let finished = matches!(&event, UiEvent::Finished { .. } | UiEvent::ReplayDone);
+                if ui.send(event).is_err() {
+                    break;
+                }
+                if finished {
+                    if let Some(ctx) = &ctx {
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        });
+        sender
     }
 
     fn run_background_tasks(&mut self) {
