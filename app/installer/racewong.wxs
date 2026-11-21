@@ -39,6 +39,7 @@
     </Condition>
 
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <Property Id="PRIMARYFOLDER" Value="INSTALLFOLDER" />
     <!-- 完成页的“安装完成后启动”复选框，默认勾上 -->
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="安装完成后启动 RaceBox同步" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
@@ -208,7 +209,7 @@
            （Id / 类型 / 坐标 / 文案），只在末尾多了勾选框和一行说明。
            按钮“点去哪一页”由上面那批 Publish 按 Dialog + Control 的 Id 挂上去，
            原有控件 Id 一个都不能改。 -->
-      <Dialog Id="RaceBoxInstallDirDlg" Width="370" Height="270" Title="!(loc.InstallDirDlg_Title)">
+      <Dialog Id="RaceBoxInstallDirDlg" Width="370" Height="270" TrackDiskSpace="yes" Title="!(loc.InstallDirDlg_Title)">
         <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)" />
         <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)" />
         <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
@@ -224,17 +225,20 @@
         <Control Id="FolderLabel" Type="Text" X="20" Y="60" Width="290" Height="30" NoPrefix="yes" Text="!(loc.InstallDirDlgFolderLabel)" />
         <Control Id="Folder" Type="PathEdit" X="20" Y="100" Width="320" Height="18" Property="WIXUI_INSTALLDIR" Indirect="yes" />
         <Control Id="ChangeFolder" Type="PushButton" X="20" Y="120" Width="56" Height="17" Text="!(loc.InstallDirDlgChange)" />
-        <Control Id="DiskSpace" Type="PushButton" X="84" Y="120" Width="75" Height="17" Text="磁盘空间(&amp;S)">
-          <Publish Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1">1</Publish>
-          <Publish Event="SpawnDialog" Value="DiskCostDlg" Order="2">1</Publish>
-        </Control>
+        <!-- MSI 的磁盘数据以 512 字节为单位，交给 FormatSize 显示可读容量。 -->
+        <Control Id="SpaceRequiredLabel" Type="Text" X="20" Y="146" Width="62" Height="13" Text="所需空间：" />
+        <Control Id="SpaceRequiredValue" Type="Text" X="82" Y="146" Width="260" Height="13"
+                 FormatSize="yes" Text="[PrimaryVolumeSpaceRequired] " />
+        <Control Id="SpaceAvailableLabel" Type="Text" X="20" Y="161" Width="62" Height="13" Text="可用空间：" />
+        <Control Id="SpaceAvailableValue" Type="Text" X="82" Y="161" Width="260" Height="13"
+                 FormatSize="yes" Text="[PrimaryVolumeSpaceAvailable] " />
 
         <!-- 新增：桌面快捷方式。CheckBoxValue 是"勾上时写进属性的值"，
              取消勾选时 MSI 会把 DESKTOPSHORTCUT 清空（不是置 0），
              所以组件条件写的是 DESKTOPSHORTCUT = 1。 -->
-        <Control Id="DesktopShortcutCheckBox" Type="CheckBox" X="20" Y="150" Width="330" Height="17"
+        <Control Id="DesktopShortcutCheckBox" Type="CheckBox" X="20" Y="185" Width="330" Height="17"
                  Text="创建桌面快捷方式" Property="DESKTOPSHORTCUT" CheckBoxValue="1" />
-        <Control Id="DesktopShortcutHint" Type="Text" X="36" Y="170" Width="314" Height="15"
+        <Control Id="DesktopShortcutHint" Type="Text" X="36" Y="205" Width="314" Height="15"
                  NoPrefix="yes" Transparent="yes"
                  Text="取消勾选则只在开始菜单里放一个入口，桌面保持干净。" />
       </Dialog>
