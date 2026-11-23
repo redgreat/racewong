@@ -148,6 +148,31 @@ pub async fn unsubscribe(peripheral: &Peripheral, characteristic: &Characteristi
     let _ = peripheral.unsubscribe(characteristic).await;
 }
 
+/// 读取连接后发出的实时帧，历史轨迹中的电量不能代表当前电量。
+pub async fn read_battery(peripheral: &Peripheral, tx: &Characteristic) -> Option<u8> {
+    let mut stream = notification_stream(peripheral).await.ok()?;
+    subscribe(peripheral, tx).await.ok()?;
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut frames = crate::protocol::FrameReader::new();
+        while let Some(data) = stream.next().await {
+            if data.uuid != tx.uuid {
+                continue;
+            }
+            frames.push(&data.value);
+            while let Some(frame) = frames.next_packet() {
+                if frame.class == 0xff && frame.id == crate::protocol::MSG_RECORD_LIVE {
+                    if let Some(percent) = crate::protocol::live_battery(&frame.payload) {
+                        return Some(percent);
+                    }
+                }
+            }
+        }
+        None
+    }).await.ok().flatten();
+    unsubscribe(peripheral, tx).await;
+    result
+}
+
 pub async fn notification_stream(peripheral: &Peripheral) -> Result<NotificationStream, String> {
     peripheral
         .notifications()

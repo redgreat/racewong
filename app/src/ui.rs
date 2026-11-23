@@ -253,6 +253,7 @@ pub struct App {
     sessions: Vec<SessionRow>,
     phase: Phase,
     device_name: String,
+    battery: Option<u8>,
     device_address: String,
     status: Option<DeviceStatus>,
     received: usize,
@@ -367,6 +368,7 @@ impl App {
             sessions: Vec::new(),
             phase: Phase::Idle,
             device_name: String::new(),
+            battery: None,
             device_address: String::new(),
             status: None,
             received: 0,
@@ -627,7 +629,9 @@ impl App {
                     }
                     self.push_log(level, msg);
                 }
+                UiEvent::Battery(percent) => self.battery = Some(percent),
                 UiEvent::DeviceFound { name, address } => {
+                    self.battery = None;
                     self.device_name = name;
                     self.device_address = address;
                 }
@@ -1612,7 +1616,8 @@ impl App {
         // 跑的过程中也要出这张卡：实时速度、各通道状态都摆在这里，
         // 等任务结束才显示的话，「实时」两个字就没意义了。
         let live = self.running
-            && (downloading
+            && (self.battery.is_some()
+                || downloading
                 || self.uploaded > 0
                 || !self.channels.is_empty()
                 || erase_percent.is_some());
@@ -1636,11 +1641,24 @@ impl App {
             style::card(p).show(ui, |ui| {
                 style::fill_card_width(ui);
                 ui.horizontal(|ui| {
-                    style::card_title(ui, p, t!("运行结果", "Result"));
+                    let title = match self.current_mode {
+                        Some(RunMode::Status) => t!("状态查询", "Status query"),
+                        Some(RunMode::Sync) if self.running => self.phase.text(),
+                        _ => t!("运行结果", "Result"),
+                    };
+                    style::card_title(ui, p, title);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.colored_label(p.muted, &device_line);
+                        if self.current_mode != Some(RunMode::Import) {
+                            if let Some(percent) = self.battery {
+                                style::battery_badge(ui, p, percent);
+                            }
+                        }
                     });
                 });
+                if connected && self.current_mode != Some(RunMode::Import) {
+                    ui.add_space(3.0);
+                    ui.colored_label(p.muted, &device_line);
+                }
 
                 // ---------- ① 结论横幅：放最上面 ----------
                 // 跑完第一眼要看的是「成没成」，条数、耗时这些明细排在它后面。
@@ -1719,7 +1737,7 @@ impl App {
                         cells.push((
                             t!("解析", "Parsed"),
                             tr!("{} 条", "{} rec", downloaded),
-                            p.text,
+                            p.info,
                         ));
                         cells.push((
                             t!("已上传", "Uploaded"),
@@ -1730,7 +1748,7 @@ impl App {
                         cells.push((
                             t!("下载", "Downloaded"),
                             tr!("{} 条", "{} rec", downloaded),
-                            p.text,
+                            p.info,
                         ));
                         cells.push((
                             t!("已同步", "Uploaded"),
@@ -1743,28 +1761,13 @@ impl App {
                             erase_color,
                         ));
                     }
-                    cells.push((t!("上传速度", "Upload speed"), speed_text, p.text));
+                    cells.push((t!("上传速度", "Upload speed"), speed_text, p.info));
                     cells.push((
                         t!("总耗时", "Total time"),
                         fmt_dur(Duration::from_secs_f64(total_secs)),
                         p.text,
                     ));
-                    let cols = cells.len();
-                    let grid_w = (ui.available_width() - (cols as f32 - 1.0) * 16.0) / cols as f32;
-                    egui::Grid::new("run_summary_grid")
-                        .num_columns(cols)
-                        .min_col_width(grid_w.max(90.0))
-                        .spacing([16.0, 6.0])
-                        .show(ui, |ui| {
-                            for (label, value, color) in cells {
-                                ui.vertical(|ui| {
-                                    ui.colored_label(p.muted, label);
-                                    ui.label(
-                                        egui::RichText::new(value).strong().size(16.0).color(color),
-                                    );
-                                });
-                            }
-                        });
+                    style::metric_tiles(ui, p, &cells);
                 }
 
                 // ---------- ④ 各通道状态：一行文字，不带进度条 ----------
@@ -1804,15 +1807,9 @@ impl App {
                     ui.colored_label(p.muted, t!("各阶段耗时", "Time per phase"));
                     ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
-                        for (i, (name, d)) in self.phase_times.iter().enumerate() {
-                            if i > 0 {
-                                ui.add_space(6.0);
-                                ui.colored_label(p.muted, "·");
-                                ui.add_space(6.0);
-                            }
-                            ui.colored_label(p.muted, name.text());
-                            ui.add_space(4.0);
-                            ui.label(egui::RichText::new(fmt_dur(*d)).strong().color(p.text));
+                        for (name, d) in &self.phase_times {
+                            let label = format!("{}  {}", name.text(), fmt_dur(*d));
+                            style::status_pill(ui, p, p.muted, &label, 230.0);
                         }
                     });
                 }
@@ -1820,7 +1817,6 @@ impl App {
                 // 设备状态网格（查询成功后出现）
                 if let Some(s) = &self.status {
                     ui.add_space(12.0);
-                    let grid_w = (ui.available_width() - 3.0 * 16.0) / 4.0;
                     let rec_text = if s.recording {
                         t!("是", "yes")
                     } else {
@@ -1834,28 +1830,12 @@ impl App {
                     } else {
                         t!("未启用", "disabled")
                     };
-                    egui::Grid::new("status_grid")
-                        .num_columns(4)
-                        .min_col_width(grid_w.max(90.0))
-                        .spacing([16.0, 10.0])
-                        .show(ui, |ui| {
-                            for (label, value) in [
-                                (t!("录制", "Recording"), rec_text),
-                                (t!("内存", "Memory"), mem_text.as_str()),
-                                (t!("已存", "Stored"), stored_text.as_str()),
-                                (t!("安全锁", "Lock"), lock_text),
-                            ] {
-                                ui.vertical(|ui| {
-                                    ui.colored_label(p.muted, label);
-                                    ui.label(
-                                        egui::RichText::new(value)
-                                            .strong()
-                                            .size(16.0)
-                                            .color(p.text),
-                                    );
-                                });
-                            }
-                        });
+                    style::metric_tiles(ui, p, &[
+                        (t!("录制", "Recording"), rec_text.into(), if s.recording { p.success } else { p.muted }),
+                        (t!("内存", "Memory"), mem_text, if s.memory_level >= 80 { p.warn } else { p.info }),
+                        (t!("已存", "Stored"), stored_text, p.info),
+                        (t!("安全锁", "Lock"), lock_text.into(), if s.security_enabled { p.success } else { p.muted }),
+                    ]);
                 }
 
                 // 本次数据段（最新的在最上面）
@@ -1966,9 +1946,13 @@ impl App {
         let window = self.window_handle;
         self.runtime.spawn(async move {
             let mut downloaded = None;
+            let mut battery = None;
             while let Some(event) = events.recv().await {
                 if let UiEvent::RunStats(stats) = &event {
                     downloaded = Some(stats.downloaded);
+                }
+                if let UiEvent::Battery(percent) = &event {
+                    battery = Some(*percent);
                 }
                 if notifications {
                     let notice = match &event {
@@ -1995,7 +1979,12 @@ impl App {
                         }
                         _ => None,
                     };
-                    if let Some((title, body)) = notice {
+                    if let Some((title, mut body)) = notice {
+                        if let (UiEvent::Finished { ok: true, .. }, Some(percent @ 0..=19)) = (&event, battery) {
+                            if downloaded.is_some() {
+                                body.push_str(&format!("\n{} {percent}%. {}", t!("电量", "Battery"), t!("请充电", "Please charge the device")));
+                            }
+                        }
                         crate::desktop::notify(title.to_string(), body, window);
                     }
                 }

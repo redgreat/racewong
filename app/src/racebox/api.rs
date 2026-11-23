@@ -117,6 +117,57 @@ pub struct CloudClient {
     auth: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct CloudSessionList {
+    #[serde(default)]
+    error_code: i32,
+    sessions: Vec<CloudSessionIndex>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudSessionIndex {
+    pub device_serial_number: Option<u64>,
+    pub index_in_the_day: Option<u8>,
+    #[serde(rename = "dateTimeStartedUTC", alias = "dateTimeStartedUtc")]
+    pub started: Option<serde_json::Value>,
+    #[serde(rename = "timeZoneOffset", alias = "timezoneOffset")]
+    pub tz_offset_minutes: Option<i16>,
+}
+
+impl CloudSessionIndex {
+    pub fn started_at(&self) -> Option<i64> {
+        let value = self.started.as_ref()?;
+        if let Some(timestamp) = value.as_i64() {
+            // 数值时间戳可用秒或毫秒表示，统一到毫秒排序。
+            return Some(if timestamp.unsigned_abs() < 100_000_000_000 {
+                timestamp * 1000
+            } else {
+                timestamp
+            });
+        }
+        let text = value.as_str()?;
+        if let Ok(date) = chrono::DateTime::parse_from_rfc3339(text) {
+            return Some(date.timestamp_millis());
+        }
+        chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f")
+            .ok()
+            .map(|date| date.and_utc().timestamp_millis())
+    }
+}
+
+#[test]
+fn cloud_session_index_decodes_utc_timestamp_and_sequence() {
+    let item: CloudSessionIndex = serde_json::from_value(serde_json::json!({
+        "deviceSerialNumber": 123,
+        "indexInTheDay": 19,
+        "dateTimeStartedUTC": "2026-11-23T00:05:00Z"
+    })).unwrap();
+    assert_eq!(item.device_serial_number, Some(123));
+    assert_eq!(item.index_in_the_day, Some(19));
+    assert_eq!(item.started_at(), Some(1_795_392_300_000));
+}
+
 impl CloudClient {
     pub fn new(auth: Option<String>) -> Self {
         // 官方 App（反编译 `BaseApiClient.PrepareRequestMessage`）对 racebox.pro 的
@@ -207,6 +258,25 @@ impl CloudClient {
     ///
     /// `if_unmodified_since` 用文件的修改时间（RFC1123），服务端拿它做增量判断；
     /// 不传也能成功，但保持和 App 一致更稳妥。
+    /// 空变更列表只读取云端元数据，不修改手机上传的会话。
+    pub async fn session_indices(&self) -> Result<Vec<CloudSessionIndex>, CloudError> {
+        let cookie = self.cookie_header().ok_or_else(|| CloudError::permanent("尚未登录"))?;
+        let response = self.http.post(format!("{BASE}session/syncmeta"))
+            .header("Cookie", cookie)
+            .json(&serde_json::json!({"lastSynced": 0, "sessions": []}))
+            .send().await.map_err(|e| CloudError::transient(format!("读取云会话列表失败: {e}")))?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(CloudError::from_status(status, format!("读取云会话列表失败 (HTTP {status})")));
+        }
+        let response: CloudSessionList = response.json().await
+            .map_err(|e| CloudError::transient(format!("无法解析云会话列表: {e}")))?;
+        if response.error_code != 0 {
+            return Err(CloudError::permanent("云端拒绝读取会话列表"));
+        }
+        Ok(response.sessions)
+    }
+
     pub async fn upload_session(
         &self,
         bytes: Vec<u8>,

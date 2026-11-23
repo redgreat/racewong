@@ -10,6 +10,46 @@ use crate::racebox::CloudClient;
 use crate::sink::{DataSink, Session, SinkError, SinkResult};
 use crate::t;
 use async_trait::async_trait;
+use chrono::{NaiveDate, TimeDelta, Utc};
+
+fn recording_day(utc: chrono::DateTime<Utc>, offset_minutes: i16) -> Option<NaiveDate> {
+    utc.naive_utc()
+        .checked_add_signed(TimeDelta::minutes(i64::from(offset_minutes)))
+        .map(|local| local.date())
+}
+
+fn highest_index(
+    sessions: &[crate::racebox::api::CloudSessionIndex],
+    serial: u64,
+    day: NaiveDate,
+    default_offset: i16,
+) -> u8 {
+    sessions.iter()
+        .filter(|item| serial == 0 || item.device_serial_number == Some(serial))
+        .filter_map(|item| {
+            let utc = chrono::DateTime::from_timestamp_millis(item.started_at()?)?;
+            let offset = item.tz_offset_minutes.unwrap_or(default_offset);
+            (recording_day(utc, offset)? == day).then_some(item.index_in_the_day?)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+#[test]
+fn sequence_restarts_at_recording_timezone_midnight() {
+    let sessions = serde_json::from_value::<Vec<crate::racebox::api::CloudSessionIndex>>(
+        serde_json::json!([
+            {"deviceSerialNumber": 1, "indexInTheDay": 19, "dateTimeStartedUTC": "2026-11-22T15:59:59Z"},
+            {"deviceSerialNumber": 1, "indexInTheDay": 3, "dateTimeStartedUTC": "2026-11-22T16:00:00Z"},
+            {"deviceSerialNumber": 1, "indexInTheDay": 2, "dateTimeStartedUTC": "2026-11-22T17:00:00Z"},
+            {"deviceSerialNumber": 2, "indexInTheDay": 99, "dateTimeStartedUTC": "2026-11-22T16:00:00Z"}
+        ]),
+    ).unwrap();
+    let day = |d| NaiveDate::from_ymd_opt(2026, 11, d).unwrap();
+    assert_eq!(highest_index(&sessions, 1, day(22), 480) + 1, 20);
+    assert_eq!(highest_index(&sessions, 1, day(23), 480) + 1, 4);
+    assert_eq!(highest_index(&sessions, 1, day(24), 480) + 1, 1);
+}
 
 pub struct RaceBoxSink {
     client: CloudClient,
@@ -18,6 +58,7 @@ pub struct RaceBoxSink {
     /// 本地文件导入时 `Session.device` 是文件名，解析不出序列号就靠它。
     fallback_serial: u64,
     tz_offset_min: i16,
+    indices: tokio::sync::Mutex<std::collections::HashMap<(u64, NaiveDate), u8>>,
 }
 
 impl RaceBoxSink {
@@ -29,6 +70,7 @@ impl RaceBoxSink {
                 .and_then(crate::racebox::serial_from_device_name)
                 .unwrap_or(0),
             tz_offset_min: cfg.tz_offset_min,
+            indices: Default::default(),
         }
     }
 
@@ -62,12 +104,31 @@ impl DataSink for RaceBoxSink {
         progress: &(dyn Fn(usize) + Send + Sync),
     ) -> SinkResult {
         let (device_serial, serial_source) = self.serial_for(session);
+        let first = session.records.first().ok_or_else(|| SinkError::cloud(
+            t!("这一段没有有效记录", "segment has no valid record"), false,
+        ))?;
+        let day = NaiveDate::from_ymd_opt(i32::from(first.year), first.month.into(), first.day.into())
+            .and_then(|date| date.and_hms_opt(first.hour.into(), first.minute.into(), first.second.into()))
+            .and_then(|utc| recording_day(utc.and_utc(), self.tz_offset_min))
+            .ok_or_else(|| SinkError::cloud("会话起始时间无效，无法按日编号", false))?;
+        let key = (device_serial, day);
+        // 序列化云上传，避免两个并行的数据段拿到同一个序号。
+        let mut indices = self.indices.lock().await;
+        let index = if let Some(&last) = indices.get(&key) {
+            last
+        } else {
+            let sessions = self.client.session_indices().await
+                .map_err(|e| SinkError::cloud(e.msg, e.retry))?;
+            highest_index(&sessions, device_serial, day, self.tz_offset_min)
+        };
+        let next_index = index.checked_add(1)
+            .ok_or_else(|| SinkError::cloud("当天会话序号已达 255，无法分配新号", false))?;
         let (bytes, runs) =
             crate::racebox::session_bytes(
                 &session.records,
                 device_serial,
                 self.tz_offset_min,
-                session.session_index,
+                u32::from(next_index),
             )
                 .ok_or_else(|| {
                     SinkError::cloud(
@@ -83,6 +144,7 @@ impl DataSink for RaceBoxSink {
             .upload_session(bytes, &stamp)
             .await
             .map_err(|e| SinkError::cloud(e.msg, e.retry))?;
+        indices.insert(key, next_index);
 
         progress(session.records.len());
         // 明确写出类型和跑次：云端按类型分列表，Drag 列表只展示「有跑次」的会话，

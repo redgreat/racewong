@@ -13,6 +13,25 @@ pub const CLASS_FF: u8 = 0xFF;
 pub const MSG_DOWNLOAD_START: u8 = 0x23;
 pub const MSG_RECORD_HISTORY: u8 = 0x21;
 pub const MSG_RECORD_LIVE: u8 = 0x01;
+
+/// 实时帧的电量不依赖 GPS 定位，最高位是充电标志。
+pub fn live_battery(payload: &[u8]) -> Option<u8> {
+    if payload.len() != 80 {
+        return None;
+    }
+    let percent = payload[67] & 0x7f;
+    (percent <= 100).then_some(percent)
+}
+
+#[test]
+fn live_battery_reads_charging_bit_and_validates_range() {
+    let mut frame = [0; 80];
+    frame[67] = 0x80 | 19;
+    assert_eq!(live_battery(&frame), Some(19));
+    frame[67] = 127;
+    assert_eq!(live_battery(&frame), None);
+    assert_eq!(live_battery(&frame[..67]), None);
+}
 pub const MSG_SESSION_BOUNDARY: u8 = 0x26;
 pub const MSG_ACK: u8 = 0x02;
 pub const MSG_NACK: u8 = 0x03;

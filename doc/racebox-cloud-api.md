@@ -143,7 +143,7 @@ Cookie: racebox-api-auth=<token>
 | 0x0a | 2 | FileSuffixLength（本实现 0，不写圈事件） |
 | 0x0c | 4 | SensorsDataLength |
 | 0x10 | 1 | Type：**0=直线加速（Drag），1=赛道（Track）**。本实现固定 0（见下） |
-| 0x11 | 1 | IndexInTheDay（桌面端写入本轮的会话段序号，从 1 开始，上限 255） |
+| 0x11 | 1 | IndexInTheDay（按设备与录制开始的本地日期分组，当日接续云端最大号，无记录时从 1 开始） |
 | 0x12 | 1 | SensorRecordsTimeDelta |
 | 0x13 | 1 | 保留 0 |
 | 0x14 | 4 | NumberOfSensorRecords |

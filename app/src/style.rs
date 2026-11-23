@@ -54,6 +54,55 @@ pub struct Palette {
     pub info: Color32,
 }
 
+/// 电池轮廓、正极和电量填充；百分比始终使用可读的主题文字色。
+pub fn battery_badge(ui: &mut egui::Ui, p: &Palette, percent: u8) {
+    let color = if percent < 20 { p.error } else { p.success };
+    ui.horizontal(|ui| {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(27.0, 15.0), egui::Sense::hover());
+        let body = egui::Rect::from_min_size(rect.min, egui::vec2(23.0, 15.0));
+        let painter = ui.painter();
+        painter.rect_stroke(body, 4.0, Stroke::new(1.2_f32, p.muted), egui::StrokeKind::Inside);
+        painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(body.right() + 1.0, body.center().y - 3.0), egui::vec2(3.0, 6.0)),
+            1.0,
+            p.muted,
+        );
+        let inside = body.shrink(3.0);
+        let width = inside.width() * f32::from(percent.min(100)) / 100.0;
+        painter.rect_filled(egui::Rect::from_min_size(inside.min, egui::vec2(width, inside.height())), 2.0, color);
+        response.on_hover_text(t!("电量", "Battery"));
+        ui.label(egui::RichText::new(format!("{percent}%")).strong().color(if percent < 20 { color } else { p.text }));
+    });
+}
+
+/// 查询和同步结果共用的指标格，窄窗口里自动折行。
+pub fn metric_tiles(ui: &mut egui::Ui, p: &Palette, cells: &[(&str, String, Color32)]) {
+    let gap = 8.0;
+    let available = ui.available_width();
+    let columns = ((available + gap) / (120.0 + gap)).floor().max(1.0) as usize;
+    let columns = columns.min(cells.len()).max(1);
+    let width = (available - gap * (columns - 1) as f32) / columns as f32;
+    for row in cells.chunks(columns) {
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for (label, value, color) in row {
+                egui::Frame::new()
+                    .fill(p.edit_bg)
+                    .stroke(Stroke::new(1.0_f32, p.card_stroke))
+                    .corner_radius(8)
+                    .inner_margin(Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.set_width((width - 22.0).max(0.0));
+                        ui.set_min_height(42.0);
+                        ui.colored_label(p.muted, *label);
+                        ui.label(egui::RichText::new(value).strong().size(16.0).color(*color));
+                    });
+            }
+        });
+    }
+}
+
 pub fn palette(theme: Theme) -> Palette {
     match theme {
         Theme::Dark => Palette {

@@ -9,6 +9,8 @@
 use super::table::{row, Row};
 
 pub const ROWS: &[Row] = &[
+    row("电量", "Battery", "バッテリー", "배터리", "Bateria", "Batería", "Заряд", "Batterie", "Akku", "Batteria"),
+    row("请充电", "Please charge the device", "充電してください", "기기를 충전하세요", "Carregue o dispositivo", "Carga el dispositivo", "Зарядите устройство", "Rechargez l’appareil", "Gerät bitte laden", "Ricarica il dispositivo"),
     row("正在下载…", "Downloading…", "ダウンロード中…", "다운로드 중…", "A baixar…", "Descargando…", "Загрузка…", "Téléchargement…", "Wird heruntergeladen…", "Download in corso…"),
     row("自动同步间隔（分钟）", "Auto-sync interval (minutes)", "自動同期の間隔（分）", "자동 동기화 간격(분)", "Intervalo de sincronização automática (minutos)", "Intervalo de sincronización automática (minutos)", "Интервал автосинхронизации (минуты)", "Intervalle de synchronisation automatique (minutes)", "Intervall der automatischen Synchronisierung (Minuten)", "Intervallo di sincronizzazione automatica (minuti)"),
     row(

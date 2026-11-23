@@ -99,6 +99,7 @@ pub enum NoticeTarget {
 
 #[derive(Clone, Debug)]
 pub enum UiEvent {
+    Battery(u8),
     Phase(Phase),
     Log(LogLevel, String),
     /// 需要用户在同步页立刻看到的结果（测试连接、任务完成情况等）。
@@ -1089,6 +1090,13 @@ async fn run_inner(
         LogLevel::Success,
         t!("设备已连接", "device connected").to_string(),
     ));
+    if matches!(mode, RunMode::Status | RunMode::Sync)
+        && device_name.to_ascii_lowercase().contains("racebox mini")
+    {
+        if let Some(percent) = ble::read_battery(&peripheral, &tx_char).await {
+            let _ = tx.send(UiEvent::Battery(percent));
+        }
+    }
 
     let outcome = async {
         match mode {
