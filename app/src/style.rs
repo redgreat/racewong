@@ -93,10 +93,17 @@ pub fn metric_tiles(ui: &mut egui::Ui, p: &Palette, cells: &[(&str, String, Colo
                     .corner_radius(8)
                     .inner_margin(Margin::symmetric(10, 8))
                     .show(ui, |ui| {
-                        ui.set_width((width - 22.0).max(0.0));
-                        ui.set_min_height(42.0);
-                        ui.colored_label(p.muted, *label);
-                        ui.label(egui::RichText::new(value).strong().size(16.0).color(*color));
+                        // 用整块内容区对齐，让标题和大字号数值共用垂直中心。
+                        ui.allocate_ui_with_layout(
+                            egui::vec2((width - 22.0).max(0.0), 42.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.colored_label(p.muted, *label);
+                                ui.label(
+                                    egui::RichText::new(value).strong().size(16.0).color(*color),
+                                );
+                            },
+                        );
                     });
             }
         });
@@ -282,7 +289,7 @@ pub fn window(p: &Palette) -> egui::Frame {
 /// 同一层里的 Area 会按「最后被点过的」重新排序：遮罩是可交互的，用户点一下
 /// 背景，egui 就把它提到同层最上面——弹窗被压在下面，整窗变灰、点不动也关不掉。
 /// 分到两层之后两者永远不会互换位置。
-pub fn modal_shield(ctx: &egui::Context, p: &Palette) {
+pub fn modal_shield(ctx: &egui::Context, p: &Palette) -> egui::Response {
     let screen = ctx.screen_rect();
     egui::Area::new(egui::Id::new("modal_shield"))
         .order(egui::Order::Middle)
@@ -290,12 +297,14 @@ pub fn modal_shield(ctx: &egui::Context, p: &Palette) {
         .movable(false)
         .anchor(egui::Align2::LEFT_TOP, [0.0, 0.0])
         .show(ctx, |ui| {
-            let (rect, _) = ui.allocate_exact_size(screen.size(), egui::Sense::click_and_drag());
+            let (rect, response) = ui.allocate_exact_size(screen.size(), egui::Sense::click_and_drag());
             // 深色底下压得更狠一点才压得住，浅色稍微透一点不然太脏
             let alpha = if p.is_dark() { 150 } else { 90 };
             ui.painter()
                 .rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, alpha));
-        });
+            response
+        })
+        .inner
 }
 
 /// 卡片容器：统一底色、描边、圆角与内边距。

@@ -3159,8 +3159,9 @@ impl eframe::App for App {
                     });
             });
 
-        // 关于是非模态浮窗，窗口外的主界面可以继续操作。
+        // 关于仍在主窗口内，用遮罩淡化背景并接住窗外点击。
         if self.about_open {
+            let outside_clicked = style::modal_shield(ctx, &p).clicked();
             // 懒加载应用图标纹理（和 exe/窗口图标同款 icon256.png）
             if self.about_icon.is_none() {
                 let bytes = include_bytes!("../assets/icon256.png");
@@ -3181,6 +3182,7 @@ impl eframe::App for App {
             let busy = self.update_busy;
             egui::Window::new(t!("关于", "About"))
                 .id(egui::Id::new("racebox-about"))
+                .order(egui::Order::Foreground)
                 .default_width(320.0)
                 .collapsible(false)
                 .resizable(false)
@@ -3246,7 +3248,7 @@ impl eframe::App for App {
                 ui.add_space(6.0);
 
                 });
-            if !open {
+            if !open || outside_clicked || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.about_open = false;
                 self.update_result = None;
                 self.update_notice_until = None;
