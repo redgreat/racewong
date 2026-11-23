@@ -343,8 +343,8 @@ pub fn launch_installer(path: &std::path::Path) -> Result<(), String> {
         let body = r#"param([int]$AppPid, [string]$Msi, [string]$Log, [string]$Exe)
 $old = Get-Process -Id $AppPid -ErrorAction SilentlyContinue
 if ($old) { $old.WaitForExit() }
-$folder = [IO.Path]::GetDirectoryName($Exe)
-$argsLine = '/i "{0}" /qn /norestart "INSTALLFOLDER={1}" /l*v "{2}"' -f $Msi,$folder,$Log
+# MSI 会从注册表恢复旧安装目录，不需要在命令行再拼接目录属性。
+$argsLine = '/i "{0}" /quiet /norestart /l*v "{1}"' -f $Msi,$Log
 try {
     $code = (Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $argsLine -Wait -PassThru -ErrorAction Stop).ExitCode
 } catch {

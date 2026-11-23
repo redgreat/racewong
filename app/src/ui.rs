@@ -3158,6 +3158,14 @@ impl eframe::App for App {
 
         // 关于窗口：带标题栏（可以用标题栏拖动），点窗口外任意处关闭，
         // 点窗体内部不关（里面还有「检查更新」要按）。
+        if ctx.data_mut(|data| data.remove_temp::<bool>(about_viewport_id().0.with("close"))) == Some(true) {
+            self.about_open = false;
+            self.update_result = None;
+            self.update_notice_until = None;
+        }
+        if ctx.data_mut(|data| data.remove_temp::<bool>(about_viewport_id().0.with("update"))) == Some(true) {
+            self.check_update(false);
+        }
         if self.about_open {
             // 懒加载应用图标纹理（和 exe/窗口图标同款 icon256.png）
             if self.about_icon.is_none() {
@@ -3175,15 +3183,26 @@ impl eframe::App for App {
                 self.update_notice_until = None;
                 self.update_result = None;
             }
-            let close = ctx.show_viewport_immediate(
+            // 独立渲染关于窗口，通过事件通知主窗体执行更新。
+            let icon = self.about_icon.clone();
+            let busy = self.update_busy;
+            let result = self.update_result.clone();
+            let notice_until = self.update_notice_until;
+            ctx.request_repaint_of(about_viewport_id());
+            ctx.show_viewport_deferred(
                 about_viewport_id(),
                 egui::ViewportBuilder::default()
                     .with_title(t!("关于", "About"))
                     .with_inner_size([350.0, 365.0])
                     .with_resizable(false),
-                |ctx, _| {
+                move |ctx, _| {
                     let close = ctx.input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape));
-                    if let Some(until) = self.update_notice_until {
+                    if close {
+                        ctx.data_mut(|data| data.insert_temp(about_viewport_id().0.with("close"), true));
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                        return;
+                    }
+                    if let Some(until) = notice_until {
                         ctx.request_repaint_after(until.saturating_duration_since(Instant::now()));
                     }
                     egui::CentralPanel::default().show(ctx, |ui| {
@@ -3191,7 +3210,7 @@ impl eframe::App for App {
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                         ui.vertical_centered(|ui| {
                             // 应用图标
-                            if let Some(tex) = &self.about_icon {
+                            if let Some(tex) = &icon {
                                 ui.add(egui::Image::new((tex.id(), egui::vec2(52.0, 52.0))));
                             } else {
                                 ui.add(egui::Label::new(
@@ -3218,19 +3237,19 @@ impl eframe::App for App {
                                 .color(p.muted),
                             );
                             ui.add_space(8.0);
-                            let busy = self.update_busy;
                             let check_btn = ui.add_enabled(
                                 !busy,
                                 style::secondary_button(&p, t!("检查并更新", "Check and update")),
                             );
                             if check_btn.clicked() {
-                                self.check_update(false);
+                                ctx.data_mut(|data| data.insert_temp(about_viewport_id().0.with("update"), true));
+                                ctx.request_repaint_of(egui::ViewportId::ROOT);
                             }
                             if busy {
                                 ui.add_space(6.0);
                                 ui.spinner();
                             }
-                            if let Some((text, level)) = &self.update_result {
+                            if let Some((text, level)) = result.as_ref().filter(|_| notice_until.is_none_or(|until| Instant::now() < until)) {
                                 ui.add_space(6.0);
                                 ui.colored_label(level_color(&p, *level), text);
                             }
@@ -3246,14 +3265,8 @@ impl eframe::App for App {
                         );
                         ui.add_space(6.0);
                     });
-                    close
                 },
             );
-            if close {
-                self.about_open = false;
-                self.update_result = None;
-                self.update_notice_until = None;
-            }
         }
 
         // 关闭设置页前的“有未保存更改”确认弹窗
