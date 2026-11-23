@@ -469,7 +469,10 @@ impl App {
             match cmd {
                 crate::tray::TrayCommand::About => {
                     self.about_open = true;
-                    ctx.send_viewport_cmd_to(about_viewport_id(), egui::ViewportCommand::Focus);
+                    self.hidden_to_tray = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 crate::tray::TrayCommand::Show => {
                     self.hidden_to_tray = false;
@@ -3156,16 +3159,7 @@ impl eframe::App for App {
                     });
             });
 
-        // 关于窗口：带标题栏（可以用标题栏拖动），点窗口外任意处关闭，
-        // 点窗体内部不关（里面还有「检查更新」要按）。
-        if ctx.data_mut(|data| data.remove_temp::<bool>(about_viewport_id().0.with("close"))) == Some(true) {
-            self.about_open = false;
-            self.update_result = None;
-            self.update_notice_until = None;
-        }
-        if ctx.data_mut(|data| data.remove_temp::<bool>(about_viewport_id().0.with("update"))) == Some(true) {
-            self.check_update(false);
-        }
+        // 关于是非模态浮窗，窗口外的主界面可以继续操作。
         if self.about_open {
             // 懒加载应用图标纹理（和 exe/窗口图标同款 icon256.png）
             if self.about_icon.is_none() {
@@ -3183,90 +3177,80 @@ impl eframe::App for App {
                 self.update_notice_until = None;
                 self.update_result = None;
             }
-            // 独立渲染关于窗口，通过事件通知主窗体执行更新。
-            let icon = self.about_icon.clone();
+            let mut open = true;
             let busy = self.update_busy;
-            let result = self.update_result.clone();
-            let notice_until = self.update_notice_until;
-            ctx.request_repaint_of(about_viewport_id());
-            ctx.show_viewport_deferred(
-                about_viewport_id(),
-                egui::ViewportBuilder::default()
-                    .with_title(t!("关于", "About"))
-                    .with_inner_size([350.0, 365.0])
-                    .with_resizable(false),
-                move |ctx, _| {
-                    let close = ctx.input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape));
-                    if close {
-                        ctx.data_mut(|data| data.insert_temp(about_viewport_id().0.with("close"), true));
-                        ctx.request_repaint_of(egui::ViewportId::ROOT);
-                        return;
+            egui::Window::new(t!("关于", "About"))
+                .id(egui::Id::new("racebox-about"))
+                .default_width(320.0)
+                .collapsible(false)
+                .resizable(false)
+                .frame(style::window(&p))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                ui.add_space(12.0);
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                ui.vertical_centered(|ui| {
+                    // 应用图标
+                    if let Some(tex) = &self.about_icon {
+                        ui.add(egui::Image::new((tex.id(), egui::vec2(52.0, 52.0))));
+                    } else {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new("RaceBox").strong().size(20.0),
+                        ));
                     }
-                    if let Some(until) = notice_until {
-                        ctx.request_repaint_after(until.saturating_duration_since(Instant::now()));
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(t!("RaceBox同步", "RaceBox Sync"))
+                            .strong()
+                            .size(18.0)
+                            .color(p.text),
+                    );
+                    ui.add_space(4.0);
+                    // 版本号 + 「检查并更新」：更新入口只留在这里，
+                    // 设置页那张卡已经去掉（每次启动都会自动查一次，不用摆个按钮占地方）
+                    ui.label(
+                        egui::RichText::new(tr!(
+                            "版本 {}",
+                            "version {}",
+                            env!("CARGO_PKG_VERSION")
+                        ))
+                        .size(12.5)
+                        .color(p.muted),
+                    );
+                    ui.add_space(8.0);
+                    let check_btn = ui.add_enabled(
+                        !busy,
+                        style::secondary_button(&p, t!("检查并更新", "Check and update")),
+                    );
+                    if check_btn.clicked() {
+                        self.check_update(false);
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        ui.add_space(12.0);
-                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                        ui.vertical_centered(|ui| {
-                            // 应用图标
-                            if let Some(tex) = &icon {
-                                ui.add(egui::Image::new((tex.id(), egui::vec2(52.0, 52.0))));
-                            } else {
-                                ui.add(egui::Label::new(
-                                    egui::RichText::new("RaceBox").strong().size(20.0),
-                                ));
-                            }
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new(t!("RaceBox同步", "RaceBox Sync"))
-                                    .strong()
-                                    .size(18.0)
-                                    .color(p.text),
-                            );
-                            ui.add_space(4.0);
-                            // 版本号 + 「检查并更新」：更新入口只留在这里，
-                            // 设置页那张卡已经去掉（每次启动都会自动查一次，不用摆个按钮占地方）
-                            ui.label(
-                                egui::RichText::new(tr!(
-                                    "版本 {}",
-                                    "version {}",
-                                    env!("CARGO_PKG_VERSION")
-                                ))
-                                .size(12.5)
-                                .color(p.muted),
-                            );
-                            ui.add_space(8.0);
-                            let check_btn = ui.add_enabled(
-                                !busy,
-                                style::secondary_button(&p, t!("检查并更新", "Check and update")),
-                            );
-                            if check_btn.clicked() {
-                                ctx.data_mut(|data| data.insert_temp(about_viewport_id().0.with("update"), true));
-                                ctx.request_repaint_of(egui::ViewportId::ROOT);
-                            }
-                            if busy {
-                                ui.add_space(6.0);
-                                ui.spinner();
-                            }
-                            if let Some((text, level)) = result.as_ref().filter(|_| notice_until.is_none_or(|until| Instant::now() < until)) {
-                                ui.add_space(6.0);
-                                ui.colored_label(level_color(&p, *level), text);
-                            }
-                        });
+                    if busy {
                         ui.add_space(6.0);
-                        about_row(ui, &p, t!("作者", "Author"), "wangcw");
-                        about_row(ui, &p, t!("邮箱", "Email"), "rubygreat@msn.com");
-                        about_row(
-                            ui,
-                            &p,
-                            t!("协议", "Protocol"),
-                            "ublox BLE · PostgreSQL / MQTT (RBX2)",
-                        );
+                        ui.spinner();
+                    }
+                    if let Some((text, level)) = &self.update_result {
                         ui.add_space(6.0);
-                    });
-                },
-            );
+                        ui.colored_label(level_color(&p, *level), text);
+                    }
+                });
+                ui.add_space(6.0);
+                about_row(ui, &p, t!("作者", "Author"), "wangcw");
+                about_row(ui, &p, t!("邮箱", "Email"), "rubygreat@msn.com");
+                about_row(
+                    ui,
+                    &p,
+                    t!("协议", "Protocol"),
+                    "ublox BLE · PostgreSQL / MQTT (RBX2)",
+                );
+                ui.add_space(6.0);
+
+                });
+            if !open {
+                self.about_open = false;
+                self.update_result = None;
+                self.update_notice_until = None;
+            }
         }
 
         // 关闭设置页前的“有未保存更改”确认弹窗
@@ -3354,10 +3338,6 @@ impl eframe::App for App {
 }
 
 /// 关于弹窗里的“标签: 值”信息行。
-fn about_viewport_id() -> egui::ViewportId {
-    egui::ViewportId::from_hash_of("racebox-about")
-}
-
 fn about_row(ui: &mut egui::Ui, p: &Palette, key: &str, value: &str) {
     ui.horizontal(|ui| {
         ui.add_space(24.0);

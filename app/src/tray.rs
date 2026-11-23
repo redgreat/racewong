@@ -74,7 +74,6 @@ mod win32 {
     pub const SW_SHOW: i32 = 5;
     pub const SW_RESTORE: i32 = 9;
     pub const WM_CLOSE: u32 = 0x0010;
-    pub const WM_PAINT: u32 = 0x000F;
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -214,10 +213,7 @@ mod platform {
                 return;
             }
             match cmd {
-                TrayCommand::About => {
-                    // 隐藏的根窗口也需要处理一帧，才能创建关于窗口。
-                    super::win32::PostMessageW(hwnd, super::win32::WM_PAINT, 0, 0);
-                }
+                TrayCommand::About => super::show_window(hwnd),
                 TrayCommand::Show => {
                     if super::quit_requested() {
                         return;
