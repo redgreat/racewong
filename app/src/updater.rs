@@ -357,7 +357,10 @@ if ($code -ne 0 -and $code -ne 3010) {
 }
 if (Test-Path -LiteralPath $Exe) { Start-Process -FilePath $Exe }
 "#;
-        std::fs::write(&script, body).map_err(|e| format!("写入升级脚本失败: {e}"))?;
+        // Windows PowerShell 5.1 会把无 BOM 的 UTF-8 当成本机 ANSI，
+        // 中文注释可能吞掉紧随其后的参数赋值，因此必须写入 UTF-8 BOM。
+        let script_bytes = format!("\u{feff}{body}");
+        std::fs::write(&script, script_bytes).map_err(|e| format!("写入升级脚本失败: {e}"))?;
         // GUI 程序启动 PowerShell 时不需要新建控制台。
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
