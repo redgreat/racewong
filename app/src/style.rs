@@ -82,8 +82,8 @@ pub fn metric_tiles(ui: &mut egui::Ui, p: &Palette, cells: &[(&str, String, Colo
     let available = ui.available_width();
     let columns = ((available + gap) / (120.0 + gap)).floor().max(1.0) as usize;
     let columns = columns.min(cells.len()).max(1);
-    let width = (available - gap * (columns - 1) as f32) / columns as f32;
     for row in cells.chunks(columns) {
+        let width = (available - gap * (row.len() - 1) as f32) / row.len() as f32;
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
             for (label, value, color) in row {
@@ -98,10 +98,12 @@ pub fn metric_tiles(ui: &mut egui::Ui, p: &Palette, cells: &[(&str, String, Colo
                             egui::vec2((width - 22.0).max(0.0), 42.0),
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
+                                ui.set_min_size(egui::vec2((width - 22.0).max(0.0), 42.0));
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                                 ui.colored_label(p.muted, *label);
                                 ui.label(
                                     egui::RichText::new(value).strong().size(16.0).color(*color),
-                                );
+                                ).on_hover_text(value);
                             },
                         );
                     });
@@ -828,19 +830,42 @@ pub fn status_banner(ui: &mut egui::Ui, p: &Palette, color: Color32, text: &str)
 /// 和 [`status_banner`] 的区别是**不换行**：换行会把整行撑高、按钮跟着往下掉。
 /// 超宽就截断（`max_w` 由调用方按剩余宽度给），鼠标悬停能看全文。
 pub fn status_pill(ui: &mut egui::Ui, p: &Palette, color: Color32, text: &str, max_w: f32) {
+    status_pill_frame(p, color).show(ui, |ui| {
+        ui.set_max_width((max_w - 20.0).max(40.0));
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+        ui.colored_label(color, egui::RichText::new(text).strong()).on_hover_text(text);
+    });
+}
+
+fn status_pill_frame(p: &Palette, color: Color32) -> egui::Frame {
     let alpha = if p.is_dark() { 40 } else { 24 };
-    let inner = (max_w - 20.0).max(40.0);
     egui::Frame::NONE
         .fill(tint(color, alpha))
         .stroke(Stroke::new(1.0_f32, tint(color, 100)))
         .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::symmetric(10, 5))
-        .show(ui, |ui| {
-            ui.set_max_width(inner);
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-            ui.colored_label(color, egui::RichText::new(text.to_owned()).strong())
-                .on_hover_text(text.to_owned());
-        });
+}
+
+/// 阶段数量固定，等宽分配整行，文字过长时可悬停查看。
+pub fn phase_pills(ui: &mut egui::Ui, p: &Palette, labels: &[String]) {
+    if labels.is_empty() {
+        return;
+    }
+    let gap = 8.0;
+    let width = (ui.available_width() - gap * (labels.len() - 1) as f32) / labels.len() as f32;
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        for text in labels {
+            status_pill_frame(p, p.muted).show(ui, |ui| {
+                let size = egui::vec2((width - 22.0).max(0.0), ui.text_style_height(&egui::TextStyle::Body));
+                ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.set_min_size(size);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                    ui.colored_label(p.muted, egui::RichText::new(text).strong()).on_hover_text(text);
+                });
+            });
+        }
+    });
 }
 
 /// 日志级别徽标：小圆角浅底块 + 彩色文字。

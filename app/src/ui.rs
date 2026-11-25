@@ -1270,64 +1270,49 @@ impl App {
     /// 屏幕上多出两根条只是把结果卡顶下去。这里只留文字：谁在跑、跑到多少、多快，
     /// 圆环负责「还剩多少」，两边不重叠。
     fn channel_line(&self, ui: &mut egui::Ui, p: &Palette) {
-        // 通道名之间用 `·` 分隔，和「各阶段耗时」那行保持同一种节奏
-        ui.horizontal_wrapped(|ui| {
-            for (i, row) in self.channels.iter().enumerate() {
-                if i > 0 {
-                    ui.add_space(6.0);
-                    ui.colored_label(p.muted, "·");
-                    ui.add_space(6.0);
-                }
-                ui.label(egui::RichText::new(row.name.clone()).strong().color(p.text));
-                ui.add_space(6.0);
-                let (text, color) = if row.failed > 0 {
-                    (
-                        tr!(
-                            "{} 条 · 失败 {} 条",
-                            "{} rec · {} failed",
-                            fmt_count(row.uploaded),
-                            fmt_count(row.failed)
-                        ),
-                        p.error,
-                    )
-                } else if row.done() {
-                    (
-                        tr!("{} 条 · 已完成", "{} rec · done", fmt_count(row.total)),
-                        p.success,
-                    )
-                } else if row.total > 0 {
-                    (
-                        tr!(
-                            "{} / {} 条",
-                            "{} / {} rec",
-                            fmt_count(row.uploaded),
-                            fmt_count(row.total)
-                        ),
-                        p.text,
-                    )
-                } else if self.running && self.phase == Phase::Uploading {
-                    // 这一路还一条都没报上来（RaceBox 云是整段一次性发出去的），
-                    // 摆个「0 条」看着像卡死，不如直说正在传
-                    (format!("{}…", t!("上传中", "Uploading")), p.muted)
-                } else {
-                    (tr!("{} 条", "{} rec", fmt_count(row.uploaded)), p.text)
-                };
-                ui.label(egui::RichText::new(text).strong().color(color));
-                // 速度：跑的时候是实时值，跑完是这一路最后算出来的平均值——
-                // 两边留着，正好能横向比出哪一路慢
-                if row.failed == 0 {
-                    if let Some(rate) = row.rate.filter(|r| *r >= 1.0) {
-                        ui.add_space(6.0);
-                        ui.colored_label(p.muted, "·");
-                        ui.add_space(6.0);
-                        ui.colored_label(
-                            p.muted,
-                            tr!("{} 条/秒", "{}/s", fmt_count(rate.round() as usize)),
-                        );
-                    }
+        let mut cells = Vec::with_capacity(self.channels.len());
+        for row in &self.channels {
+            let (mut text, color) = if row.failed > 0 {
+                (
+                    tr!(
+                        "{} 条 · 失败 {} 条",
+                        "{} rec · {} failed",
+                        fmt_count(row.uploaded),
+                        fmt_count(row.failed)
+                    ),
+                    p.error,
+                )
+            } else if row.done() {
+                (
+                    tr!("{} 条 · 已完成", "{} rec · done", fmt_count(row.total)),
+                    p.success,
+                )
+            } else if row.total > 0 {
+                (
+                    tr!(
+                        "{} / {} 条",
+                        "{} / {} rec",
+                        fmt_count(row.uploaded),
+                        fmt_count(row.total)
+                    ),
+                    p.text,
+                )
+            } else if self.running && self.phase == Phase::Uploading {
+                // 这一路还一条都没报上来（RaceBox 云是整段一次性发出去的），
+                // 摆个「0 条」看着像卡死，不如直说正在传
+                (format!("{}…", t!("上传中", "Uploading")), p.muted)
+            } else {
+                (tr!("{} 条", "{} rec", fmt_count(row.uploaded)), p.text)
+            };
+            if row.failed == 0 {
+                if let Some(rate) = row.rate.filter(|r| *r >= 1.0) {
+                    text.push_str(" · ");
+                    text.push_str(&tr!("{} 条/秒", "{}/s", fmt_count(rate.round() as usize)));
                 }
             }
-        });
+            cells.push((row.name.as_str(), text, color));
+        }
+        style::metric_tiles(ui, p, &cells);
     }
 
     fn show_sync_tab(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -1666,7 +1651,10 @@ impl App {
                 // ---------- ① 结论横幅：放最上面 ----------
                 // 跑完第一眼要看的是「成没成」，条数、耗时这些明细排在它后面。
                 // 同步 / 导入 / 清除内存都有结论，查询状态没有（那是一次读数）。
-                if (is_sync_task || is_erase_task) && !self.last_summary.is_empty() {
+                if (is_sync_task || is_erase_task)
+                    && self.phase != Phase::Done
+                    && !self.last_summary.is_empty()
+                {
                     ui.add_space(12.0);
                     style::status_banner(ui, p, result_color, &self.last_summary.clone());
                 }
@@ -1805,16 +1793,23 @@ impl App {
                 }
 
                 // 各阶段耗时（只针对完整同步）
-                if is_sync_task && !self.phase_times.is_empty() {
+                if is_sync_task {
                     ui.add_space(10.0);
                     ui.colored_label(p.muted, t!("各阶段耗时", "Time per phase"));
                     ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| {
-                        for (name, d) in &self.phase_times {
-                            let label = format!("{}  {}", name.text(), fmt_dur(*d));
-                            style::status_pill(ui, p, p.muted, &label, 230.0);
-                        }
-                    });
+                    let phases: &[Phase] = if self.current_mode == Some(RunMode::Import) {
+                        &[Phase::Starting, Phase::Preflight, Phase::Parsing, Phase::Uploading]
+                    } else {
+                        &[Phase::Starting, Phase::Preflight, Phase::Scanning, Phase::Connecting,
+                          Phase::Downloading, Phase::Uploading, Phase::Erasing]
+                    };
+                    let labels: Vec<_> = phases.iter().map(|&phase| {
+                        let finished = self.phase_times.iter().find(|(name, _)| *name == phase).map(|(_, d)| *d);
+                        let current = self.phase_start.filter(|_| self.running && self.phase == phase);
+                        let duration = current.map(|start| finished.unwrap_or_default() + start.elapsed()).or(finished);
+                        format!("{}  {}", phase.text(), duration.map(fmt_dur).unwrap_or_else(|| "—".to_owned()))
+                    }).collect();
+                    style::phase_pills(ui, p, &labels);
                 }
 
                 // 设备状态网格（查询成功后出现）
