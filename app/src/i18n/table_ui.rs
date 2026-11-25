@@ -9,6 +9,7 @@
 use super::table::{row, Row};
 
 pub const ROWS: &[Row] = &[
+    row("PG数据库", "PG database", "PG データベース", "PG 데이터베이스", "Banco de dados PG", "Base de datos PG", "База данных PG", "Base PG", "PG-Datenbank", "Database PG"),
     row("电量", "Battery", "バッテリー", "배터리", "Bateria", "Batería", "Заряд", "Batterie", "Akku", "Batteria"),
     row("请充电", "Please charge the device", "充電してください", "기기를 충전하세요", "Carregue o dispositivo", "Carga el dispositivo", "Зарядите устройство", "Rechargez l’appareil", "Gerät bitte laden", "Ricarica il dispositivo"),
     row("正在下载…", "Downloading…", "ダウンロード中…", "다운로드 중…", "A baixar…", "Descargando…", "Загрузка…", "Téléchargement…", "Wird heruntergeladen…", "Download in corso…"),

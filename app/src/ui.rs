@@ -742,7 +742,7 @@ impl App {
         }
         while let Ok(message) = self.update_rx.try_recv() {
             if matches!(&message, UpdateMsg::Downloading) {
-                if self.about_open {
+                if self.about_open || !self.update_silent {
                     self.update_result = Some((
                         t!("正在下载…", "Downloading…").to_string(),
                         LogLevel::Info,
@@ -1270,9 +1270,9 @@ impl App {
     /// 屏幕上多出两根条只是把结果卡顶下去。这里只留文字：谁在跑、跑到多少、多快，
     /// 圆环负责「还剩多少」，两边不重叠。
     fn channel_line(&self, ui: &mut egui::Ui, p: &Palette) {
-        let mut cells = Vec::with_capacity(self.channels.len());
+        let mut cells = Vec::with_capacity(self.channels.len() * 2);
         for row in &self.channels {
-            let (mut text, color) = if row.failed > 0 {
+            let (text, color) = if row.failed > 0 {
                 (
                     tr!(
                         "{} 条 · 失败 {} 条",
@@ -1304,13 +1304,17 @@ impl App {
             } else {
                 (tr!("{} 条", "{} rec", fmt_count(row.uploaded)), p.text)
             };
-            if row.failed == 0 {
-                if let Some(rate) = row.rate.filter(|r| *r >= 1.0) {
-                    text.push_str(" · ");
-                    text.push_str(&tr!("{} 条/秒", "{}/s", fmt_count(rate.round() as usize)));
-                }
-            }
-            cells.push((row.name.as_str(), text, color));
+            let name = if row.name == "PostgreSQL" {
+                t!("PG数据库", "PG database")
+            } else {
+                row.name.as_str()
+            };
+            cells.push((name, text, color));
+            let rate = row.rate
+                .filter(|r| row.failed == 0 && *r >= 1.0)
+                .map(|r| tr!("{} 条/秒", "{}/s", fmt_count(r.round() as usize)))
+                .unwrap_or_else(|| "—".to_owned());
+            cells.push((t!("上传速度", "Upload speed"), rate, p.info));
         }
         style::metric_tiles(ui, p, &cells);
     }
@@ -3156,7 +3160,7 @@ impl eframe::App for App {
 
         // 关于仍在主窗口内，用遮罩淡化背景并接住窗外点击。
         if self.about_open {
-            let outside_clicked = style::modal_shield(ctx, &p).clicked();
+            let outside_clicked = style::about_shield(ctx, &p).clicked();
             // 懒加载应用图标纹理（和 exe/窗口图标同款 icon256.png）
             if self.about_icon.is_none() {
                 let bytes = include_bytes!("../assets/icon256.png");
@@ -3178,6 +3182,8 @@ impl eframe::App for App {
             egui::Window::new(t!("关于", "About"))
                 .id(egui::Id::new("racebox-about"))
                 .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .movable(false)
                 .default_width(320.0)
                 .collapsible(false)
                 .resizable(false)
@@ -3243,10 +3249,14 @@ impl eframe::App for App {
                 ui.add_space(6.0);
 
                 });
-            if !open || outside_clicked || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if !open || (!self.update_busy
+                && (outside_clicked || ctx.input(|i| i.key_pressed(egui::Key::Escape))))
+            {
                 self.about_open = false;
-                self.update_result = None;
-                self.update_notice_until = None;
+                if !self.update_busy {
+                    self.update_result = None;
+                    self.update_notice_until = None;
+                }
             }
         }
 

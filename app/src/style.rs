@@ -292,6 +292,14 @@ pub fn window(p: &Palette) -> egui::Frame {
 /// 背景，egui 就把它提到同层最上面——弹窗被压在下面，整窗变灰、点不动也关不掉。
 /// 分到两层之后两者永远不会互换位置。
 pub fn modal_shield(ctx: &egui::Context, p: &Palette) -> egui::Response {
+    backdrop(ctx, p, false)
+}
+
+pub fn about_shield(ctx: &egui::Context, p: &Palette) -> egui::Response {
+    backdrop(ctx, p, true)
+}
+
+fn backdrop(ctx: &egui::Context, p: &Palette, subtle: bool) -> egui::Response {
     let screen = ctx.screen_rect();
     egui::Area::new(egui::Id::new("modal_shield"))
         .order(egui::Order::Middle)
@@ -301,7 +309,12 @@ pub fn modal_shield(ctx: &egui::Context, p: &Palette) -> egui::Response {
         .show(ctx, |ui| {
             let (rect, response) = ui.allocate_exact_size(screen.size(), egui::Sense::click_and_drag());
             // 深色底下压得更狠一点才压得住，浅色稍微透一点不然太脏
-            let alpha = if p.is_dark() { 150 } else { 90 };
+            let alpha = match (subtle, p.is_dark()) {
+                (true, true) => 85,
+                (true, false) => 55,
+                (false, true) => 150,
+                (false, false) => 90,
+            };
             ui.painter()
                 .rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, alpha));
             response
