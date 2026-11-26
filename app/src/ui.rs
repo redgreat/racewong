@@ -256,7 +256,6 @@ pub struct App {
     battery: Option<u8>,
     device_address: String,
     status: Option<DeviceStatus>,
-    received: usize,
     total: usize,
     /// 其中有效定位记录数（设备消息里可能有无定位的，不计入）。
     downloaded_parsed: usize,
@@ -371,7 +370,6 @@ impl App {
             battery: None,
             device_address: String::new(),
             status: None,
-            received: 0,
             total: 0,
             downloaded_parsed: 0,
             uploaded: 0,
@@ -648,11 +646,9 @@ impl App {
                 }
                 UiEvent::Status(status) => self.status = Some(status),
                 UiEvent::DownloadProgress {
-                    received,
                     total,
                     parsed,
                 } => {
-                    self.received = received;
                     self.total = total;
                     self.downloaded_parsed = parsed;
                 }
@@ -917,7 +913,6 @@ impl App {
         self.phase_start = Some(Instant::now());
         self.run_stats = None;
         self.last_summary.clear();
-        self.received = 0;
         self.total = 0;
         self.downloaded_parsed = 0;
         self.uploaded = 0;
@@ -988,7 +983,6 @@ impl App {
         self.phase_start = Some(Instant::now());
         self.run_stats = None;
         self.last_summary.clear();
-        self.received = 0;
         self.total = 0;
         self.downloaded_parsed = 0;
         self.uploaded = 0;
@@ -1331,7 +1325,7 @@ impl App {
         let files_mode = self.source == SyncSource::Files;
         let import_task = self.running && self.current_mode == Some(RunMode::Import);
         let picked_files = self.cloud.selected_paths().len();
-        let (received, total, parsed) = (self.received, self.total, self.downloaded_parsed);
+        let (total, parsed) = (self.total, self.downloaded_parsed);
         let downloading = total > 0 || parsed > 0;
         let erase_percent = self.erase_percent;
         let spool_pending = self.spool_pending;
@@ -1771,29 +1765,6 @@ impl App {
                 if self.show_channels() {
                     ui.add_space(10.0);
                     self.channel_line(ui, p);
-                }
-
-                // ---------- ⑤ 运行中的实时计数 ----------
-                // 跑完就不重复「已下载 x 条」了——上面汇总网格里已经有这一格
-                if self.running && downloading {
-                    ui.add_space(8.0);
-                    let mut text = if total > 0 {
-                        tr!("已下载 {} / {} 条", "downloaded {} / {}", parsed, total)
-                    } else {
-                        tr!("已下载 {} 条", "downloaded {}", parsed)
-                    };
-                    if received > parsed {
-                        text.push_str(&tr!(
-                            "（跳过无定位 {} 条）",
-                            " ({} skipped without a fix)",
-                            received - parsed
-                        ));
-                    }
-                    ui.colored_label(p.muted, text);
-                }
-                if let Some(percent) = erase_percent {
-                    ui.add_space(8.0);
-                    ui.colored_label(p.muted, tr!("清理内存 {}%", "erasing {}%", percent));
                 }
 
                 // 各阶段耗时（只针对完整同步）

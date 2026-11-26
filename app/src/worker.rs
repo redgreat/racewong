@@ -119,7 +119,6 @@ pub enum UiEvent {
     Status(DeviceStatus),
     /// 下载进度：`received`/`total` 是设备返回的消息数，`parsed` 是其中有效定位记录数。
     DownloadProgress {
-        received: usize,
         total: usize,
         parsed: usize,
     },
@@ -848,7 +847,6 @@ async fn download_and_upload(
                         ),
                     ));
                     let _ = tx.send(UiEvent::DownloadProgress {
-                        received: 0,
                         total: total_upper,
                         parsed: 0,
                     });
@@ -864,7 +862,6 @@ async fn download_and_upload(
                     }
                     if received_total % 50 == 0 {
                         let _ = tx.send(UiEvent::DownloadProgress {
-                            received: received_total,
                             total: if total_upper > 0 {
                                 total_upper
                             } else {
@@ -955,7 +952,6 @@ async fn download_and_upload(
     }
 
     let _ = tx.send(UiEvent::DownloadProgress {
-        received: received_total,
         total: if total_upper > 0 {
             total_upper
         } else {
