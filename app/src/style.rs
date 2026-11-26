@@ -78,15 +78,13 @@ pub fn battery_badge(ui: &mut egui::Ui, p: &Palette, percent: u8) {
 
 /// 查询和同步结果共用的指标格，窄窗口里自动折行。
 pub fn metric_tiles(ui: &mut egui::Ui, p: &Palette, cells: &[(&str, String, Color32)]) {
-    let gap = 8.0;
-    let available = ui.available_width();
-    let columns = ((available + gap) / (120.0 + gap)).floor().max(1.0) as usize;
-    let columns = columns.min(cells.len()).max(1);
-    for row in cells.chunks(columns) {
-        let width = (available - gap * (row.len() - 1) as f32) / row.len() as f32;
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            for (label, value, color) in row {
+    let widths: Vec<_> = cells.iter().map(|(label, value, _)| {
+        measure_label(ui, egui::RichText::new(*label))
+            + measure_label(ui, egui::RichText::new(value).strong().size(16.0))
+            + ui.spacing().item_spacing.x + 24.0
+    }).collect();
+    content_sized_rows(ui, &widths, |ui, index, width| {
+                let (label, value, color) = &cells[index];
                 egui::Frame::new()
                     .fill(p.edit_bg)
                     .stroke(Stroke::new(1.0_f32, p.card_stroke))
@@ -99,7 +97,7 @@ pub fn metric_tiles(ui: &mut egui::Ui, p: &Palette, cells: &[(&str, String, Colo
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
                                 ui.set_min_size(egui::vec2((width - 22.0).max(0.0), 42.0));
-                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                                 ui.colored_label(p.muted, *label);
                                 ui.label(
                                     egui::RichText::new(value).strong().size(16.0).color(*color),
@@ -107,8 +105,43 @@ pub fn metric_tiles(ui: &mut egui::Ui, p: &Palette, cells: &[(&str, String, Colo
                             },
                         );
                     });
+    });
+}
+
+fn measure_label(ui: &egui::Ui, text: egui::RichText) -> f32 {
+    egui::WidgetText::from(text)
+        .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::FontSelection::Default)
+        .size().x.ceil()
+}
+
+/// 优先按文字宽度排布，再均分每行剩余空间；放不下的气泡移到下一行。
+fn content_sized_rows(
+    ui: &mut egui::Ui,
+    mut widths: &[f32],
+    mut render: impl FnMut(&mut egui::Ui, usize, f32),
+) {
+    let gap = 8.0;
+    let available = ui.available_width();
+    let mut offset = 0;
+    while let Some(&first) = widths.first() {
+        let mut occupied = first.min(available);
+        let mut count = 1;
+        for &width in &widths[1..] {
+            if occupied + gap + width > available {
+                break;
+            }
+            occupied += gap + width;
+            count += 1;
+        }
+        let extra = (available - occupied) / count as f32;
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for (index, &width) in widths[..count].iter().enumerate() {
+                render(ui, offset + index, width.min(available) + extra);
             }
         });
+        offset += count;
+        widths = &widths[count..];
     }
 }
 
@@ -861,23 +894,19 @@ fn status_pill_frame(p: &Palette, color: Color32) -> egui::Frame {
 
 /// 阶段数量固定，等宽分配整行，文字过长时可悬停查看。
 pub fn phase_pills(ui: &mut egui::Ui, p: &Palette, labels: &[String]) {
-    if labels.is_empty() {
-        return;
-    }
-    let gap = 8.0;
-    let width = (ui.available_width() - gap * (labels.len() - 1) as f32) / labels.len() as f32;
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        for text in labels {
+    let widths: Vec<_> = labels.iter()
+        .map(|text| measure_label(ui, egui::RichText::new(text).strong()) + 24.0)
+        .collect();
+    content_sized_rows(ui, &widths, |ui, index, width| {
+            let text = &labels[index];
             status_pill_frame(p, p.muted).show(ui, |ui| {
                 let size = egui::vec2((width - 22.0).max(0.0), ui.text_style_height(&egui::TextStyle::Body));
                 ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.set_min_size(size);
-                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                     ui.colored_label(p.muted, egui::RichText::new(text).strong()).on_hover_text(text);
                 });
             });
-        }
     });
 }
 
